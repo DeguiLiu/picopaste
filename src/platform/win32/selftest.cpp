@@ -353,7 +353,9 @@ Status RunSelfTest(const SelfTestOptions& options) noexcept {
   if (g_failed == 0) {
     return Status::success();
   }
-  return Status::error(Error::kBusy);
+  // Not kBusy: that code means "an upload is already in flight", and returning
+  // it for a failed capability would make the error lie about what happened.
+  return Status::error(Error::kSelfTestFailed);
 }
 
 }  // namespace picopaste::win32

@@ -56,6 +56,9 @@ enum class Error : std::uint8_t {
 
   // Bounded logging
   kLogIoFailed,         // open/write/rotate/flush of the log file failed
+
+  // Self-test
+  kSelfTestFailed,      // one or more mandatory capabilities failed
 };
 
 template <typename V>
