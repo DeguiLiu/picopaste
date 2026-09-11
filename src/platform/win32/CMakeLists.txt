@@ -3,6 +3,7 @@
 # Linked into the picopaste executable target, which is created by the root
 # CMakeLists before this directory is added.
 target_sources(picopaste PRIVATE
+  main_win32.cpp     # wWinMain: console-attached --selftest runner; interactive mode not wired
   clipboard.cpp      # Win32 clipboard capture; WIC PNG encode; single temp-file path
   stream_win32.cpp   # ByteStream over a CreateProcessW child with pipe redirection
   inject.cpp         # SendInput Ctrl+Shift+V with a focus guard

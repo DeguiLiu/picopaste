@@ -1,59 +1,64 @@
 // picopaste -- single-instance mutex and Job Object containment.
 #include "single_instance.hpp"
 
-#include <cwchar>
-
 #include "win32_util.hpp"
 
 namespace picopaste::win32 {
 namespace {
 
 // Small page-file-backed section describing the current owner, so a second
-// instance can report who holds the mutex. A mutex itself carries no PID.
+// instance can report who holds the mutex. A mutex itself carries no PID. The
+// owner fills pid/image and then publishes ready last, so a reader that sees
+// ready == 0 must treat the identity as not yet available, never as a recorded
+// owner with PID 0.
 struct OwnerInfo {
+  volatile std::uint32_t ready = 0;
   std::uint32_t pid = 0;
-  std::uint32_t reserved = 0;
   wchar_t image[kOwnerImageChars] = {};
 };
 
-void MutexName(wchar_t* out, std::size_t chars, std::uint16_t port) noexcept {
-  (void)swprintf(out, chars, L"Local\\picopaste-%u", static_cast<unsigned>(port));
-}
+// The owner publishes within a few instructions of CreateMutexW returning, so a
+// bounded wait closes the "not written yet" window without an unbounded spin.
+// Past the bound the identity is reported as absent, which is explicit.
+constexpr int kOwnerReadyAttempts = 20;
+constexpr DWORD kOwnerReadySleepMs = 1;
 
-void OwnerName(wchar_t* out, std::size_t chars, std::uint16_t port) noexcept {
-  (void)swprintf(out, chars, L"Local\\picopaste-%u.owner", static_cast<unsigned>(port));
-}
-
-void ReadOwner(std::uint16_t port, std::uint32_t* owner_pid, wchar_t* owner_image,
+void ReadOwner(std::uint32_t* owner_pid, wchar_t* owner_image,
                std::size_t owner_image_chars) noexcept {
   if (owner_pid == nullptr && owner_image == nullptr) {
     return;
   }
-  wchar_t name[64] = {};
-  OwnerName(name, 64, port);
-  UniqueHandle section(OpenFileMappingW(FILE_MAP_READ, FALSE, name));
-  if (section.valid() == false) {
-    return;
+  for (int attempt = 0; attempt < kOwnerReadyAttempts; ++attempt) {
+    UniqueHandle section(OpenFileMappingW(FILE_MAP_READ, FALSE, kSingleInstanceOwnerName));
+    if (section.valid()) {
+      const void* view = MapViewOfFile(section.get(), FILE_MAP_READ, 0, 0, sizeof(OwnerInfo));
+      if (view != nullptr) {
+        const OwnerInfo* info = static_cast<const OwnerInfo*>(view);
+        const bool published = (info->ready != 0u);
+        if (published) {
+          // Acquire: pair with the writer's release barrier before the ready
+          // store, so pid/image cannot be read from a half-written record.
+          MemoryBarrier();
+          if (owner_pid != nullptr) {
+            *owner_pid = info->pid;
+          }
+          if (owner_image != nullptr && owner_image_chars > 0) {
+            (void)CopyWide(info->image, owner_image, owner_image_chars);
+          }
+        }
+        UnmapViewOfFile(view);
+        if (published) {
+          return;
+        }
+      }
+    }
+    Sleep(kOwnerReadySleepMs);
   }
-  const void* view = MapViewOfFile(section.get(), FILE_MAP_READ, 0, 0, sizeof(OwnerInfo));
-  if (view == nullptr) {
-    return;
-  }
-  const OwnerInfo* info = static_cast<const OwnerInfo*>(view);
-  if (owner_pid != nullptr) {
-    *owner_pid = info->pid;
-  }
-  if (owner_image != nullptr && owner_image_chars > 0) {
-    (void)CopyWide(info->image, owner_image, owner_image_chars);
-  }
-  UnmapViewOfFile(view);
 }
 
-void WriteOwner(std::uint16_t port, HANDLE* section_out, void** view_out) noexcept {
-  wchar_t name[64] = {};
-  OwnerName(name, 64, port);
+void WriteOwner(HANDLE* section_out, void** view_out) noexcept {
   UniqueHandle section(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-                                          sizeof(OwnerInfo), name));
+                                          sizeof(OwnerInfo), kSingleInstanceOwnerName));
   if (section.valid() == false) {
     return;
   }
@@ -62,16 +67,22 @@ void WriteOwner(std::uint16_t port, HANDLE* section_out, void** view_out) noexce
     return;
   }
   OwnerInfo* info = static_cast<OwnerInfo*>(view);
+  // Reset the marker before touching pid/image: a section reused from a
+  // previous owner must not be readable as current until this write completes.
+  info->ready = 0;
+  MemoryBarrier();
   info->pid = GetCurrentProcessId();
-  info->reserved = 0;
   (void)GetModuleFileNameW(nullptr, info->image, static_cast<DWORD>(kOwnerImageChars));
+  // Release: publish the completed record last.
+  MemoryBarrier();
+  info->ready = 1;
   *section_out = section.release();
   *view_out = view;
 }
 
 }  // namespace
 
-Status SingleInstance::Acquire(std::uint16_t port, std::uint32_t* owner_pid, wchar_t* owner_image,
+Status SingleInstance::Acquire(std::uint32_t* owner_pid, wchar_t* owner_image,
                                std::size_t owner_image_chars) noexcept {
   if (owner_pid != nullptr) {
     *owner_pid = 0;
@@ -80,22 +91,19 @@ Status SingleInstance::Acquire(std::uint16_t port, std::uint32_t* owner_pid, wch
     owner_image[0] = L'\0';
   }
 
-  wchar_t mutex_name[64] = {};
-  MutexName(mutex_name, 64, port);
-
   // Deliberately no initial owner and no WaitForSingleObject: the mutex object
   // simply exists while we do. The kernel releases it on process exit, which is
   // the exact lifetime we want, with no PID file to go stale.
-  mutex_ = CreateMutexW(nullptr, FALSE, mutex_name);
+  mutex_ = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
   if (mutex_ == nullptr) {
     return Status::error(Error::kJobObjectFailed);
   }
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    ReadOwner(port, owner_pid, owner_image, owner_image_chars);
+    ReadOwner(owner_pid, owner_image, owner_image_chars);
     return Status::error(Error::kSingleInstanceExists);
   }
 
-  WriteOwner(port, &owner_section_, &owner_view_);
+  WriteOwner(&owner_section_, &owner_view_);
   return Status::success();
 }
 
@@ -104,7 +112,22 @@ Status SingleInstance::SetupJobObjects(std::uint32_t memory_limit_mb) noexcept {
     return Status::error(Error::kJobObjectFailed);
   }
 
-  // 1. Containment: kill children when we die. No memory limit here.
+  // 1. Containment: kill ssh.exe children when this process dies; no memory
+  // limit here. This process is deliberately NOT assigned to this job. Closing
+  // the last handle to a KILL_ON_JOB_CLOSE job terminates every process
+  // associated with it ("Job Objects": "if the job has the
+  // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag specified, closing the last job
+  // object handle terminates all associated processes"), so joining it would
+  // turn Close(), the destructor, and every early-return error path below into
+  // a self-kill that is impossible to observe. The child is assigned to this
+  // job explicitly at spawn (stream_win32.cpp), and this handle is the only
+  // one, so the kernel destroys the job -- killing the child -- when this
+  // process terminates for any reason, including TerminateProcess.
+  //
+  // Rejected alternative: stay a member and never close the handle. That leaks
+  // the handle by design, keeps a self-kill job attached to us for the whole
+  // process lifetime, and leaves Close() unable to tear the child down
+  // deterministically.
   containment_job_ = CreateJobObjectW(nullptr, nullptr);
   if (containment_job_ == nullptr) {
     return Status::error(Error::kJobObjectFailed);
@@ -116,22 +139,23 @@ Status SingleInstance::SetupJobObjects(std::uint32_t memory_limit_mb) noexcept {
     Close();
     return Status::error(Error::kJobObjectFailed);
   }
-  if (AssignProcessToJobObject(containment_job_, GetCurrentProcess()) == 0) {
-    Close();
-    return Status::error(Error::kJobObjectFailed);
-  }
 
-  // 2. Nested memory ceiling, applied to this process only. SILENT_BREAKAWAY_OK
-  // keeps the ssh.exe child out of this job so the ceiling does not also cap
-  // OpenSSH; the child still inherits the containment job above.
+  // 2. Nested memory ceiling, applied to this process AND to its ssh.exe
+  // children. A child created by a process that is in a job is itself in that
+  // job unless the job permits breakaway, so ssh.exe inherits this ceiling.
+  // That is deliberate: the design requires the runtime hard cap to cover the
+  // ssh child, which is the single largest allocator in the tree. Exceeding the
+  // ceiling fails the allocation inside the child, which surfaces as an upload
+  // failure -- visible, per the project's first requirement. Do NOT add
+  // JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK here: it would let the memory-heavy
+  // child out of the only cap that bounds it.
   memory_job_ = CreateJobObjectW(nullptr, nullptr);
   if (memory_job_ == nullptr) {
     Close();
     return Status::error(Error::kJobObjectFailed);
   }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION memory_info{};
-  memory_info.BasicLimitInformation.LimitFlags =
-      JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+  memory_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
   memory_info.JobMemoryLimit = static_cast<SIZE_T>(memory_limit_mb) * 1024u * 1024u;
   if (SetInformationJobObject(memory_job_, JobObjectExtendedLimitInformation, &memory_info,
                               sizeof(memory_info)) == 0) {

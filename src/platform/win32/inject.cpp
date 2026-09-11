@@ -18,6 +18,7 @@ static_assert(sizeof(INPUT) == 40, "INPUT must be 40 bytes on x64");
 namespace picopaste::win32 {
 namespace {
 
+constexpr WORD kKeyEventExtended = 0x0001;
 constexpr WORD kKeyEventKeyUp = 0x0002;
 constexpr LONG kKeyDownMask = static_cast<LONG>(0x8000);
 
@@ -25,12 +26,12 @@ bool IsKeyDown(int vk) noexcept {
   return (GetAsyncKeyState(vk) & kKeyDownMask) != 0;
 }
 
-INPUT MakeKey(WORD vk, bool key_up) noexcept {
+INPUT MakeKey(WORD vk, bool key_up, bool extended = false) noexcept {
   INPUT event{};
   event.type = INPUT_KEYBOARD;
   event.ki.wVk = vk;
   event.ki.wScan = 0;
-  event.ki.dwFlags = key_up ? kKeyEventKeyUp : 0;
+  event.ki.dwFlags = (key_up ? kKeyEventKeyUp : 0) | (extended ? kKeyEventExtended : 0);
   event.ki.time = 0;
   event.ki.dwExtraInfo = 0;
   return event;
@@ -56,12 +57,29 @@ SendChordResult SendPasteChord() noexcept {
   // A physically held Alt or Win merges into the synthetic chord
   // (Ctrl+Alt+Shift+V or a Win chord) and the terminal does not treat it as
   // paste. Release those first; Shift and Ctrl are part of the chord anyway.
-  INPUT release[3];
+  //
+  // VK_MENU is the generic Alt and maps to the non-extended (left) scan code,
+  // so it cannot clear a held right Alt; VK_LMENU/VK_RMENU name the two keys.
+  // The right Alt is an extended key (0xE0 scan prefix) and needs
+  // KEYEVENTF_EXTENDEDKEY; the left Alt does not. (See "Extended-Key Flag" in
+  // the Keyboard Input overview.)
+  struct HeldModifier {
+    WORD vk;
+    bool extended;
+  };
+  constexpr HeldModifier kHeldModifiers[] = {
+      {VK_LMENU, false},
+      {VK_RMENU, true},
+      {VK_LWIN, false},
+      {VK_RWIN, false},
+  };
+  constexpr int kHeldModifierCount =
+      static_cast<int>(sizeof(kHeldModifiers) / sizeof(kHeldModifiers[0]));
+  INPUT release[kHeldModifierCount];
   int release_count = 0;
-  const int release_keys[3] = {VK_MENU, VK_LWIN, VK_RWIN};
-  for (int i = 0; i < 3; ++i) {
-    if (IsKeyDown(release_keys[i])) {
-      release[release_count] = MakeKey(static_cast<WORD>(release_keys[i]), true);
+  for (int i = 0; i < kHeldModifierCount; ++i) {
+    if (IsKeyDown(kHeldModifiers[i].vk)) {
+      release[release_count] = MakeKey(kHeldModifiers[i].vk, true, kHeldModifiers[i].extended);
       ++release_count;
     }
   }

@@ -39,6 +39,7 @@ enum class Error : std::uint8_t {
   kRenameFailed,
   kRemoveFailed,
   kSizeMismatch,        // remote byte count != local byte count
+  kBufferTooSmall,      // remote file larger than the caller's read buffer
 
   // Paste injection
   kClipboardSetFailed,

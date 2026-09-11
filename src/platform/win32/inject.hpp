@@ -2,10 +2,11 @@
 //
 // The remote path is put on the clipboard with the vendored clip library (its
 // raw SetClipboardData path leaves a system-owned HGLOBAL, so the text outlives
-// this process without an OLE flush). The keystroke itself is SendInput, and
-// its return value is checked against the number of events submitted --
-// including any modifier-release events added first -- so a refused insert is
-// reported, never mistaken for success.
+// this process without an OLE flush). The keystroke itself is SendInput. The
+// modifier-release pre-pass is a separate SendInput call with its own
+// submitted-count check, and the 6-event Ctrl+Shift+V chord is checked against
+// its own submitted count, so a refused insert is reported, never mistaken for
+// success.
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -51,8 +52,8 @@ struct SendChordResult {
   DWORD last_error = 0;
 };
 
-// Release any physically held Alt/Win key, then send Ctrl+Shift+V, verifying
-// the accepted event count against the submitted count.
+// Release any physically held Alt/Win key (its own count-checked SendInput),
+// then send the 6-event Ctrl+Shift+V chord (count-checked independently).
 SendChordResult SendPasteChord() noexcept;
 
 // Set the clipboard text, wait, re-check focus, send the chord, and optionally

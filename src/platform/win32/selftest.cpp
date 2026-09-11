@@ -199,10 +199,8 @@ void CheckHotkey(const Config* config) noexcept {
 }
 
 // --- 5. single-instance mutex ----------------------------------------------
-void CheckSingleInstance(std::uint16_t port) noexcept {
-  wchar_t name[64] = {};
-  (void)swprintf(name, 64, L"Local\\picopaste-%u", static_cast<unsigned>(port));
-  UniqueHandle mutex(CreateMutexW(nullptr, FALSE, name));
+void CheckSingleInstance() noexcept {
+  UniqueHandle mutex(CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName));
   char detail[256] = {};
   if (mutex.valid() == false) {
     (void)std::snprintf(detail, sizeof(detail), "CreateMutexW failed (GetLastError=%lu)",
@@ -341,7 +339,7 @@ Status RunSelfTest(const SelfTestOptions& options) noexcept {
   CheckWicEncode();
   CheckSendInput();
   CheckHotkey(options.config);
-  CheckSingleInstance(options.port);
+  CheckSingleInstance();
   CheckJobObjects(options.config);
   CheckSftp(options.config);
   CheckMemory();

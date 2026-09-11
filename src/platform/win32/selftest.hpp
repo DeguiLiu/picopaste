@@ -17,8 +17,6 @@ struct SelfTestOptions {
   const Config* config = nullptr;
   // Reserved for the end-to-end upload check (M5); currently reports SKIP.
   bool e2e = false;
-  // Port used for the single-instance mutex probe.
-  std::uint16_t port = 0;
 };
 
 // Run the table to stdout. Returns kOk only when no mandatory capability failed.

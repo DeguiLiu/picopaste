@@ -699,7 +699,7 @@ Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept {
   GlobalUnlock(data);
   if (encoded.has_value()) {
     temp_guard.Keep();
-    encoded.value().source = formats.has_dibv5 ? "DIBV5" : "DIB";
+    encoded.value().source.assign(osp::TruncateToCapacity, formats.has_dibv5 ? "DIBV5" : "DIB");
   }
   return encoded;
 }

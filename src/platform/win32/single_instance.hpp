@@ -2,12 +2,17 @@
 //
 // Two jobs, deliberately:
 //   1. a containment job with KILL_ON_JOB_CLOSE and NO memory limit, holding
-//      this process and (by inheritance) its ssh.exe child, so a crash here
-//      cannot orphan the tunnel;
+//      the ssh.exe child (assigned explicitly at spawn) so this process's
+//      death -- including a hard TerminateProcess -- cannot orphan the tunnel.
+//      This process is deliberately NOT a member: closing the last handle to a
+//      KILL_ON_JOB_CLOSE job terminates every associated process, so joining
+//      that job ourselves would make Close() (and every early-return error
+//      path) a self-kill;
 //   2. a nested job carrying JOB_OBJECT_LIMIT_JOB_MEMORY, applied to this
-//      process only. It also sets SILENT_BREAKAWAY_OK so the ssh.exe child is
-//      not pulled into it -- otherwise the 32 MB ceiling would also cap
-//      OpenSSH, which needs ~10 MB of its own.
+//      process AND to its ssh.exe children: a child created by a process in a
+//      job is itself in that job unless the job permits breakaway. That is
+//      deliberate -- the runtime hard cap must cover the ssh child, which is
+//      the largest allocator in the tree.
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -33,6 +38,13 @@ namespace picopaste::win32 {
 // Longest image path we record for the owning instance.
 inline constexpr std::size_t kOwnerImageChars = 260;
 
+// Session-scoped kernel object names. Local\ is deliberate: the Windows
+// clipboard is per-session, so a second Windows session legitimately needs its
+// own instance. The port is deliberately absent -- the requirement is a single
+// process per session regardless of configuration.
+inline constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\picopaste";
+inline constexpr wchar_t kSingleInstanceOwnerName[] = L"Local\\picopaste.owner";
+
 // Owns the named mutex, the owner-info section, and the two job objects for the
 // process lifetime. Move-only-free: create one at start-up and keep it.
 class SingleInstance final {
@@ -42,9 +54,11 @@ class SingleInstance final {
   SingleInstance(const SingleInstance&) = delete;
   SingleInstance& operator=(const SingleInstance&) = delete;
 
-  // Create Local\picopaste-<port>. On conflict returns kSingleInstanceExists
-  // and, when available, the owner's PID and image path in the out params.
-  Status Acquire(std::uint16_t port, std::uint32_t* owner_pid, wchar_t* owner_image,
+  // Create the session-wide mutex. On conflict returns kSingleInstanceExists
+  // and, when the owner has published it, the owner's PID and image path in
+  // the out params. A zero owner_pid with an empty image on that error means
+  // the identity was explicitly unavailable, never that no owner exists.
+  Status Acquire(std::uint32_t* owner_pid, wchar_t* owner_image,
                  std::size_t owner_image_chars) noexcept;
 
   // Create the containment job and the nested memory job. On any failure

@@ -13,21 +13,27 @@ constexpr UINT kMenuQuit = 1;
 constexpr wchar_t kWindowClass[] = L"picopaste-tray";
 
 // Three colour-coded icons: blue for healthy, amber for warning, red for error.
-// These are the shared system icons (LoadIconW with a null instance). They need
-// no gdi32 drawing and survive correctly; DestroyIcon must NOT be called on
-// them. (A hand-drawn green/amber/red set would require gdi32, which this
-// target does not link.)
+// These are the shared system icons, addressed by their resource IDs via
+// MAKEINTRESOURCEW. The IDs are spelled numerically and cast through ULONG_PTR
+// because mingw and MSVC disagree on whether the IDI_* macros are integers or
+// MAKEINTRESOURCE pointers. DestroyIcon must NOT be called on these.
 HICON MakeStateIcon(TrayState state) noexcept {
+  ULONG_PTR resource = 32516;  // IDI_ASTERISK: blue "i"
   switch (state) {
     case TrayState::kHealthy:
-      return LoadIconW(nullptr, IDI_INFORMATION);  // blue "i"
+      resource = 32516;  // IDI_ASTERISK
+      break;
     case TrayState::kWarning:
-      return LoadIconW(nullptr, IDI_WARNING);  // amber triangle
+      resource = 32515;  // IDI_EXCLAMATION: amber triangle
+      break;
     case TrayState::kError:
-      return LoadIconW(nullptr, IDI_ERROR);  // red cross
+      resource = 32513;  // IDI_HAND: red cross
+      break;
     default:
-      return LoadIconW(nullptr, IDI_APPLICATION);
+      resource = 32512;  // IDI_APPLICATION
+      break;
   }
+  return LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(resource));
 }
 
 }  // namespace

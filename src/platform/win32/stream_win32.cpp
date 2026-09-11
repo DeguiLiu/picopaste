@@ -140,8 +140,10 @@ Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
   closed_ = false;
 
   if (options.containment_job != nullptr) {
-    // Best effort: the containment job also covers children implicitly, but an
-    // explicit assignment makes the ownership independent of inheritance.
+    // Explicit assignment is the only mechanism: the parent is deliberately not
+    // a member of the containment job, so there is no inheritance to fall back
+    // on. The job's sole handle is the parent's, so the kernel kills this child
+    // with it whenever the parent dies.
     (void)AssignProcessToJobObject(options.containment_job, process_);
   }
   return Status::success();

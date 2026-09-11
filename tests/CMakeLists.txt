@@ -23,6 +23,7 @@ add_executable(picopaste_tests
   test_config.cpp
   test_log.cpp
   test_lifecycle.cpp
+  test_memory_budget.cpp
   test_hook_install.cpp
   test_dir_ops.cpp
 )
@@ -37,3 +38,15 @@ endif()
 
 include(Catch)
 catch_discover_tests(picopaste_tests)
+
+# ---------------------------------------------------------------------------
+# Mechanical gates for design promises that were previously only intentions.
+# Both are CMake scripts (not shell), so they run identically under the Linux
+# and Windows CI jobs via ctest. See tools/check_*.cmake for what they enforce.
+# ---------------------------------------------------------------------------
+add_test(NAME gate_no_scripts
+  COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+          -P "${CMAKE_SOURCE_DIR}/tools/check_no_scripts.cmake")
+add_test(NAME gate_posix_leak
+  COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+          -P "${CMAKE_SOURCE_DIR}/tools/check_posix_leak.cmake")

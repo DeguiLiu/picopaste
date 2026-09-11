@@ -1,0 +1,22 @@
+PicoJSON — vendored single header JSON parser/serializer.
+
+Upstream:  https://github.com/kazuho/picojson
+Pinned:    tag v1.3.0 (latest release; commit 25fc213cca61ea22b3c2e4db8def9927562ba5f7)
+Licence:   BSD 2-Clause (see LICENSE in this directory)
+Files:     picojson.h (1010 lines), LICENSE
+
+Acquired from the GitHub release tarball:
+  https://github.com/kazuho/picojson/archive/refs/tags/v1.3.0.tar.gz
+  sha256(tarball)  = 056805ca2691798f5545935a14bb477f2e1d827c9fb862e6e449dbea22801c7d
+  sha256(picojson.h) = 5ddf7276d04926da7be243e7af49258e78cc27278ee9097ba45b942c7a6b5f9d
+  sha256(LICENSE)  = 5585fe141cc7bb08c953f3859db608852968d0bbc625b9b6d95c0bd6349bacb6
+
+Verbatim, unmodified. Compiled without PICOJSON_USE_INT64 (that option emits an
+upstream assignment-in-condition warning which -Werror rejects); JSON numbers
+therefore round-trip as doubles, exact for integers below 2^53.
+
+Used by src/core/app/hook_install.cpp to merge the remote Claude Code
+settings.json. Chosen over nlohmann/json (newosp's opt-in -DOSP_CONFIG_JSON
+path) because enabling that requires editing root CMakeLists.txt and pulls a
+~25k-line header for one merge operation; PicoJSON is ~1k lines, BSD, and
+compiles warning-clean under -Wall -Wextra -Wpedantic -Werror.

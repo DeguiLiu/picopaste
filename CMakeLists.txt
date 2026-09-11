@@ -19,10 +19,18 @@ option(PICOPASTE_WERROR "Treat warnings as errors" OFF)
 set(PICOPASTE_CONFIG_FORMAT "ini" CACHE STRING "newosp config backend: ini|toml")
 
 # ---------------------------------------------------------------------------
-# newosp — required, not optional.
+# newosp -- required, not optional, and currently PINNED TO A BRANCH.
 #
-# Points at the `windows` worktree while the MSVC platform layer is developed
-# there; switch to the main checkout once that branch merges.
+# The Windows build depends on newosp's `windows` branch, NOT on `main`. On
+# main, osp/platform.hpp reads windows.h's RT_VERSION (a resource-type constant)
+# as the RT-Thread marker and then includes a non-existent <rtthread.h>, so any
+# Windows translation unit that pulls windows.h first fails to compile. That fix
+# lives on `windows` and is not yet merged.
+#
+# The branch is recorded in two places and they must agree:
+#   - .github/workflows/ci.yml  (PICOPASTE_NEWOSP_REPO / PICOPASTE_NEWOSP_REF)
+#   - docs/build/windows-compile-test.md (step 1)
+# Drop the pin once `windows` merges into main.
 # ---------------------------------------------------------------------------
 set(PICOPASTE_NEWOSP_DIR "$ENV{HOME}/newosp-windows" CACHE PATH "Path to the newosp checkout")
 
@@ -68,6 +76,50 @@ function(picopaste_apply_flags target)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Vendored third-party headers are not ours to fix, and their warnings must
+# never be promoted to errors by our -Werror posture.
+#
+# A plain SYSTEM include directory is not sufficient here: hook_install.cpp
+# includes picojson by relative path ("../../../third_party/picojson/..."), and
+# every compiler classifies a header by *how it was found*. A relative include
+# is found through the current-file search, so it stays a normal header and its
+# -Wmaybe-uninitialized (GCC -O2+) survives -isystem. That is why the previous
+# per-target approach would not have worked and why the single-site
+# `#pragma GCC diagnostic` existed (and did nothing for MSVC, which ignores it).
+#
+# Instead a generated shim is force-included into the whole target. It pulls
+# the vendored headers through <> (the system/external search path) before the
+# product source reaches them; the include guard then makes the later relative
+# include a no-op, and the header is system/external for the entire TU. This
+# covers every current and future TU in the target on both toolchains, rather
+# than only the one file that happens to carry a pragma today.
+#
+# The `#pragma GCC diagnostic` in src/core/app/hook_install.cpp is now redundant
+# (the header is a system header before that include is reached) but is left in
+# place: removing it is the source owner's call, and it is harmless.
+# ---------------------------------------------------------------------------
+set(PICOPASTE_VENDOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+set(PICOPASTE_VENDOR_SHIM "${CMAKE_CURRENT_BINARY_DIR}/picopaste_vendor_system.hpp")
+file(WRITE "${PICOPASTE_VENDOR_SHIM}"
+  "#pragma once\n#include <picojson/picojson.h>\n")
+
+function(picopaste_apply_vendor_includes target)
+  if(MSVC)
+    # /external:I declares the tree external; /external:W0 keeps its warnings
+    # out of /WX. /FI is the MSVC equivalent of -include.
+    target_compile_options(${target} PRIVATE
+      /external:W0
+      "/external:I${PICOPASTE_VENDOR_DIR}"
+      "/FI${PICOPASTE_VENDOR_SHIM}")
+  else()
+    # SYSTEM makes -isystem; the shim's <picojson/...> resolves there and is
+    # therefore exempt from -Werror.
+    target_include_directories(${target} SYSTEM PRIVATE "${PICOPASTE_VENDOR_DIR}")
+    target_compile_options(${target} PRIVATE -include "${PICOPASTE_VENDOR_SHIM}")
+  endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Core — platform-neutral. Each subdirectory appends its own sources, so
 # parallel workstreams never touch a shared file.
 # ---------------------------------------------------------------------------
@@ -75,6 +127,7 @@ add_library(picopaste_core STATIC)
 target_include_directories(picopaste_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(picopaste_core PUBLIC osp)
 picopaste_apply_flags(picopaste_core)
+picopaste_apply_vendor_includes(picopaste_core)
 
 add_subdirectory(src/core/sftp)
 add_subdirectory(src/core/log)
@@ -93,6 +146,7 @@ if(WIN32)
   target_link_libraries(picopaste PRIVATE picopaste_core
     user32 shell32 ole32 windowscodecs shlwapi advapi32)
   picopaste_apply_flags(picopaste)
+  picopaste_apply_vendor_includes(picopaste)
   add_subdirectory(src/platform/win32)
 endif()
 

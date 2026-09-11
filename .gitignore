@@ -1,17 +1,19 @@
-build/
-build-*/
-out/
-cmake-build-*/
-CMakeCache.txt
-CMakeFiles/
-CMakeUserPresets.json
+# CMake build trees at the repository root. One per configure; never source.
+# Root-anchored deliberately: an unanchored `build*/` also matches docs/build/.
+/build*/
+
+# Object files and linker by-products from manual compiler invocations.
+# (These were previously accumulating in the repository root.)
 *.obj
 *.o
-*.exe
 *.pdb
 *.ilk
-*.log
-.vs/
+*.exp
+*.lib
+*.exe
+
+# Editor and OS noise.
 .vscode/
+.idea/
 .cache/
 compile_commands.json

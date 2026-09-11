@@ -22,6 +22,7 @@
 #include "osp/platform.hpp"
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include <cstdint>
 

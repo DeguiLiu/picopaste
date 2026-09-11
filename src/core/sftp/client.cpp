@@ -1,9 +1,11 @@
 // picopaste — SFTP v3 client (see include/picopaste/sftp/client.hpp).
 //
-// Synchronous, single-threaded by contract. Scratch is per-instance (tx_/rx_):
-// a 64 KB chunk plus a 16 KB inbound frame, reused for every request, never
-// heap-allocated. Uploading a file is O(kWriteChunkBytes) memory and streams
-// straight from the local file descriptor into the outbound WRITE payload.
+// The single owner of the channel: every request is emitted and every reply
+// parsed here, against one request-id counter and one frame codec. Synchronous,
+// single-threaded by contract. Scratch is per-instance (tx_/rx_): a 64 KB
+// outbound chunk plus a 64 KB inbound frame, reused for every request, never
+// heap-allocated. Uploading a file streams straight from the local file
+// descriptor into the outbound WRITE payload.
 #include "picopaste/sftp/client.hpp"
 
 #include <cerrno>
@@ -74,7 +76,7 @@ long long ReadFull(int fd, std::uint8_t* dst, std::size_t len) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Frame I/O
+// Frame I/O (the one codec)
 // ---------------------------------------------------------------------------
 
 // Reads one frame (length prefix + type + payload) into `rx`. Rejects a zero
@@ -149,6 +151,18 @@ Error ReadStatus(ByteStream& s, std::uint8_t* rx, std::uint32_t rx_cap, std::uin
   return ParseStatusRest(r, code);
 }
 
+// ---------------------------------------------------------------------------
+// Upload-name pattern (declared in client.hpp; the listing filter).
+// ---------------------------------------------------------------------------
+
+bool IsDigit(char c) noexcept { return (c >= '0') && (c <= '9'); }
+
+bool IsLowerHex(char c) noexcept { return IsDigit(c) || ((c >= 'a') && (c <= 'f')); }
+
+std::uint32_t Dec2(const char* p) noexcept {
+  return (static_cast<std::uint32_t>(p[0] - '0') * 10u) + static_cast<std::uint32_t>(p[1] - '0');
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -167,6 +181,86 @@ Status Client::SendPacket(Pkt type, const void* payload, std::uint32_t len) noex
   }
   if ((len > 0u) && !stream_.write(stream_.ctx, static_cast<const std::uint8_t*>(payload), len)) {
     return Status::error(Error::kChannelWriteFailed);
+  }
+  return Status::success();
+}
+
+// ---------------------------------------------------------------------------
+// Open / close primitives
+// ---------------------------------------------------------------------------
+
+Status Client::OpenHandle(Pkt request, const char* path, const void* extra, std::uint32_t extra_len,
+                          std::uint8_t* handle, std::uint32_t& handle_len, bool& missing) noexcept {
+  missing = false;
+  handle_len = 0u;
+  if (!initialized_) {
+    return Status::error(Error::kChannelNotConnected);
+  }
+  const std::uint32_t id = next_id_++;
+  BufferWriter w(tx_, sizeof(tx_));
+  (void)w.WriteU32(id);
+  if (!w.WriteCString(path, kMaxPathBytes)) {
+    return Status::error(Error::kOpenFailed);
+  }
+  if ((extra_len > 0u) && !w.WriteBytes(extra, extra_len)) {
+    return Status::error(Error::kOpenFailed);
+  }
+  if (!w.ok()) {
+    return Status::error(Error::kOpenFailed);
+  }
+  if (!SendPacket(request, tx_, static_cast<std::uint32_t>(w.size()))) {
+    return Status::error(Error::kOpenFailed);
+  }
+
+  std::uint8_t type = 0u;
+  std::uint32_t len = 0u;
+  const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
+  if (e != Error::kOk) {
+    return Status::error((e == Error::kChannelReadFailed) ? Error::kOpenFailed : e);
+  }
+  BufferReader r(rx_, len);
+  if (ReadRequestId(r, id) != Error::kOk) {
+    return Status::error(Error::kSftpProtocolError);
+  }
+  if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
+    FxStatus code = FxStatus::kFailure;
+    if (ParseStatusRest(r, code) != Error::kOk) {
+      return Status::error(Error::kSftpProtocolError);
+    }
+    if (code == FxStatus::kNoSuchFile) {
+      missing = true;
+      return Status::success();
+    }
+    return Status::error(Error::kOpenFailed);
+  }
+  if (type != static_cast<std::uint8_t>(Pkt::kHandle)) {
+    return Status::error(Error::kSftpProtocolError);
+  }
+  const char* h = nullptr;
+  std::uint32_t h_len = 0u;
+  if (!r.ReadString(h, h_len) || (h_len == 0u) || (h_len > kMaxHandleBytes)) {
+    return Status::error(Error::kOpenFailed);
+  }
+  (void)std::memcpy(handle, h, h_len);
+  handle_len = h_len;
+  return Status::success();
+}
+
+Status Client::CloseHandle(const std::uint8_t* handle, std::uint32_t handle_len) noexcept {
+  const std::uint32_t id = next_id_++;
+  BufferWriter w(tx_, sizeof(tx_));
+  (void)w.WriteU32(id);
+  (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+  if (!w.ok()) {
+    return Status::error(Error::kCloseFailed);
+  }
+  if (!SendPacket(Pkt::kClose, tx_, static_cast<std::uint32_t>(w.size()))) {
+    return Status::error(Error::kCloseFailed);
+  }
+  FxStatus code = FxStatus::kFailure;
+  const Error e = ReadStatus(stream_, rx_, sizeof(rx_), id, code);
+  if ((e != Error::kOk) || (code != FxStatus::kOk)) {
+    return Status::error(Error::kCloseFailed);
   }
   return Status::success();
 }
@@ -383,7 +477,7 @@ Status Client::MkdirAll(const char* path) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// OPEN / WRITE / CLOSE / STAT
+// OPEN / READ / WRITE / CLOSE / STAT
 // ---------------------------------------------------------------------------
 
 Status Client::UploadFile(const char* remote_path, const char* local_path) noexcept {
@@ -404,52 +498,14 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
   const std::uint64_t local_size = static_cast<std::uint64_t>(st.st_size);
 
   /* OPEN(WRITE|CREAT|TRUNC) */
-  const std::uint32_t open_id = next_id_++;
-  char handle[kMaxHandleBytes];
+  std::uint8_t extras[8];
+  PutBe32(extras, kFxWrite | kFxCreat | kFxTrunc);
+  PutBe32(extras + 4u, 0u); /* empty ATTRS */
+  std::uint8_t handle[kMaxHandleBytes];
   std::uint32_t handle_len = 0u;
-  {
-    BufferWriter w(tx_, sizeof(tx_));
-    (void)w.WriteU32(open_id);
-    if (!w.WriteCString(remote_path, kMaxPathBytes)) {
-      return done(Status::error(Error::kOpenFailed));
-    }
-    (void)w.WriteU32(kFxWrite | kFxCreat | kFxTrunc);
-    (void)w.WriteU32(0u); /* empty ATTRS */
-    if (!w.ok()) {
-      return done(Status::error(Error::kOpenFailed));
-    }
-    const Status sent = SendPacket(Pkt::kOpen, tx_, static_cast<std::uint32_t>(w.size()));
-    if (!sent) {
-      return done(Status::error(Error::kOpenFailed));
-    }
-
-    std::uint8_t type = 0u;
-    std::uint32_t len = 0u;
-    const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
-    if (e != Error::kOk) {
-      return done(Status::error(Error::kOpenFailed));
-    }
-    BufferReader r(rx_, len);
-    if (ReadRequestId(r, open_id) != Error::kOk) {
-      return done(Status::error(Error::kSftpProtocolError));
-    }
-    if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-      FxStatus code = FxStatus::kFailure;
-      if (ParseStatusRest(r, code) != Error::kOk) {
-        return done(Status::error(Error::kSftpProtocolError));
-      }
-      return done(Status::error(Error::kOpenFailed));
-    }
-    if (type != static_cast<std::uint8_t>(Pkt::kHandle)) {
-      return done(Status::error(Error::kSftpProtocolError));
-    }
-    const char* h = nullptr;
-    std::uint32_t h_len = 0u;
-    if (!r.ReadString(h, h_len) || (h_len == 0u) || (h_len > kMaxHandleBytes)) {
-      return done(Status::error(Error::kOpenFailed));
-    }
-    (void)std::memcpy(handle, h, h_len);
-    handle_len = h_len;
+  bool missing = false;
+  if (!OpenHandle(Pkt::kOpen, remote_path, extras, sizeof(extras), handle, handle_len, missing)) {
+    return done(Status::error(Error::kOpenFailed));
   }
 
   /* WRITE chunks, streaming from the local fd directly into the frame. */
@@ -470,7 +526,7 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
     /* Prefix is laid out before the already-read data region. */
     BufferWriter w(tx_, sizeof(tx_));
     (void)w.WriteU32(write_id);
-    (void)w.WriteString(handle, handle_len);
+    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
     (void)w.WriteU64(offset);
     (void)w.WriteU32(chunk);
     if (!w.ok() || (w.size() != data_off)) {
@@ -491,24 +547,8 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
     }
   }
 
-  /* CLOSE */
-  {
-    const std::uint32_t close_id = next_id_++;
-    BufferWriter w(tx_, sizeof(tx_));
-    (void)w.WriteU32(close_id);
-    (void)w.WriteString(handle, handle_len);
-    if (!w.ok()) {
-      return done(Status::error(Error::kCloseFailed));
-    }
-    const Status sent = SendPacket(Pkt::kClose, tx_, static_cast<std::uint32_t>(w.size()));
-    if (!sent) {
-      return done(Status::error(Error::kCloseFailed));
-    }
-    FxStatus code = FxStatus::kFailure;
-    const Error e = ReadStatus(stream_, rx_, sizeof(rx_), close_id, code);
-    if ((e != Error::kOk) || (code != FxStatus::kOk)) {
-      return done(Status::error(Error::kCloseFailed));
-    }
+  if (!CloseHandle(handle, handle_len)) {
+    return done(Status::error(Error::kCloseFailed));
   }
 
   /* STAT + local/remote size comparison. No RENAME happens here. */
@@ -520,6 +560,150 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
     return done(Status::error(Error::kSizeMismatch));
   }
   return done(Status::success());
+}
+
+Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity,
+                        std::uint32_t& size, bool& missing) noexcept {
+  size = 0u;
+  missing = false;
+  if ((path == nullptr) || ((buffer == nullptr) && (capacity > 0u))) {
+    return Status::error(Error::kOpenFailed);
+  }
+
+  std::uint8_t handle[kMaxHandleBytes];
+  std::uint32_t handle_len = 0u;
+  std::uint8_t extras[8];
+  PutBe32(extras, kFxRead);
+  PutBe32(extras + 4u, 0u); /* empty ATTRS */
+  const Status opened =
+      OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
+  if (!opened) {
+    return opened;
+  }
+  if (missing) {
+    return Status::success();
+  }
+  auto fail = [&](Error e) noexcept -> Status {
+    (void)CloseHandle(handle, handle_len);
+    return Status::error(e);
+  };
+
+  std::uint64_t offset = 0u;
+  for (;;) {
+    const std::uint32_t remaining = capacity - size;
+    /* When the buffer is full, ask for one byte so an oversized file is
+       detected instead of silently truncated. */
+    const std::uint32_t ask = (remaining == 0u)
+                                  ? 1u
+                                  : ((remaining < kReadChunkBytes) ? remaining : kReadChunkBytes);
+    const std::uint32_t read_id = next_id_++;
+    BufferWriter w(tx_, sizeof(tx_));
+    (void)w.WriteU32(read_id);
+    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+    (void)w.WriteU64(offset);
+    (void)w.WriteU32(ask);
+    if (!w.ok()) {
+      return fail(Error::kSftpProtocolError);
+    }
+    if (!SendPacket(Pkt::kRead, tx_, static_cast<std::uint32_t>(w.size()))) {
+      return fail(Error::kChannelWriteFailed);
+    }
+
+    std::uint8_t type = 0u;
+    std::uint32_t len = 0u;
+    const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
+    if (e != Error::kOk) {
+      return fail(e);
+    }
+    BufferReader r(rx_, len);
+    if (ReadRequestId(r, read_id) != Error::kOk) {
+      return fail(Error::kSftpProtocolError);
+    }
+    if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
+      FxStatus code = FxStatus::kFailure;
+      if (ParseStatusRest(r, code) != Error::kOk) {
+        return fail(Error::kSftpProtocolError);
+      }
+      if (code == FxStatus::kEof) {
+        break;
+      }
+      return fail(Error::kOpenFailed);
+    }
+    if (type != static_cast<std::uint8_t>(Pkt::kData)) {
+      return fail(Error::kSftpProtocolError);
+    }
+    const char* data = nullptr;
+    std::uint32_t data_len = 0u;
+    if (!r.ReadString(data, data_len)) {
+      return fail(Error::kSftpProtocolError);
+    }
+    if (data_len == 0u) {
+      break; /* no progress: stop rather than spin */
+    }
+    if (data_len > (capacity - size)) {
+      return fail(Error::kBufferTooSmall); /* over capacity: refuse loudly */
+    }
+    (void)std::memcpy(buffer + size, data, data_len);
+    size += data_len;
+    offset += data_len;
+  }
+  return CloseHandle(handle, handle_len);
+}
+
+Status Client::WriteFile(const char* path, const std::uint8_t* bytes,
+                         std::uint32_t length) noexcept {
+  if ((path == nullptr) || ((bytes == nullptr) && (length > 0u))) {
+    return Status::error(Error::kWriteFailed);
+  }
+  std::uint8_t extras[8];
+  /* OpenSSH RENAME is not overwrite-capable, so replace via OPEN(TRUNC). The
+     caller has already taken a verified backup where reversibility matters. */
+  PutBe32(extras, kFxWrite | kFxCreat | kFxTrunc);
+  PutBe32(extras + 4u, 0u); /* empty ATTRS */
+  std::uint8_t handle[kMaxHandleBytes];
+  std::uint32_t handle_len = 0u;
+  bool missing = false;
+  const Status opened =
+      OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
+  if (!opened) {
+    return opened;
+  }
+  auto fail = [&](Error e) noexcept -> Status {
+    (void)CloseHandle(handle, handle_len);
+    return Status::error(e);
+  };
+
+  std::uint64_t offset = 0u;
+  std::uint32_t pos = 0u;
+  while (pos < length) {
+    const std::uint32_t remaining = length - pos;
+    const std::uint32_t chunk = (remaining < kWriteChunkBytes) ? remaining : kWriteChunkBytes;
+    const std::uint32_t write_id = next_id_++;
+    BufferWriter w(tx_, sizeof(tx_));
+    (void)w.WriteU32(write_id);
+    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+    (void)w.WriteU64(offset);
+    (void)w.WriteU32(chunk);
+    if (!w.ok()) {
+      return fail(Error::kWriteFailed);
+    }
+    const std::size_t data_off = w.size();
+    if ((data_off + chunk) > sizeof(tx_)) {
+      return fail(Error::kWriteFailed);
+    }
+    (void)std::memcpy(tx_ + data_off, bytes + pos, chunk);
+    if (!SendPacket(Pkt::kWrite, tx_, static_cast<std::uint32_t>(data_off + chunk))) {
+      return fail(Error::kChannelWriteFailed);
+    }
+    FxStatus code = FxStatus::kFailure;
+    const Error e = ReadStatus(stream_, rx_, sizeof(rx_), write_id, code);
+    if ((e != Error::kOk) || (code != FxStatus::kOk)) {
+      return fail(Error::kWriteFailed);
+    }
+    pos += chunk;
+    offset += chunk;
+  }
+  return CloseHandle(handle, handle_len);
 }
 
 Result<std::uint64_t> Client::StatSize(const char* path) noexcept {
@@ -608,10 +792,188 @@ Status Client::Remove(const char* path) noexcept {
   }
   FxStatus code = FxStatus::kFailure;
   const Error e = ReadStatus(stream_, rx_, sizeof(rx_), id, code);
-  if ((e != Error::kOk) || (code != FxStatus::kOk)) {
+  if (e != Error::kOk) {
     return Status::error(Error::kRemoveFailed);
   }
-  return Status::success();
+  /* A cleanup that races another cleanup must not report failure: "already
+     gone" is the desired end state. */
+  if ((code == FxStatus::kOk) || (code == FxStatus::kNoSuchFile)) {
+    return Status::success();
+  }
+  return Status::error(Error::kRemoveFailed);
+}
+
+// ---------------------------------------------------------------------------
+// OPENDIR / READDIR / CLOSE
+// ---------------------------------------------------------------------------
+
+Result<UploadListing> Client::ListDir(const char* dir) noexcept {
+  UploadListing out{};
+  if ((dir == nullptr) || (dir[0] == '\0')) {
+    return Result<UploadListing>::error(Error::kChannelNotConnected);
+  }
+
+  std::uint8_t handle[kMaxHandleBytes];
+  std::uint32_t handle_len = 0u;
+  bool missing = false;
+  const Status opened = OpenHandle(Pkt::kOpendir, dir, /*extra=*/nullptr, 0u, handle, handle_len,
+                                   missing);
+  if (!opened) {
+    return Result<UploadListing>::error(opened.get_error());
+  }
+  if (missing) {
+    out.dir_missing = true;
+    return Result<UploadListing>::success(out);
+  }
+
+  /* Single close point: every path below joins here before returning. */
+  Error err = Error::kOk;
+  bool done = false;
+  while (!done && (err == Error::kOk)) {
+    const std::uint32_t id = next_id_++;
+    BufferWriter w(tx_, sizeof(tx_));
+    (void)w.WriteU32(id);
+    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+    if (!w.ok()) {
+      err = Error::kSftpProtocolError;
+      break;
+    }
+    if (!SendPacket(Pkt::kReaddir, tx_, static_cast<std::uint32_t>(w.size()))) {
+      err = Error::kChannelWriteFailed;
+      break;
+    }
+
+    std::uint8_t type = 0u;
+    std::uint32_t len = 0u;
+    const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
+    if (e != Error::kOk) {
+      err = e;
+      break;
+    }
+    BufferReader r(rx_, len);
+    if (ReadRequestId(r, id) != Error::kOk) {
+      err = Error::kSftpProtocolError;
+      break;
+    }
+
+    if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
+      FxStatus code = FxStatus::kFailure;
+      if (ParseStatusRest(r, code) != Error::kOk) {
+        err = Error::kSftpProtocolError;
+        break;
+      }
+      if (code == FxStatus::kEof) {
+        done = true;
+      } else {
+        err = Error::kSftpStatusError;
+      }
+      continue;
+    }
+    if (type != static_cast<std::uint8_t>(Pkt::kName)) {
+      err = Error::kSftpProtocolError;
+      break;
+    }
+
+    std::uint32_t count = 0u;
+    if (!r.ReadU32(count) || (count == 0u) || (count > kMaxEntriesPerFrame)) {
+      err = Error::kSftpProtocolError;
+      break;
+    }
+    for (std::uint32_t i = 0u; (i < count) && (err == Error::kOk); ++i) {
+      /* longname and the full ATTRS must be consumed even for entries we skip,
+         or the next NAME entry desynchronises. */
+      const char* fname = nullptr;
+      std::uint32_t fname_len = 0u;
+      const char* longname = nullptr;
+      std::uint32_t longname_len = 0u;
+      AttrsInfo attrs{};
+      if (!r.ReadString(fname, fname_len) || !r.ReadString(longname, longname_len) ||
+          !ParseAttrs(r, attrs)) {
+        err = Error::kSftpProtocolError;
+        break;
+      }
+      if (!MatchesUploadName(fname, fname_len)) {
+        ++out.skipped;
+        continue;
+      }
+      if (out.entries.full()) {
+        out.truncated = true;
+        done = true;
+        break;
+      }
+      DirEntry entry{};
+      entry.name = osp::FixedString<kMaxUploadNameBytes>(osp::TruncateToCapacity, fname, fname_len);
+      entry.mtime = attrs.mtime;
+      entry.has_mtime = attrs.has_acmod_time;
+      entry.size = attrs.size;
+      entry.has_size = attrs.has_size;
+      if (!out.entries.push_back(entry)) {
+        out.truncated = true;
+        done = true;
+        break;
+      }
+    }
+  }
+
+  const Status closed = CloseHandle(handle, handle_len);
+  if (err != Error::kOk) {
+    return Result<UploadListing>::error(err);
+  }
+  if (!closed) {
+    return Result<UploadListing>::error(Error::kCloseFailed);
+  }
+  return Result<UploadListing>::success(out);
+}
+
+// ---------------------------------------------------------------------------
+// Upload-name pattern
+// ---------------------------------------------------------------------------
+
+bool MatchesUploadName(const char* name, std::uint32_t len) noexcept {
+  /* clip-YYYYMMDD-HHMMSS-<hex>.png */
+  constexpr std::uint32_t kMinLen = 5u + 8u + 1u + 6u + 1u + 1u + 4u;  /* 26 */
+  if ((name == nullptr) || (len < kMinLen) || (len > kMaxUploadNameBytes)) {
+    return false;
+  }
+  if (std::memcmp(name, "clip-", 5u) != 0) {
+    return false;
+  }
+  if ((name[13] != '-') || (name[20] != '-')) {
+    return false;
+  }
+  for (std::uint32_t i = 5u; i <= 12u; ++i) {  /* YYYYMMDD */
+    if (!IsDigit(name[i])) {
+      return false;
+    }
+  }
+  for (std::uint32_t i = 14u; i <= 19u; ++i) {  /* HHMMSS */
+    if (!IsDigit(name[i])) {
+      return false;
+    }
+  }
+  const std::uint32_t month = Dec2(name + 9u);
+  const std::uint32_t day = Dec2(name + 11u);
+  const std::uint32_t hour = Dec2(name + 14u);
+  const std::uint32_t minute = Dec2(name + 16u);
+  const std::uint32_t second = Dec2(name + 18u);
+  if ((month < 1u) || (month > 12u) || (day < 1u) || (day > 31u) || (hour > 23u) ||
+      (minute > 59u) || (second > 59u)) {
+    return false;
+  }
+  const std::uint32_t suffix = len - 4u;
+  if (std::memcmp(name + suffix, ".png", 4u) != 0) {
+    return false;
+  }
+  const std::uint32_t hex_len = suffix - 21u;
+  if ((hex_len < 1u) || (hex_len > kMaxUploadHexDigits)) {
+    return false;
+  }
+  for (std::uint32_t i = 21u; i < suffix; ++i) {
+    if (!IsLowerHex(name[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace picopaste::sftp

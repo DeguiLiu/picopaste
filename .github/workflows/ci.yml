@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [none, address+undefined]
+        # Comma, not '+': GCC rejects -fsanitize=address+undefined
+        # (verified on g++ 11), while the comma form is accepted by GCC/Clang.
+        sanitizer: ["none", "address,undefined"]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +31,14 @@ jobs:
           if [ "${{ matrix.sanitizer }}" != "none" ]; then
             FLAGS="-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitizer }} -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitizer }}"
           fi
-          cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON $FLAGS
+          cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON \
+            -DPICOPASTE_NEWOSP_DIR="$HOME/newosp-windows" $FLAGS
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
+      # Runs the full ctest suite, which includes the mechanical gates
+      # (gate_no_scripts, gate_posix_leak) registered in tests/CMakeLists.txt.
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
@@ -52,31 +57,15 @@ jobs:
 
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON
+        # Pass the newosp path explicitly: the CMake default is $ENV{HOME} and
+        # Windows runners do not guarantee HOME==USERPROFILE.
+        run: cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON -DPICOPASTE_NEWOSP_DIR="$env:USERPROFILE/newosp-windows"
 
       - name: Build
         run: cmake --build build --config Release
 
+      # ctest includes the CMake-script gates registered in tests/CMakeLists.txt
+      # (gate_no_scripts, gate_posix_leak); the latter correctly excludes
+      # src/platform/posix/, which is legitimate POSIX and not built on Windows.
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
-
-      - name: POSIX leak lint
-        shell: pwsh
-        # Platform headers must not be reachable from the MSVC path. This is a
-        # cheap backstop for the smoke TU; it fails on a bare mention rather
-        # than on a failed compile, so it names the offending header directly.
-        run: |
-          $bad = @('unistd.h','pthread.h','sched.h','termios.h','sys/epoll.h','sys/socket.h')
-          $hits = @()
-          Get-ChildItem -Recurse -Include *.hpp,*.h,*.cpp -Path src,include |
-            ForEach-Object {
-              $f = $_.FullName
-              foreach ($h in $bad) {
-                if (Select-String -Path $f -Pattern "#\s*include\s*<$([regex]::Escape($h))>" -Quiet) {
-                  $hits += "$f -> $h"
-                }
-              }
-            }
-          if ($hits.Count -gt 0) {
-            Write-Error "POSIX headers reachable on the Windows build:`n$($hits -join "`n")"
-          }
