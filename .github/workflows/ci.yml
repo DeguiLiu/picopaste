@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The Windows platform layer lives on this branch of newosp until it merges.
+  CCLIP_NEWOSP_REPO: https://github.com/DeguiLiu/newosp.git
+  CCLIP_NEWOSP_REF: windows
+
+jobs:
+  linux:
+    name: linux / gcc (core + tests, sanitizers)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address+undefined]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch newosp
+        run: git clone --depth 1 --branch "$CCLIP_NEWOSP_REF" "$CCLIP_NEWOSP_REPO" "$HOME/newosp-windows"
+
+      - name: Configure
+        run: |
+          FLAGS=""
+          if [ "${{ matrix.sanitizer }}" != "none" ]; then
+            FLAGS="-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitizer }} -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitizer }}"
+          fi
+          cmake -S . -B build -DCCLIP_BUILD_TESTS=ON -DCCLIP_WERROR=ON $FLAGS
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: windows / msvc (build + smoke)
+    # This is the ONLY gate that can catch MSVC-only blockers. A mingw
+    # cross-compile cannot: mingw defines __GNUC__ and ships pthread.h and
+    # unistd.h, so it happily compiles headers that MSVC rejects.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch newosp
+        shell: pwsh
+        run: git clone --depth 1 --branch "$env:CCLIP_NEWOSP_REF" "$env:CCLIP_NEWOSP_REPO" "$env:USERPROFILE/newosp-windows"
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64 -DCCLIP_BUILD_TESTS=ON -DCCLIP_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: POSIX leak lint
+        shell: pwsh
+        # Platform headers must not be reachable from the MSVC path. This is a
+        # cheap backstop for the smoke TU; it fails on a bare mention rather
+        # than on a failed compile, so it names the offending header directly.
+        run: |
+          $bad = @('unistd.h','pthread.h','sched.h','termios.h','sys/epoll.h','sys/socket.h')
+          $hits = @()
+          Get-ChildItem -Recurse -Include *.hpp,*.h,*.cpp -Path src,include |
+            ForEach-Object {
+              $f = $_.FullName
+              foreach ($h in $bad) {
+                if (Select-String -Path $f -Pattern "#\s*include\s*<$([regex]::Escape($h))>" -Quiet) {
+                  $hits += "$f -> $h"
+                }
+              }
+            }
+          if ($hits.Count -gt 0) {
+            Write-Error "POSIX headers reachable on the Windows build:`n$($hits -join "`n")"
+          }

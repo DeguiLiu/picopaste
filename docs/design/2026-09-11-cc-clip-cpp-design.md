@@ -167,14 +167,24 @@ ssh -o ClearAllForwardings=yes -s <host> sftp
 
 ## 4. 图片采集与粘贴注入
 
-### 采集：两条路径，都不复制 DIB
+### 采集：统一走临时文件
 
-1. **快路径**：注册剪贴板格式 `"PNG"` 存在时（浏览器截图、部分截图工具的默认行为），直接得到 PNG 字节。以 `GlobalLock` 锁定后**按 64 KB 分块流式读出**，内存占用 O(64 KB)，**零临时文件**。
-2. **回退路径**：`CF_DIBV5`(17) 或 `CF_DIB`(8)。解析 `BITMAPINFOHEADER` 取宽高、位深、stride，用 WIC `CreateBitmapFromMemory` **直接指向 DIB 像素（不复制）**，编码器输出到临时文件（`SHCreateStreamOnFileEx`）；随后从临时文件分块读出。索引色（8bpp）加一层 `IWICFormatConverter`。
+初版的"零拷贝 DIB + 零临时文件"主张与"上传可能持续数秒"**不可同时成立**（评审 P0-2，成立）：若在整段 SFTP 写入期间从剪贴板 HGLOBAL 直接流式读取，就必须全程保持剪贴板打开或 HGLOBAL 有效——那会长时间占锁剪贴板、阻塞其他应用，且指针随时可能随剪贴板所有者更替而失效。
 
-**绝不把 DIB 拷进自己的堆**：一张 4K 截图未压缩约 33 MB，一次复制就会击穿内存预算。这是本设计最重要的内存纪律。
+修正后的单一路径：
 
-编码用 WIC 而非自带 deflate/zlib：它是操作系统自带的编码器，无需向项目引入压缩库。
+1. **`OpenClipboard` → 立即取出并转为临时文件 → `CloseClipboard`**（持锁窗口仅数百毫秒）：
+   - 注册格式 `"PNG"` 存在 → 直接把 PNG 字节写入临时文件；
+   - 否则 `CF_DIBV5`(17) / `CF_DIB`(8) → 解析 `BITMAPINFOHEADER` 取宽高、位深、stride，WIC `CreateBitmapFromMemory` 指向 DIB 像素（编码期间不复制），编码器输出到同一临时文件（`SHCreateStreamOnFileEx`）。索引色（8bpp）经 `IWICFormatConverter`。
+2. **上传从临时文件按 64 KB 分块读**，与剪贴板状态完全解耦；上传结束后删除临时文件。
+
+这条路径同时消掉了"快路径 / 回退路径"的分叉——分叉本身是一类失败模式的来源。代价是每次粘贴多一次磁盘写（4K 截图 PNG 约 2–8 MB，SSD 上可忽略），换来恒定 O(64 KB) 的 I/O 缓冲与可预测的内存上界。
+
+**内存纪律**：绝不把未压缩 DIB 拷进自己的堆——一张 4K 截图未压缩约 33 MB，一次复制即击穿预算。
+
+编码用 WIC 而非自带 deflate/zlib：它是操作系统自带编码器，无需向项目引入压缩库。
+
+**后续可选优化**（不进 v1）：自实现 `IStream`，让 WIC 编码结果直接写入 SFTP 写流，从而去掉临时文件。实现成本约 150 行 COM 样板，收益是省掉一次磁盘往返。
 
 ### 注入
 
@@ -218,7 +228,17 @@ Go 版本用 `debug.SetMemoryLimit(32 << 20)` 拿到了硬上限，C++ 没有等
 
 ### 空闲 CPU 为 0 的实现
 
-不设周期性定时器。所有线程阻塞在 `GetMessageW` / `ReadFile` / `WaitForMultipleObjects` / 信号量上。健康状态由**事件驱动**得出（SFTP 管道 EOF、子进程退出、任何一次请求失败），而非轮询探测。
+初版写"不设周期性定时器"与后文的心跳、60 s 资源采样自相矛盾（评审 P0-3，成立）。准确表述是：
+
+**不设忙轮询。** 一切周期性动作都由**可等待计时器**驱动（`CreateWaitableTimerEx` + `WaitForMultipleObjects`），空闲时所有线程阻塞在内核对象上，不消耗 CPU 时间片。具体地：
+
+- 主线程阻塞在 `GetMessageW`；
+- SFTP 读线程阻塞在管道 `ReadFile`；
+- 上传 worker 阻塞在信号量；
+- 日志线程阻塞在无锁环的通知量；
+- 资源采样与看门狗心跳各由一个可等待计时器唤醒（默认 60 s / 1 s），唤醒成本为微秒级，且不产生轮询。
+
+健康状态主体是**事件驱动**的（SFTP 管道 EOF、子进程退出、任何一次请求失败），计时器只用于低频采样与心跳，不是健康判定手段。
 
 ---
 
@@ -234,29 +254,61 @@ Go 版本用 `debug.SetMemoryLimit(32 << 20)` 拿到了硬上限，C++ 没有等
 | `breaker.hpp` | 通道熔断：连续失败后停止重试风暴，避免把断网变成 CPU 热点 |
 | `mem_pool.hpp` | 固定块内存池：分块缓冲、日志节点；杜绝碎片与热路径动态分配 |
 | `vocabulary.hpp` | `FixedString<N>` / `FixedVector<T,N>` / `expected<V,E>` / `optional<T>` / `NewType`：零堆配置与错误传递 |
-| `config.hpp` + `toml.hpp` | 配置解析（热键、host、远端目录、延时、内存上限、日志级别） |
-| `system_monitor.hpp` | 资源可观测（§5） |
-| `shutdown.hpp` | 优雅退出与资源归位 |
-| `process.hpp` / `shell_commands.hpp` | 子进程创建与收容（需 Windows 适配） |
+| `config.hpp` + `toml.hpp` | 配置解析（热键、host、远端目录、延时、内存上限、日志级别）。**注意 newosp 默认 TOML 后端为 OFF，须显式 `-DOSP_CONFIG_TOML=ON`** |
+| `thread.hpp`（经 CRTP Windows 策略） | 仅为让 `async_log` 与 `timer` 能编译；业务线程直接 `std::thread`，不使用 `osp::Thread` |
+| `shutdown.hpp`（自建替代） | Win32 `SetConsoleCtrlHandler` + 手动 reset event，在 cc-clip-cpp 内实现 |
 
 ### 不使用
 
-`net.hpp` / `socket.hpp` / `event_loop.hpp` / `io_poller.hpp` / `transport.hpp` —— 这些是 epoll / kqueue 专属，Windows 不可用（`platform.hpp` 中 `OSP_HAS_NETWORK` 对 Windows 默认为 0）。本设计不需要通用网络栈：SFTP 走 ssh 子进程管道，无入站端口。
+| 模块 | 原因 |
+|---|---|
+| `net.hpp` / `socket.hpp` / `event_loop.hpp` / `io_poller.hpp` / `transport.hpp` | epoll / kqueue 专属，Windows 不可用。本设计不需要通用网络栈：SFTP 走 ssh 子进程管道，无入站端口 |
+| `shell_commands.hpp` / `shell.hpp` | 依赖过重（拖入 `node_manager_hsm.hpp` → `event_loop.hpp` → `io_poller.hpp`，以及 `bus.hpp`、`fault_collector.hpp`）。子进程创建在 cc-clip-cpp 内自建 |
+| `process.hpp` | 整个文件体在 `#if OSP_PLATFORM_LINUX` 内，Windows 上为空。且唯一消费方是本项目，Job Object 收容逻辑本就属于 cc-clip-cpp |
+| `system_monitor.hpp` | 同上为空实现。本项目只需私有提交 / 工作集 / 句柄数三个数，本地 `GetProcessMemoryInfo` + `GetProcessHandleCount` 约 20 行即可，不值得为单一消费方给 newosp 加模块 |
+| `service_hsm.hpp` | 状态机建在 `hsm.hpp` 之上；`HsmService` 会额外拖入 `fault_collector.hpp`（→ `thread.hpp`）与 `bus` |
+| `bus.hpp` / `discovery` / `qos` / `data_fusion` / `node_*` | 与本项目无关 |
 
-### 需要提交给 newosp 的补丁
+### 需要提交给 newosp 的改动（评审后修正）
 
-精确位置（已核对）：
+**本文档初版在此处的判断是错的**，评审以实测推翻，我已独立复核并确认。原表把 `platform.hpp` 的 hints 宏、`mem_pool.hpp` 的 TSAN 宏、`bus.hpp` 的 prefetch 列为待补丁项，实际它们早已被平台/编译器宏保护：
 
-| 文件 | 位置 | 内容 | 处理 |
-|---|---|---|---|
-| `platform.hpp` | L149-150 | `OSP_LIKELY` / `OSP_UNLIKELY` 用 `__builtin_expect` | 加 `_MSC_VER` 分支（MSVC 上定义为恒等） |
-| `platform.hpp` | L151-152 | `OSP_UNUSED` / `OSP_PRINTF_FMT` 用 `__attribute__` | MSVC 分支：`__declspec` 或置空 |
-| `platform.hpp` | L306 | `__builtin_ia32_pause()` | MSVC 分支：`_mm_pause()` |
-| `platform.hpp` | L308 | `asm volatile("yield" ::: "memory")` | MSVC 分支：`YieldProcessor()` |
-| `mem_pool.hpp` | L60 / L63 | `OSP_TSAN_NO_RACE` 用 `__attribute__((no_sanitize("thread")))` | MSVC 上置空 |
-| `bus.hpp` | L654 / L706 | `__builtin_prefetch` | 若引入 bus 则改为 `_mm_prefetch`；否则不需 |
+| 初版所列条目 | 复核事实 | 判定 |
+|---|---|---|
+| `platform.hpp` L149-152 hints 宏 | 非 `__GNUC__`/`__clang__` 本就走 `#else` 恒等分支 | 无效项 |
+| `mem_pool.hpp` L60/63 TSAN 宏 | `__SANITIZE_THREAD__` / `__has_feature` 均不成立时走 `#else` 空宏 | 无效项 |
+| `bus.hpp` L654/706 prefetch | 两处均在 `#ifdef __GNUC__` 内 | 无效项 |
 
-`toml.hpp` 已有完整的 `_MSC_VER` / `TOML_HAS_BUILTIN` 分支，无需改动。这是好消息：补丁集中在 `platform.hpp` 一个中心头文件，改 4 处即可让整库具备 MSVC 能力。
+真正的阻塞点如下（我逐条读代码确认）：
+
+| 文件 | 事实 | 处理 |
+|---|---|---|
+| `thread.hpp:46-47` | `#else` 分支无条件 `#include <pthread.h>` / `<sched.h>` | **新增 `OSP_PLATFORM_WINDOWS` 分支，以 CRTP 策略类承载** |
+| `thread.hpp:242-250` | `pthread_setschedparam` + `SCHED_FIFO`/`SCHED_IDLE` 无保护 | 同上 |
+| `thread.hpp:402` | `pthread_self()` 作为 `CurrentThreadId()` 的回退 | 同上（改 `GetCurrentThreadId()`） |
+| `mem_pool.hpp:43` | `#include "osp/thread.hpp"` 是**死引用**（全文未使用 `osp::Thread`） | 删除该行 |
+| `spsc_ringbuffer`/`breaker`/`log`/`hsm`/`vocabulary`/`toml`/`config`/`semaphore` | 闭包实测干净 | 无需改动 |
+
+依赖闭包实测（`#include "osp/*.hpp"` 传递闭包）：本设计要用的模块共触达 **17 个头，唯一 MSVC 阻塞项是 `thread.hpp`**。`process.hpp`、`system_monitor.hpp`、`shutdown.hpp`、`io_poller.hpp`、`shell.hpp`、`bus.hpp` 均不在闭包内。
+
+### CRTP 平台策略层
+
+按 newosp 既有的分派优先级（模板参数 > 名字隐藏 > CRTP），把 `osp::Thread` 的平台差异从类体内的 `#if` 抽出为策略类：
+
+```cpp
+struct PosixThreadOps   { static uintptr_t CurrentThreadId() noexcept; /* ... */ };
+struct RtThreadOps      { /* ... */ };
+struct Win32ThreadOps   { /* std::thread + GetCurrentThreadId / SetThreadPriority / SetThreadAffinityMask */ };
+
+template <typename Ops>
+class ThreadT { /* 逻辑与现状逐行等价，平台动作委托 Ops */ };
+
+using Thread = ThreadT<OSP_DEFAULT_THREAD_OPS>;   // 名字与 API 不变
+```
+
+约束：POSIX / RT-Thread 两个策略类是**现有代码的机械搬移，行为逐字不变**，由 newosp 既有 Linux 测试套件回归验证。Windows 策略类**内部委托 `std::thread`**——即用户要求的"直接用 STL 线程库"，只是放在 newosp 的抽象之内。这样 `async_log`（持有 `osp::Thread writer_thread` 成员）与 `timer`（持有 `osp::Thread worker_`）才能在 Windows 上可用。
+
+`toml.hpp` 已有完整的 `_MSC_VER` / `TOML_HAS_BUILTIN` 分支，无需改动。
 
 ---
 
@@ -291,6 +343,13 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 
 无论哪个方案，都需要在远端 `~/.claude/settings.json` 注入一条 hook。由**客户端经 SFTP 读写该文件**完成：读 → 合并（不覆盖用户已有条目）→ 写回，写入前生成时间戳备份，并提供 `restore` 子命令。全程无 shell、无 jq。
 
+**写回必须用非覆盖语义**。本机对真实 `sftp-server` 实测：`RENAME` 到一个**已存在**的目标返回 `FAILURE(4)`（OpenSSH 以 `link()` + `unlink()` 实现改名，`link()` 遇已存在目标即失败）。因此"写临时名 + `RENAME` 覆盖"这套常见的原子写**在 SFTP v3 上不成立**。可行写法二选一：
+
+- 先备份（`settings.json.cc-clip-backup-<ts>`）→ `REMOVE` 旧文件 → `RENAME`；存在一个极短的窗口，但有备份兜底；
+- `OPEN` 截断直接覆盖写入；内容由客户端在内存中合并完成后一次写出，窗口更短。
+
+选后者，并把前者作为它失败时的回退。两条路径都保证：写之前的完整内容已落在带时间戳的备份文件里。
+
 ---
 
 ## 9. 失败模式对照
@@ -321,14 +380,17 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 
 | 层 | 手段 | 在哪里执行 |
 |---|---|---|
-| 平台无关核（SFTP 编解码、上传状态机、配置、日志轮转、退避策略、HSM） | Catch2 + ASan / UBSan / TSan，TDD，覆盖率 ≥ 80% | **本机 Linux**，可完全闭环 |
-| SFTP 客户端 | 对本机真实 `/usr/lib/openssh/sftp-server` 跑集成测试：分包、分块、`STAT` 校验、`RENAME` 原子性、各类错误码 | **本机 Linux** |
-| win32 层编译正确性 | `zig c++ -target x86_64-windows-gnu` 交叉编译门禁，抓 `windows.h` / `wincodec.h` 签名与结构体对齐问题 | 本机 |
-| MSVC 编译正确性 | GitHub Actions `windows-latest` 作业 | CI |
-| win32 运行行为 | 客户端内置 `selftest`：逐项自检剪贴板读图 / WIC 编码 / SendInput 注入数 / 热键注册 / 单实例互斥 / SFTP 连通 / 内存基线，输出通过表 | **你在 Windows 一条命令** |
-| 端到端 | `selftest --e2e`：真实上传一个合成图并回读校验 | 你在 Windows |
+| 平台无关核（SFTP 编解码、上传状态机、配置、日志轮转、退避策略、HSM） | Catch2 + ASan / UBSan / TSan，TDD，覆盖率 ≥ 80% | **本机 Linux**，可完整闭环 |
+| SFTP 客户端 | 对本机真实 `/usr/lib/openssh/sftp-server` 跑集成测试：分包、分块、`STAT` 校验、`RENAME` 原子性。**必须覆盖三类已实测边界**：`MKDIR` 目标已存在（返回 `FAILURE(4)`）、`RENAME` 目标已存在（返回 `FAILURE(4)`）、`ATTRS` 按 `flags` 位掩码解析（实测 `flags=0xf`） | **本机 Linux** |
+| **MSVC 头文件冒烟 TU** | 一个 `.cpp` 逐个 `#include` 全部闭包头（`-DOSP_WITH_NETWORK=OFF`），由 **MSVC** 编译 | **Windows CI** |
+| POSIX 泄漏 lint | `unistd.h` / `pthread.h` / `termios.h` / `fork(` 等符号必须出现在平台 `#if` 内 | 本机 / CI |
+| MSVC 编译与测试 | GitHub Actions `windows-latest` 作业，跑同一套 `ctest` | **CI，自 M1 起跑** |
+| win32 运行行为 | 客户端内置 `selftest`：逐项自检剪贴板读图 / WIC 编码 / `SendInput` 注入数 / 热键注册 / 单实例互斥 / SFTP 连通 / 内存基线，输出通过表 | **你在 Windows 一条命令** |
+| 端到端 | `selftest --e2e`：真实上传一张合成图并回读校验 | 你在 Windows |
 
-关键点：**架构中风险最高的 SFTP 编解码，恰好是唯一能在本机端到端真实验证的部分。**
+**初版在此处的判断已被评审推翻**：原本打算用 `zig c++ -target x86_64-windows-gnu` 交叉编译当门禁。该门禁**无效且有害**——mingw 目标会定义 `__GNUC__` 并自带 `pthread.h` / `unistd.h`，于是 `thread.hpp`、`shutdown.hpp` 这两处最严重的 MSVC 阻塞点在该门禁下**全部通过**，给出虚假信心。zig 仅保留为非权威的本地早期 lint，正式门禁是 MSVC 冒烟 TU + CI。
+
+关键点：**协议层可在本机完整闭环；平台层必须靠 MSVC CI，不能用 mingw 代理。**
 
 ---
 
@@ -345,20 +407,33 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 
 | M | 内容 | 完成判据 |
 |---|---|---|
-| M1 | 工程骨架 + newosp 补丁 + 双平台构建通过 | Linux 与 MSVC 均能构建出 exe |
-| M2 | SFTP v3 编解码 + 对本机真实 sftp-server 的集成测试 | 上传/校验/原子改名测试全绿 |
-| M3 | win32 层：剪贴板采集 + WIC + SendInput + 焦点守卫 | `selftest` 各项通过（Windows） |
-| M4 | 单实例 + Job Object + 托盘 + 热键 + 日志轮转 + HSM 监督 | 长跑无增长、无残留、空闲 CPU 为 0 |
-| M5 | 端到端打通 + hook 注入与回滚 + 文档 | 热键粘贴可用；失败路径均有明确报错 |
+| **M0** | newosp `windows` 分支：`thread.hpp` CRTP 平台策略层 + `Win32ThreadOps`（内部委托 `std::thread`）+ `mem_pool.hpp` 删死引用 + Windows CI + 冒烟 TU | 冒烟 TU 在 MSVC 下编译通过；newosp 既有 Linux 测试全绿（回归）；POSIX 泄漏 lint 通过 |
+| M1 | cc-clip-cpp 骨架 + 双平台构建（依赖 M0） | Linux 与 MSVC 均能产出 exe |
+| M2 | SFTP v3 编解码 + 集成测试 + 三类边界用例（`MKDIR` 已存在 / `RENAME` 已存在 / `ATTRS` 位掩码） | 上传、校验、原子改名测试全绿 |
+| M3 | win32 层：剪贴板采集（统一临时文件）+ WIC + `SendInput` + 焦点守卫 + `selftest` | `selftest` 各项通过（Windows） |
+| M4 | 单实例 + Job Object + 托盘 + 热键 + 日志轮转 + HSM 监督（`hsm.hpp`）+ 本机内存采样 | 长跑无增长、无残留、空闲 CPU 为 0；**内存基线有实测数字且稳态 < 20 MB** |
+| M5 | 端到端 + hook 注入（**非覆盖写回**）+ 远端 `uploads` 保留策略 + 文档 | 热键粘贴可用；失败路径均有明确报错 |
+
+M5 的 `uploads` 保留策略需要 SFTP `OPENDIR` / `READDIR` / `REMOVE`，opcode 从 10 增至 13。没有它，`~/.cache/cc-clip/uploads` 会无界增长，与"极致省资源"相悖。
 
 ---
 
-## 12. 待确认决策
+## 12. 决策记录
 
-1. **通知回传**：方案 A 事件流（推荐，不改 ssh 配置），还是方案 B RemoteForward（沿用已验证链路）？
-2. **v1 范围**：是否包含通知？或先只做"热键 → 上传 → 粘贴"这一条主干？
+| # | 决策 | 结论 | 理由 |
+|---|---|---|---|
+| 1 | 客户端语言 | **C++17 + CMake + MSVC** | 需求第 2 条明文要求逻辑由 C++ 二进制承担；SFTP 编解码 / WIC-COM / Job Object 本就只能在 C 层写；LuaJIT 给不了内核强制的内存硬上限，且 Lua state 无法跨线程共享数据 |
+| 2 | 上传传输 | **常驻 SFTP 子系统通道，自实现 SFTP v3** | 零握手、零远端 shell 依赖、协议级尺寸校验与原子改名。`scp` 的命令行语义坑不适用于 SFTP 协议本身；OpenResty 会为一个不存在的服务端需求引入服务端进程；trzsz 是交互式终端协议（保留为人工传输通道） |
+| 3 | 图片送达 | **上传后把远端绝对路径写入剪贴板，合成 Ctrl+Shift+V** | 消掉远端 bash shim 的唯一途径；上游 Windows 路径已验证手法可行。代价：v1 只服务 Claude Code |
+| 4 | 服务端 | **零代码** | sshd 自带 `sftp-server`；建目录 / 改名 / 校验由协议承担；通知只需 hook 一行 `tee -a` |
+| 5 | 通知回传 | **方案 A 事件流** | 不碰 ssh 配置、无入站端口、无 nonce、通道断开即管道 EOF 立刻可知、无轮询。若实际部署受阻，回落方案 B（RemoteForward + 显式 `127.0.0.1:` 绑定 + 时间戳备份 + restore 子命令） |
+| 6 | 剪贴板策略 | **统一走临时文件** | 见 §4：零拷贝与"上传可能持续数秒"不可兼得；统一路径同时消掉一条分叉 |
+| 7 | 状态机 | **newosp `hsm.hpp`**（`StateMachine` / `TableHsm`） | 唯一"今天就能在 Windows 用"的核心模块，不应被 `thread.hpp` 移植阻塞；`HsmService` 会额外拖入 `fault_collector` 与 `bus` |
+| 8 | newosp Windows 改动范围 | **`thread.hpp` 一个 CRTP 平台策略层 + `mem_pool.hpp` 删 1 行死引用 + Windows CI + 冒烟 TU** | 见 §6。四项后端（`process` / `system_monitor` / `shutdown` / `io_poller`）经 YAGNI 复核后**不做** |
+| 9 | newosp 分支 | **worktree `~/newosp-windows`，分支 `windows`，基于 `e1c6692`** | 不打扰用户 `~/newosp` 的 main 工作区；全部为新增平台分支，风险低，后续可合并回 main 使 newosp 成为双平台库 |
+| 10 | v1 范围 | **先打通"热键 → 上传 → 粘贴"主干，通知为 M5** | 主干是四个痛点的集中处；M5 可独立推迟而不影响主干可用 |
 
-**已确认的前提（若假设有误请指出）**
+**已确认的前提**
 - 常驻后台通道需要免密认证（ssh-agent 或免密密钥）；否则需 `login` 子命令手动预热一次。
 - 上传目录沿用 `~/.cache/cc-clip/uploads`。
 - 远端 SFTP 子系统缺失时，**不做第二条上传代码路径**，而是给出可操作的报错。
@@ -366,6 +441,11 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 ---
 
 ## 13. 附：上游协议设计评估摘要
+
+本文档中所有 `#NN` 编号均指**上游仓库 `ShunmeiCho/cc-clip` 的 issue**（本文写作时的 fork `DeguiLiu/cc-clip` 已禁用 issues，故在 fork 下查询会返回 404）。两条关键引用已核实存在且标题与论点一致：
+
+- `ShunmeiCho/cc-clip#80`（closed）："`cc-clip send` reports success but file is not uploaded to remote server (Windows → Linux)" —— §9 中"上传谎报成功"的来源。
+- `ShunmeiCho/cc-clip#140`（closed）："Windows: SendKeys auto-paste is silently dropped by Electron terminals (Wave)" —— §4 中"`SendKeys` 被 Chromium/Electron 终端吞掉却仍返回成功"的来源。
 
 评估结论支撑了"不兼容上游协议"的决策，摘要如下：
 
