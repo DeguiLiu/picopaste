@@ -25,6 +25,66 @@ jobs:
       - name: Fetch newosp
         run: git clone --depth 1 --branch "$PICOPASTE_NEWOSP_REF" "$PICOPASTE_NEWOSP_REPO" "$HOME/newosp-windows"
 
+      # The integration tests shell out to `ssh -s localhost sftp` and rely on
+      # ssh's own host-key checking, so a runner without a trusted local sshd
+      # makes every one of them SKIP -- the SFTP layer would never be exercised.
+      # Start a loopback-only sshd on port 2222 and pin the name `localhost` to
+      # that port in ~/.ssh/config; the tests' unmodified ssh command honours it
+      # (first matching Host block wins, so no other config may pre-empt it).
+      # Port >1024 and same-user auth mean no root is needed; fresh keys every
+      # run make a stale known_hosts entry impossible.
+      - name: Start local sshd for SFTP integration tests
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+          fi
+          # sshd's privilege-separation directory; the runner user cannot make
+          # it under /run on its own.
+          sudo mkdir -p /run/sshd
+          sudo chmod 0755 /run/sshd
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/ci_host_ed25519 -N '' -q
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N '' -q
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          cat > ~/.ssh/ci_sshd_config <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $HOME/.ssh/ci_host_ed25519
+          PidFile $HOME/.ssh/ci_sshd.pid
+          AuthorizedKeysFile $HOME/.ssh/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          UsePAM no
+          # Loopback-only daemon on an ephemeral runner; StrictModes would only
+          # add a home-directory-permissions failure mode we cannot control.
+          StrictModes no
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          EOF
+          /usr/sbin/sshd -f ~/.ssh/ci_sshd_config
+          cat > ~/.ssh/config <<'EOF'
+          Host localhost
+            Port 2222
+          EOF
+          chmod 600 ~/.ssh/config
+          # Wait for the listener, then trust its host key under the alias the
+          # tests connect with ([localhost]:2222 for a non-default port).
+          for _ in $(seq 1 20); do
+            if ssh-keyscan -p 2222 -T 2 localhost 2>/dev/null | grep -q .; then
+              break
+            fi
+            sleep 1
+          done
+          ssh-keyscan -p 2222 localhost >> ~/.ssh/known_hosts
+          # Fail loudly if passwordless ssh still does not work rather than
+          # letting the integration tests quietly report SKIP.
+          ssh -o BatchMode=yes -o LogLevel=ERROR -s localhost sftp </dev/null
+          echo "local sftp subsystem is up"
+
       - name: Configure
         run: |
           FLAGS=""

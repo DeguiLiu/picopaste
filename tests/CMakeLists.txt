@@ -27,7 +27,8 @@ add_executable(picopaste_tests
   test_hook_install.cpp
   test_dir_ops.cpp
 )
-target_link_libraries(picopaste_tests PRIVATE picopaste_core Catch2::Catch2WithMain)
+target_link_libraries(picopaste_tests PRIVATE picopaste_core Catch2::Catch2WithMain
+  picopaste_msvc_crt)
 
 if(WIN32)
   # The tests exercise the real ssh SFTP channel. picopaste::test::SpawnStream
@@ -47,7 +48,12 @@ else()
 endif()
 
 include(Catch)
-catch_discover_tests(picopaste_tests)
+# When the local sftp subsystem is unavailable every case in an integration
+# test SKIPs, and a run with zero executed tests exits 4. Catch2's
+# --allow-running-no-tests would turn that into a PASS, which is the exact
+# dishonesty this suite exists to prevent. SKIP_RETURN_CODE instead tells ctest
+# to report the case as Skipped -- an honest "did not run".
+catch_discover_tests(picopaste_tests PROPERTIES SKIP_RETURN_CODE 4)
 
 # ---------------------------------------------------------------------------
 # Mechanical gates for design promises that were previously only intentions.

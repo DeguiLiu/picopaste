@@ -12,7 +12,7 @@
 //   - counters are zero when the platform cannot report them.
 //
 // Linux is implemented inline below (reads /proc/self/status and
-// /proc/self/statm). On Windows the symbol is only declared here; the win32
+// /proc/self/fd). On Windows the symbol is only declared here; the win32
 // workstream provides the definition (GetProcessMemoryInfo +
 // GetProcessHandleCount + GetProcessMemoryInfo.PeakWorkingSetSize).
 
@@ -117,27 +117,23 @@ inline MemorySnapshot SampleMemory() noexcept {
     return snapshot;
   }
   snapshot.private_bytes = detail::StatusKb(status, "VmData:");
-  snapshot.peak_bytes = detail::StatusKb(status, "VmHWM:");
   snapshot.thread_count = detail::StatusU32(status, "Threads:");
 
-  char statm[256];
-  if (detail::ReadProcFile("/proc/self/statm", statm, sizeof(statm))) {
-    // fields: size resident shared text lib data dt (pages)
-    const char* at = statm;
-    char* end = nullptr;
-    (void)std::strtoull(at, &end, 10);  // skip "size"
-    at = (end == at) ? at : end;
-    while (' ' == *at) {
-      ++at;
-    }
-    const unsigned long long resident_pages = std::strtoull(at, &end, 10);
-    if (end != at) {
-      const long page_size = ::sysconf(_SC_PAGESIZE);
-      if (0 < page_size) {
-        snapshot.working_set_bytes = static_cast<std::uint64_t>(resident_pages) * static_cast<std::uint64_t>(page_size);
-      }
-    }
-  }
+  // Working set and its peak MUST come from this one buffer. VmRSS is the
+  // current resident set and VmHWM the kernel's high-water mark of that same
+  // counter. Deriving the current value from a second file (/proc/self/statm)
+  // at a later instant lets the process fault in pages between the two reads;
+  // under ASan the resident set grew past the earlier VmHWM and the
+  // peak >= working_set invariant broke. Reading both here keeps a single
+  // sample internally consistent.
+  const std::uint64_t working_set = detail::StatusKb(status, "VmRSS:");
+  const std::uint64_t high_water = detail::StatusKb(status, "VmHWM:");
+  snapshot.working_set_bytes = working_set;
+  // The high-water mark can lag a just-grown resident set (the kernel folds an
+  // increase into hiwater_rss lazily), and the current sample is by definition
+  // part of the peak. Taking the larger of the two removes that lag without
+  // reintroducing a second source.
+  snapshot.peak_bytes = (high_water > working_set) ? high_water : working_set;
 
   // Linux analog of a handle count: open file descriptors.
   if (DIR* dir = ::opendir("/proc/self/fd")) {

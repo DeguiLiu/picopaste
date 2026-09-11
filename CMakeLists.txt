@@ -120,12 +120,27 @@ function(picopaste_apply_vendor_includes target)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# MSVC marks the portable CRT calls fopen/_open as deprecated (C4996), and
+# /WX promotes that warning to a hard error. Both our POSIX and Windows builds
+# must keep using fopen/_open (the *_s variants are MSVC-only and would break
+# portability), so the fix is the one the compiler names: suppress the
+# deprecation warning. _CRT_SECURE_NO_WARNINGS is defined only for MSVC --
+# GCC/Clang ignore it -- and only on the interface of our targets. newosp's
+# config.hpp fopen uses are compiled inside our translation units, so the same
+# definition covers them without touching newosp.
+# ---------------------------------------------------------------------------
+add_library(picopaste_msvc_crt INTERFACE)
+if(MSVC)
+  target_compile_definitions(picopaste_msvc_crt INTERFACE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# ---------------------------------------------------------------------------
 # Core — platform-neutral. Each subdirectory appends its own sources, so
 # parallel workstreams never touch a shared file.
 # ---------------------------------------------------------------------------
 add_library(picopaste_core STATIC)
 target_include_directories(picopaste_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(picopaste_core PUBLIC osp)
+target_link_libraries(picopaste_core PUBLIC osp PRIVATE picopaste_msvc_crt)
 picopaste_apply_flags(picopaste_core)
 picopaste_apply_vendor_includes(picopaste_core)
 
@@ -143,7 +158,7 @@ add_subdirectory(src/platform/posix)
 # ---------------------------------------------------------------------------
 if(WIN32)
   add_executable(picopaste WIN32)
-  target_link_libraries(picopaste PRIVATE picopaste_core
+  target_link_libraries(picopaste PRIVATE picopaste_core picopaste_msvc_crt
     user32 shell32 ole32 windowscodecs shlwapi advapi32)
   picopaste_apply_flags(picopaste)
   picopaste_apply_vendor_includes(picopaste)
