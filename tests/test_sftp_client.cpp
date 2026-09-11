@@ -20,7 +20,6 @@
 
 #include "picopaste/sftp/client.hpp"
 #include "picopaste/sftp/protocol.hpp"
-#include "../src/platform/posix/stream_posix.hpp"
 
 using namespace picopaste;
 using namespace picopaste::sftp;
@@ -370,7 +369,7 @@ TEST_CASE("end-to-end upload against local OpenSSH sftp-server", "[sftp][client]
                         "localhost",
                         "sftp",
                         nullptr};
-  auto spawned = posix::SpawnStream(argv);
+  auto spawned = test::SpawnStream(argv);
   if (!spawned.has_value()) {
     SKIP("could not spawn ssh: local sftp subsystem unavailable");
   }
@@ -436,7 +435,7 @@ TEST_CASE("end-to-end WriteFile/ReadFile/ListDir against local OpenSSH sftp-serv
                         "localhost",
                         "sftp",
                         nullptr};
-  auto spawned = posix::SpawnStream(argv);
+  auto spawned = test::SpawnStream(argv);
   if (!spawned.has_value()) {
     SKIP("could not spawn ssh: local sftp subsystem unavailable");
   }

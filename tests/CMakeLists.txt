@@ -29,6 +29,16 @@ add_executable(picopaste_tests
 )
 target_link_libraries(picopaste_tests PRIVATE picopaste_core Catch2::Catch2WithMain)
 
+if(WIN32)
+  # The tests exercise the real ssh SFTP channel. picopaste::test::SpawnStream
+  # forwards to win32::ChildStream on Windows, so its implementation must join
+  # this target (the picopaste executable compiles its own copy; these are two
+  # separate binaries). stream_win32.cpp uses only kernel32 (linked by default)
+  # plus the header-only win32_util helper, so no extra libraries are needed.
+  target_sources(picopaste_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/platform/win32/stream_win32.cpp")
+endif()
+
 if(MSVC)
   target_compile_options(picopaste_tests PRIVATE /W4 /permissive- /utf-8)
   set_property(TARGET picopaste_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

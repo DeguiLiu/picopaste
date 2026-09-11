@@ -23,7 +23,6 @@
 #include "picopaste/sftp/client.hpp"
 #include "picopaste/sftp/protocol.hpp"
 #include "../src/core/sftp/dir_ops.hpp"
-#include "../src/platform/posix/stream_posix.hpp"
 
 using namespace picopaste;
 using namespace picopaste::sftp;
@@ -101,7 +100,7 @@ std::unique_ptr<Session> ConnectSftp() {
                         "localhost",
                         "sftp",
                         nullptr};
-  auto spawned = posix::SpawnStream(argv);
+  auto spawned = test::SpawnStream(argv);
   if (!spawned.has_value()) {
     return nullptr;
   }

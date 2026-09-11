@@ -8,5 +8,8 @@ target_sources(picopaste_core PRIVATE
   dir_ops.cpp
 )
 
-# Longest remote path handled; mirrors picopaste::sftp::kMaxPathBytes.
-target_compile_definitions(picopaste_core PUBLIC PICOPASTE_SFTP_MAX_PATH=512)
+# Deliberately no configure-time override for the maximum remote path length:
+# picopaste::sftp::kMaxPathBytes in include/picopaste/sftp/client.hpp is the one
+# source of truth. A matching #define here would be free to drift from it, and
+# previously did (it was defined as PICOPASTE_SFTP_MAX_PATH=512 and read by
+# nobody, so a stale name silently had no effect).

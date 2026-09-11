@@ -19,7 +19,6 @@
 #include "test_support.hpp"
 
 #include "../src/core/app/hook_install.hpp"
-#include "../src/platform/posix/stream_posix.hpp"
 
 using namespace picopaste;
 
@@ -63,7 +62,8 @@ struct Env {
 };
 
 bool StartEnv(Env& env) {
-  const auto spawned = posix::SpawnStream(kSshArgv);  if (!spawned.has_value()) {
+  const auto spawned = test::SpawnStream(kSshArgv);
+  if (!spawned.has_value()) {
     return false;
   }
   env.stream = spawned.value();

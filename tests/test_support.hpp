@@ -2,9 +2,10 @@
 //
 // WHY THIS FILE EXISTS
 // The host test suite is compiled twice: on Linux for the sanitizer job and by
-// MSVC for the Windows job. Two test needs are inherently platform-specific — a
-// process id (embedded in remote path names so concurrent runs do not collide)
-// and a securely-created local scratch file to upload. The coding conventions
+// MSVC for the Windows job. Three test needs are inherently platform-specific —
+// a process id (embedded in remote path names so concurrent runs do not
+// collide), a securely-created local scratch file to upload, and the
+// child-process stream that carries the SFTP session. The coding conventions
 // require platform differences to live in exactly one place rather than as
 // #ifdefs sprinkled through every call site. For product code that place is
 // src/platform/{posix,win32}/; this header is the tests/ analogue, so the three
@@ -20,9 +21,7 @@
 #include <utility>
 
 #if defined(_WIN32)
-// MSVC CRT equivalents of the POSIX primitives below. Deliberately no
-// <windows.h>: these tests also include Catch2, and keeping the heavy Win32
-// header out of a Catch2 translation unit avoids its min/max/interface pollution.
+// MSVC CRT equivalents of the POSIX primitives below.
 #include <cstdlib>
 #include <fcntl.h>
 #include <io.h>
@@ -30,6 +29,19 @@
 #include <sys/stat.h>
 #else
 #include <unistd.h>
+#endif
+
+// The child-process stream the integration tests drive: tests/' one platform
+// selection point, mirroring src/platform/{posix,win32}/. Both sides hand back
+// the same picopaste::sftp::ByteStream, so the tests below never name a
+// platform. The Windows header reaches <windows.h>; it defines
+// WIN32_LEAN_AND_MEAN/NOMINMAX first, so the min/max/interface pollution the
+// previous comment warned about is contained to the three TUs that need it.
+#if defined(_WIN32)
+#include "../src/platform/win32/stream_win32.hpp"
+#include "../src/platform/win32/win32_util.hpp"
+#else
+#include "../src/platform/posix/stream_posix.hpp"
 #endif
 
 namespace picopaste::test {
@@ -42,6 +54,132 @@ inline std::uint64_t ProcessId() noexcept
     return static_cast<std::uint64_t>(::_getpid());
 #else
     return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+namespace detail {
+
+#if defined(_WIN32)
+// win32::ChildStream::stream() sets ByteStream::ctx to the ChildStream itself,
+// so the object must outlive the stream. The tests carry only the ByteStream,
+// so the factory owns a small fixed pool — the Windows analogue of the fixed
+// pipe pool inside posix::SpawnStream. Test cases run sequentially and close
+// their stream before the next spawn, so slots are reused at once.
+constexpr std::size_t kMaxTestStreams = 8u;
+
+struct ChildStreamPool {
+    win32::ChildStream streams[kMaxTestStreams];
+    bool in_use[kMaxTestStreams] = {};
+};
+
+// Function-local static in an inline function: one shared instance across every
+// test translation unit that includes this header.
+inline ChildStreamPool& StreamPool() noexcept
+{
+    static ChildStreamPool pool;
+    return pool;
+}
+
+// Replaces ChildStream::stream().close so closing also frees the pool slot. The
+// pointer difference is well defined because ctx always points into this pool.
+inline void PooledClose(void* ctx) noexcept
+{
+    ChildStreamPool& pool = StreamPool();
+    win32::ChildStream* self = static_cast<win32::ChildStream*>(ctx);
+    const std::ptrdiff_t index = self - pool.streams;
+    if ((index >= 0) && (index < static_cast<std::ptrdiff_t>(kMaxTestStreams))) {
+        self->Close();
+        pool.in_use[static_cast<std::size_t>(index)] = false;
+    }
+}
+
+// The integration argv is fixed and contains no whitespace or quotes. A general
+// Windows command-line quoter is out of scope here, so a token that would need
+// quoting fails the factory closed (callers then SKIP) rather than risk
+// silently mis-splitting the command.
+inline bool IsSimpleArg(const char* arg) noexcept
+{
+    if (nullptr == arg) {
+        return false;
+    }
+    for (const char* p = arg; '\0' != *p; ++p) {
+        if ((' ' == *p) || ('\t' == *p) || ('"' == *p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Joins argv (nullptr-terminated) into a CreateProcessW command line. Returns
+// false on a null argv, an argument that needs quoting, or buffer overflow.
+inline bool BuildCommandLine(const char* const* argv, wchar_t* dst, std::size_t cap) noexcept
+{
+    if (nullptr == argv) {
+        return false;
+    }
+    std::size_t used = 0u;
+    for (std::size_t i = 0u; nullptr != argv[i]; ++i) {
+        if (!IsSimpleArg(argv[i])) {
+            return false;
+        }
+        wchar_t token[win32::kMaxCommandLineChars] = {};
+        if (!win32::Utf8ToWide(argv[i], token, win32::kMaxCommandLineChars)) {
+            return false;
+        }
+        if (0u != i) {
+            if ((used + 1u) >= cap) {
+                return false;
+            }
+            dst[used] = L' ';
+            ++used;
+        }
+        for (std::size_t k = 0u; L'\0' != token[k]; ++k) {
+            if ((used + 1u) >= cap) {
+                return false;
+            }
+            dst[used] = token[k];
+            ++used;
+        }
+        dst[used] = L'\0';
+    }
+    return (0u != used);
+}
+#endif
+
+}  // namespace detail
+
+// Spawn a child process whose stdin/stdout become a ByteStream, in the same
+// shape the POSIX path already exposes: `ssh -s localhost sftp` terminated at
+// argv[0] == nullptr. Returns kChannelSpawnFailed on any failure so callers
+// keep their existing SKIP-not-fail behaviour.
+inline Result<sftp::ByteStream> SpawnStream(const char* const* argv) noexcept
+{
+#if defined(_WIN32)
+    wchar_t command_line[win32::kMaxCommandLineChars] = {};
+    if (!detail::BuildCommandLine(argv, command_line, win32::kMaxCommandLineChars)) {
+        return Result<sftp::ByteStream>::error(Error::kChannelSpawnFailed);
+    }
+
+    detail::ChildStreamPool& pool = detail::StreamPool();
+    for (std::size_t i = 0u; i < detail::kMaxTestStreams; ++i) {
+        if (pool.in_use[i]) {
+            continue;
+        }
+        pool.in_use[i] = true;
+        const win32::ChildStreamOptions options{command_line, nullptr, nullptr};
+        if (!pool.streams[i].Spawn(options)) {
+            pool.in_use[i] = false;
+            return Result<sftp::ByteStream>::error(Error::kChannelSpawnFailed);
+        }
+        sftp::ByteStream stream = pool.streams[i].stream();
+        // ChildStream's own close thunk reaps the child but cannot free the slot
+        // it came from; this wrapper does both.
+        stream.close = &detail::PooledClose;
+        return Result<sftp::ByteStream>::success(stream);
+    }
+    return Result<sftp::ByteStream>::error(Error::kChannelSpawnFailed);
+#else
+    return posix::SpawnStream(argv);
 #endif
 }
 
