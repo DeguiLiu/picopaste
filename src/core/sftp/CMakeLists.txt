@@ -2,10 +2,11 @@
 #
 # Everything here is platform-neutral and verified on the host against the
 # system's own /usr/lib/openssh/sftp-server.
-target_sources(ccclip_core PRIVATE
+target_sources(picopaste_core PRIVATE
   client.cpp
   packet.cpp
+  dir_ops.cpp
 )
 
-# Longest remote path handled; mirrors ccclip::sftp::kMaxPathBytes.
-target_compile_definitions(ccclip_core PUBLIC CCLIP_SFTP_MAX_PATH=512)
+# Longest remote path handled; mirrors picopaste::sftp::kMaxPathBytes.
+target_compile_definitions(picopaste_core PUBLIC PICOPASTE_SFTP_MAX_PATH=512)

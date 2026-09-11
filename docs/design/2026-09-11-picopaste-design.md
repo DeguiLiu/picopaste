@@ -1,8 +1,8 @@
-# cc-clip-cpp 设计文档
+# picopaste 设计文档
 
 - 日期：2026-09-11
 - 状态：待评审
-- 目标仓库：`DeguiLiu/cc-clip-cpp`
+- 目标仓库：`DeguiLiu/picopaste`
 - 参考实现：`DeguiLiu/cc-clip`（Go，v0.11.0；含分支 `windows-single-process`）
 
 ---
@@ -38,7 +38,7 @@
 | 3 | 极致省资源 | 空闲 CPU 为 0（非"接近 0"）；稳态内存 ≤ 12 MB，硬上限 32 MB；单进程 |
 | 4 | 高可靠 | 内核级单实例；子进程随主进程必死；内存有内核强制上限；启动期可观测；退出无残留 |
 | 5 | 贴合 tssh + RemoteForward 环境 | 默认**不修改** `~/.ssh/config`；确需修改时须时间戳备份 + 一条命令可回滚 |
-| 6 | 交付闭环 | 源码 + newosp 补丁 + 回归测试，推送 `DeguiLiu/cc-clip-cpp` |
+| 6 | 交付闭环 | 源码 + newosp 补丁 + 回归测试，推送 `DeguiLiu/picopaste` |
 
 **明确的非目标（v1）**：Codex / opencode / Cursor 的字节级剪贴板注入；macOS / Linux 客户端；GUI 配置界面。
 
@@ -48,7 +48,7 @@
 
 ```mermaid
 flowchart LR
-    subgraph W["Windows 客户端 · 单进程 cc-clip-cpp.exe"]
+    subgraph W["Windows 客户端 · 单进程 picopaste.exe"]
         direction TB
         HK["全局热键<br/>RegisterHotKey<br/>MOD_NOREPEAT"]
         ML["主线程消息循环<br/>GetMessageW<br/>（阻塞，无定时器）"]
@@ -61,7 +61,7 @@ flowchart LR
 
     subgraph R["Linux 远端 · 零代码"]
         SSHD["sshd<br/>sftp-server 子系统"]
-        DIR["~/.cache/cc-clip/uploads<br/>（客户端经 SFTP 创建）"]
+        DIR["~/.cache/picopaste/uploads<br/>（客户端经 SFTP 创建）"]
         CC["Claude Code<br/>按路径读取图片"]
     end
 
@@ -91,9 +91,11 @@ flowchart LR
 | 线程 | 职责 | 空闲时阻塞于 |
 |---|---|---|
 | 主线程 | Win32 消息循环：热键、托盘、菜单 | `GetMessageW` |
-| 日志线程 | 从无锁 SPSC 环取记录，写盘并按大小轮转 | 信号量 |
+| 日志线程 | 轮询排空**每个生产者线程各自的** SPSC 环，写盘并按大小轮转 | 信号量 |
 | SFTP 读线程 | 阻塞读 ssh 子进程 stdout，分发 SFTP 响应 | `ReadFile` |
 | 上传 worker | 执行上传状态机与粘贴注入 | 信号量 |
+
+**日志队列是每个生产者一个 SPSC 环，不是一个共享环。** 初版写"从无锁 SPSC 环取记录"是错的：`osp::SpscRingbuffer` 把"两个线程并发 `Push`"定义为未定义行为，而上表里主线程、SFTP 读线程、上传 worker、以及日志线程自身（轮转失败时）**四个**线程都会产生记录。一个环会被并发写入。正确形态与 newosp 自己 `async_log` 的架构一致——每生产者一个固定容量环，单消费者轮询排空。这样保持无锁、无分配，代价是排空循环遍历 4 个环。
 
 不在主线程做任何阻塞 I/O。热键触发只投递一个任务，消息循环永不卡住——这是"热键莫名失效"的一类根因。
 
@@ -123,7 +125,7 @@ sequenceDiagram
     W->>S: REALPATH "."
     S->>R: SSH_FXP_REALPATH
     R-->>W: 远端工作目录绝对路径（通常即 home）
-    W->>S: MKDIR <home>/.cache/cc-clip/uploads
+    W->>S: MKDIR <home>/.cache/picopaste/uploads
     W->>S: OPEN .tmp-<ts>-<rand>
     loop 每 64 KB
         W->>S: WRITE
@@ -206,7 +208,7 @@ ssh -o ClearAllForwardings=yes -s <host> sftp
 | 项 | 目标 | 机制 |
 |---|---|---|
 | EXE + 静态 CRT 映像 | ≈ 0.4 MB | `/MT` 静态 CRT，单文件可拷贝 |
-| 线程栈 | ≤ 0.5 MB | `_beginthreadex` 显式栈 256 KB（默认 1 MB × 4 = 4 MB，白扔 3 MB） |
+| 线程栈 | ≤ 0.5 MB | 显式 256 KB（默认 1 MB × 4 = 4 MB，白扔 3 MB）。**注意**：`sftp::Client` 自带约 82 KB 的固定收发缓冲，因此 `Client` 实例必须是上传 worker 的**长生命周期成员或静态存储**，不能放在 256 KB 的工作栈上——否则栈只剩 ~170 KB 余量，加上 SFTP 分块拷贝会触顶。 |
 | 堆 / 私有提交 | ≤ 6 MB | 启动期一次性分配，热路径**零动态分配** |
 | 剪贴板 DIB | 0（不复制） | WIC 直接指向锁定的 HGLOBAL |
 | PNG 缓冲 | 0 或 O(64 KB) | 快路径零缓冲；DIB 路径经临时文件 |
@@ -256,15 +258,15 @@ Go 版本用 `debug.SetMemoryLimit(32 << 20)` 拿到了硬上限，C++ 没有等
 | `vocabulary.hpp` | `FixedString<N>` / `FixedVector<T,N>` / `expected<V,E>` / `optional<T>` / `NewType`：零堆配置与错误传递 |
 | `config.hpp` + `toml.hpp` | 配置解析（热键、host、远端目录、延时、内存上限、日志级别）。**注意 newosp 默认 TOML 后端为 OFF，须显式 `-DOSP_CONFIG_TOML=ON`** |
 | `thread.hpp`（经 CRTP Windows 策略） | 仅为让 `async_log` 与 `timer` 能编译；业务线程直接 `std::thread`，不使用 `osp::Thread` |
-| `shutdown.hpp`（自建替代） | Win32 `SetConsoleCtrlHandler` + 手动 reset event，在 cc-clip-cpp 内实现 |
+| `shutdown.hpp`（自建替代） | Win32 `SetConsoleCtrlHandler` + 手动 reset event，在 picopaste 内实现 |
 
 ### 不使用
 
 | 模块 | 原因 |
 |---|---|
 | `net.hpp` / `socket.hpp` / `event_loop.hpp` / `io_poller.hpp` / `transport.hpp` | epoll / kqueue 专属，Windows 不可用。本设计不需要通用网络栈：SFTP 走 ssh 子进程管道，无入站端口 |
-| `shell_commands.hpp` / `shell.hpp` | 依赖过重（拖入 `node_manager_hsm.hpp` → `event_loop.hpp` → `io_poller.hpp`，以及 `bus.hpp`、`fault_collector.hpp`）。子进程创建在 cc-clip-cpp 内自建 |
-| `process.hpp` | 整个文件体在 `#if OSP_PLATFORM_LINUX` 内，Windows 上为空。且唯一消费方是本项目，Job Object 收容逻辑本就属于 cc-clip-cpp |
+| `shell_commands.hpp` / `shell.hpp` | 依赖过重（拖入 `node_manager_hsm.hpp` → `event_loop.hpp` → `io_poller.hpp`，以及 `bus.hpp`、`fault_collector.hpp`）。子进程创建在 picopaste 内自建 |
+| `process.hpp` | 整个文件体在 `#if OSP_PLATFORM_LINUX` 内，Windows 上为空。且唯一消费方是本项目，Job Object 收容逻辑本就属于 picopaste |
 | `system_monitor.hpp` | 同上为空实现。本项目只需私有提交 / 工作集 / 句柄数三个数，本地 `GetProcessMemoryInfo` + `GetProcessHandleCount` 约 20 行即可，不值得为单一消费方给 newosp 加模块 |
 | `service_hsm.hpp` | 状态机建在 `hsm.hpp` 之上；`HsmService` 会额外拖入 `fault_collector.hpp`（→ `thread.hpp`）与 `bus` |
 | `bus.hpp` / `discovery` / `qos` / `data_fusion` / `node_*` | 与本项目无关 |
@@ -316,7 +318,7 @@ using Thread = ThreadT<OSP_DEFAULT_THREAD_OPS>;   // 名字与 API 不变
 
 | 需求 | 机制 |
 |---|---|
-| 任一时刻只有一个进程 | `CreateMutexW(L"Local\\cc-clip-cpp-<port>")` + `ERROR_ALREADY_EXISTS(183)`。句柄故意不关闭，由内核在进程退出时释放——这正是所需的生命周期语义。不依赖 PID 文件，不受陈旧文件、重复开机项、重复双击影响。 |
+| 任一时刻只有一个进程 | `CreateMutexW(L"Local\\picopaste-<port>")` + `ERROR_ALREADY_EXISTS(183)`。句柄故意不关闭，由内核在进程退出时释放——这正是所需的生命周期语义。不依赖 PID 文件，不受陈旧文件、重复开机项、重复双击影响。 |
 | 子进程绝不残留 | Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。ssh.exe 子进程加入同一 Job，主进程无论正常退出还是崩溃，内核保证子进程一并终止。 |
 | 启动前清理残留 | 在方案 A 下不存在监听端口（无 RemoteForward、无本地 HTTP 监听），因而也不存在"残留进程占端口"。单实例互斥已覆盖重复启动。若启动时发现互斥被占，**报告占用者 PID 与映像名后退出**，绝不擅自终止——避免误杀用户进程。 |
 | 内存不泄漏 | §5 的固定分配纪律 + Job Object 硬上限 + `selftest` 报告的基线与峰值。 |
@@ -397,7 +399,7 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 ## 11. 交付物与里程碑
 
 **交付物**
-1. `DeguiLiu/cc-clip-cpp`：CMake 工程，C++17，MSVC 与 GCC/Clang 双构建。
+1. `DeguiLiu/picopaste`：CMake 工程，C++17，MSVC 与 GCC/Clang 双构建。
 2. newosp MSVC 兼容补丁（§6 表格，6 处）。
 3. 回归测试套件（Catch2 单测 + SFTP 集成测试）。
 4. GitHub Actions：Linux 测试 + Windows MSVC 构建。
@@ -408,13 +410,13 @@ Windows 持第二条常驻通道 `ssh <host> 'tail -F ~/.cache/cc-clip/events.js
 | M | 内容 | 完成判据 |
 |---|---|---|
 | **M0** | newosp `windows` 分支：`thread.hpp` CRTP 平台策略层 + `Win32ThreadOps`（内部委托 `std::thread`）+ `mem_pool.hpp` 删死引用 + Windows CI + 冒烟 TU | 冒烟 TU 在 MSVC 下编译通过；newosp 既有 Linux 测试全绿（回归）；POSIX 泄漏 lint 通过 |
-| M1 | cc-clip-cpp 骨架 + 双平台构建（依赖 M0） | Linux 与 MSVC 均能产出 exe |
+| M1 | picopaste 骨架 + 双平台构建（依赖 M0） | Linux 与 MSVC 均能产出 exe |
 | M2 | SFTP v3 编解码 + 集成测试 + 三类边界用例（`MKDIR` 已存在 / `RENAME` 已存在 / `ATTRS` 位掩码） | 上传、校验、原子改名测试全绿 |
 | M3 | win32 层：剪贴板采集（统一临时文件）+ WIC + `SendInput` + 焦点守卫 + `selftest` | `selftest` 各项通过（Windows） |
 | M4 | 单实例 + Job Object + 托盘 + 热键 + 日志轮转 + HSM 监督（`hsm.hpp`）+ 本机内存采样 | 长跑无增长、无残留、空闲 CPU 为 0；**内存基线有实测数字且稳态 < 20 MB** |
 | M5 | 端到端 + hook 注入（**非覆盖写回**）+ 远端 `uploads` 保留策略 + 文档 | 热键粘贴可用；失败路径均有明确报错 |
 
-M5 的 `uploads` 保留策略需要 SFTP `OPENDIR` / `READDIR` / `REMOVE`，opcode 从 10 增至 13。没有它，`~/.cache/cc-clip/uploads` 会无界增长，与"极致省资源"相悖。
+M5 的 `uploads` 保留策略需要 SFTP `OPENDIR` / `READDIR` / `REMOVE`，opcode 从 10 增至 13。没有它，`~/.cache/picopaste/uploads` 会无界增长，与"极致省资源"相悖。
 
 ---
 
@@ -435,7 +437,7 @@ M5 的 `uploads` 保留策略需要 SFTP `OPENDIR` / `READDIR` / `REMOVE`，opco
 
 **已确认的前提**
 - 常驻后台通道需要免密认证（ssh-agent 或免密密钥）；否则需 `login` 子命令手动预热一次。
-- 上传目录沿用 `~/.cache/cc-clip/uploads`。
+- 上传目录沿用 `~/.cache/picopaste/uploads`。
 - 远端 SFTP 子系统缺失时，**不做第二条上传代码路径**，而是给出可操作的报错。
 
 ---

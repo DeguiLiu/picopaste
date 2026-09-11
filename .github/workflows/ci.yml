@@ -6,8 +6,8 @@ on:
 
 env:
   # The Windows platform layer lives on this branch of newosp until it merges.
-  CCLIP_NEWOSP_REPO: https://github.com/DeguiLiu/newosp.git
-  CCLIP_NEWOSP_REF: windows
+  PICOPASTE_NEWOSP_REPO: https://github.com/DeguiLiu/newosp.git
+  PICOPASTE_NEWOSP_REF: windows
 
 jobs:
   linux:
@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fetch newosp
-        run: git clone --depth 1 --branch "$CCLIP_NEWOSP_REF" "$CCLIP_NEWOSP_REPO" "$HOME/newosp-windows"
+        run: git clone --depth 1 --branch "$PICOPASTE_NEWOSP_REF" "$PICOPASTE_NEWOSP_REPO" "$HOME/newosp-windows"
 
       - name: Configure
         run: |
@@ -29,7 +29,7 @@ jobs:
           if [ "${{ matrix.sanitizer }}" != "none" ]; then
             FLAGS="-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitizer }} -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitizer }}"
           fi
-          cmake -S . -B build -DCCLIP_BUILD_TESTS=ON -DCCLIP_WERROR=ON $FLAGS
+          cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON $FLAGS
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -48,11 +48,11 @@ jobs:
 
       - name: Fetch newosp
         shell: pwsh
-        run: git clone --depth 1 --branch "$env:CCLIP_NEWOSP_REF" "$env:CCLIP_NEWOSP_REPO" "$env:USERPROFILE/newosp-windows"
+        run: git clone --depth 1 --branch "$env:PICOPASTE_NEWOSP_REF" "$env:PICOPASTE_NEWOSP_REPO" "$env:USERPROFILE/newosp-windows"
 
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -A x64 -DCCLIP_BUILD_TESTS=ON -DCCLIP_WERROR=ON
+        run: cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON
 
       - name: Build
         run: cmake --build build --config Release

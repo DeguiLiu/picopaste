@@ -1,4 +1,4 @@
-// cc-clip-cpp — SFTP v3 wire constants.
+// picopaste — SFTP v3 wire constants.
 //
 // Only the opcodes this project actually uses are listed. Values are fixed by
 // draft-ietf-secsh-filexfer-02 (SFTP protocol version 3) and must not be
@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ccclip::sftp {
+namespace picopaste::sftp {
 
 // Packet types.
 enum class Pkt : std::uint8_t {
@@ -76,4 +76,4 @@ inline constexpr std::uint32_t kWriteChunkBytes = 64u * 1024u;
 // Likewise MKDIR on an existing directory returns kFailure, NOT kOk. Verified
 // locally. Directory creation must tolerate kFailure when the path exists.
 
-}  // namespace ccclip::sftp
+}  // namespace picopaste::sftp

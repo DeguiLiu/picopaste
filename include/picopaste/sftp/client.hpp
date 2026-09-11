@@ -1,4 +1,4 @@
-// cc-clip-cpp — SFTP v3 client surface.
+// picopaste — SFTP v3 client surface.
 //
 // Implemented in src/core/sftp/client.cpp. Synchronous and single-threaded by
 // contract: callers serialize access (the upload worker is the only caller),
@@ -7,12 +7,12 @@
 
 #include <cstdint>
 
-#include "ccclip/error.hpp"
-#include "ccclip/sftp/protocol.hpp"
-#include "ccclip/sftp/stream.hpp"
+#include "picopaste/error.hpp"
+#include "picopaste/sftp/protocol.hpp"
+#include "picopaste/sftp/stream.hpp"
 #include "osp/vocabulary.hpp"
 
-namespace ccclip::sftp {
+namespace picopaste::sftp {
 
 // Longest remote path this client will handle. Sized for a home directory plus
 // a few nesting levels; overflow is reported, never truncated silently.
@@ -28,6 +28,14 @@ struct UploadedFile {
 
 class Client {
  public:
+  // Each instance owns its own scratch (below), so two Clients are
+  // independent. They are still not thread-safe: the client is synchronous and
+  // callers must serialize access, as documented on the class.
+  Client(const Client&) = delete;
+  Client& operator=(const Client&) = delete;
+  Client(Client&&) = delete;
+  Client& operator=(Client&&) = delete;
+
   // `stream` must outlive the client. Not owned.
   explicit Client(ByteStream stream) noexcept : stream_(stream) {}
 
@@ -73,9 +81,18 @@ class Client {
  private:
   Status SendPacket(Pkt type, const void* payload, std::uint32_t len) noexcept;
 
+  // Per-instance scratch, sized from the codec's frame limits (the outbound
+  // frame holds one full kWriteChunkBytes chunk plus its header fields). No
+  // heap; each Client owns its own copy so instances cannot corrupt each
+  // other. Client is ~82 KB and therefore not a small stack object.
+  static constexpr std::uint32_t kTxBytes = kWriteChunkBytes + 512u;
+  static constexpr std::uint32_t kRxBytes = 16u * 1024u;
+
   ByteStream stream_{};
   bool initialized_ = false;
   std::uint32_t next_id_ = 1;
+  std::uint8_t tx_[kTxBytes]{};
+  std::uint8_t rx_[kRxBytes]{};
 };
 
-}  // namespace ccclip::sftp
+}  // namespace picopaste::sftp

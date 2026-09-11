@@ -1,7 +1,7 @@
-# cc-clip-cpp 设计评审报告
+# picopaste 设计评审报告
 
 - 日期：2026-09-11
-- 评审对象：`docs/design/2026-09-11-cc-clip-cpp-design.md`（本地提交 `d87a7f6`）
+- 评审对象：`docs/design/2026-09-11-picopaste-design.md`（本地提交 `d87a7f6`）
 - 评审基线：newosp `main` @ `e1c6692`（0.8.1）、上游 `DeguiLiu/cc-clip` `main` 与 `windows-single-process`
 - 评审方式：逐行核对文档引用的 `file:line`；依赖闭包静态分析；本机 sshd + `/usr/lib/openssh/sftp-server` 上跑真实 SFTP v3 交互
 - 硬约束（本次评审新增）：**必须使用 newosp**；**状态机必须使用**；允许在 newosp 新建 `windows` 分支
@@ -52,7 +52,7 @@
 | P1-1 | 建议 | Job Object 32 MB 上限覆盖 `ssh.exe` 的风险 | §4.3 |
 | P1-2 | 建议 | `SendInput` 返回值「等于 6」在注入了 Alt/Win 释放事件后不成立 | §4.3 |
 | P1-3 | 建议 | 热键重入/上传排队策略未定义 | §4.3 |
-| P1-4 | 建议 | 上游引用不可核实（仓库 issues 已禁用），目标仓库 `DeguiLiu/cc-clip-cpp` 尚未创建 | §4.4 |
+| P1-4 | 建议 | 上游引用不可核实（仓库 issues 已禁用），目标仓库 `DeguiLiu/picopaste` 尚未创建 | §4.4 |
 | P1-5 | 建议 | `shell_commands.hpp` 拖入 `shell.hpp`/`event_loop.hpp`/`bus.hpp`，应改用 `process.hpp` 或自建 | §2.4 |
 | P1-6 | 建议 | 若干实现级补充（ATTRS 位掩码、多级 MKDIR、构建开关） | §4.5 |
 
@@ -142,7 +142,7 @@ flowchart TD
 
 - 让 `osp::SpawnProcess`/`ProcessResult`（`process.hpp`）承担这一职责，并为它写 Windows 后端（`CreateProcessW` + 管道重定向 + Job 关联）；这与 §7 的 Job Object 需求天然重合，一份实现两处受益；
 - 不使用 `shell_commands.hpp` / `osp::Shell`，直接消掉 `shell.hpp` + `event_loop.hpp` + `bus.hpp` 三个头的编译面；
-- 构建时显式传 `-DOSP_WITH_NETWORK=OFF`（等价 `OSP_HAS_NETWORK=0`），并在 cc-clip-cpp 侧显式打开 `OSP_CONFIG_TOML=ON`（newosp 默认 OFF）。
+- 构建时显式传 `-DOSP_WITH_NETWORK=OFF`（等价 `OSP_HAS_NETWORK=0`），并在 picopaste 侧显式打开 `OSP_CONFIG_TOML=ON`（newosp 默认 OFF）。
 
 ### 2.5 修正后的 newosp Windows 工作范围
 
@@ -166,7 +166,7 @@ flowchart TD
 - 分支名：`windows`，从 `main` 切出；**不直接改 `main`**，避免影响嵌入式/RT-Thread 使用方。
 - 提交切分：按上表 1→10 顺序，每步独立可构建、可测试；每个提交只新增 `#if defined(OSP_PLATFORM_WINDOWS)` 分支，**不修改现有 Linux/RT-Thread 代码路径**。
 - 门禁（每条都要有）：① 全头冒烟 TU 在 MSVC 下编译通过；② Linux 现有 61 个测试文件全绿（回归）；③ 新增 grep 门禁——`unistd.h`/`pthread.h`/`termios.h`/`fork(` 等 POSIX 符号必须出现在平台 `#if` 内。
-- 合并策略：因为全部是新增平台分支，风险低，建议最终合并回 `main`，让 newosp 变成双平台库；在合并前 cc-clip-cpp 以 `windows` 分支为 submodule/FetchContent 目标。
+- 合并策略：因为全部是新增平台分支，风险低，建议最终合并回 `main`，让 newosp 变成双平台库；在合并前 picopaste 以 `windows` 分支为 submodule/FetchContent 目标。
 
 ---
 
@@ -195,7 +195,7 @@ VERIFY exists=True sha256_match=True
 1. **`RENAME` 不是覆盖语义**：把文件改名到一个**已存在**的目标返回 `SSH_FX_FAILURE(4)`。原因是 OpenSSH `sftp-server` 对普通文件用 `link()`+`unlink()` 实现改名，`link()` 遇到已存在目标即失败。
    - 对 §3 的主链路无影响（`clip-<ts>-<rand>.png` 是新名字）。
    - 但 §8「由客户端经 SFTP 读 → 合并 → 写回 `~/.claude/settings.json`」若采用「写临时名 + RENAME 覆盖」的原子手法，**必然失败**。必须改为：先 `REMOVE` 旧文件再 `RENAME`（存在非原子窗口，但已备份）、或直接 `OPEN` 截断覆盖 + 备份文件兜底。
-2. **`MKDIR` 已存在返回 `SSH_FX_FAILURE(4)`**：客户端必须把 code 4 当作「已存在，继续」，否则第二次运行即失败。文档只写了 `MKDIR <home>/.cache/cc-clip/uploads` 一次，实际需两级分别尝试（`~/.cache` 与 `~/.cache/cc-clip/uploads` 都可能缺失或已存在）。
+2. **`MKDIR` 已存在返回 `SSH_FX_FAILURE(4)`**：客户端必须把 code 4 当作「已存在，继续」，否则第二次运行即失败。文档只写了 `MKDIR <home>/.cache/picopaste/uploads` 一次，实际需两级分别尝试（`~/.cache` 与 `~/.cache/picopaste/uploads` 都可能缺失或已存在）。
 3. **`ATTRS` 必须按位解析**：`STAT` 返回 `flags=15`，`size` 仅在 `flags & SSH_FILEXFER_ATTR_SIZE` 时存在。按固定偏移取 size 会读出垃圾值（本评审第一版探针即因此读出错误 size）。这是编解码层最容易写错的一处，建议单测覆盖各 `flags` 组合。
 
 ---
@@ -238,12 +238,12 @@ VERIFY exists=True sha256_match=True
 - `DeguiLiu/cc-clip` 的 issues 功能**已禁用**，`#80`、`#140` 在该仓库不存在（REST 返回 404）。§4、§9、§13 中的这两处引用属于不可核实引用；技术论点本身（`SendKeys` 会被 Chromium/Electron 终端忽略、SSH banner 污染 stdout）可以保留，但需替换为可核实来源或标注为经验性判断。
 - `send.go` 的 `scp` 论证**已核实**：`cmd/cc-clip/send.go` 的 `sshUploadNoForward` 注释明确写「OpenSSH 9.0+ defaults `scp` to the SFTP subsystem」，与文档 §3 表格一致。
 - `windows-single-process` 分支**确实存在**。
-- 目标仓库 `DeguiLiu/cc-clip-cpp` **尚未创建**（REST 404）；本地 `~/workspace/cc-clip-cpp` 只有 1 个提交、仅含本设计文档、未配置 remote。属交付前置项。
+- 目标仓库 `DeguiLiu/picopaste` **尚未创建**（REST 404）；本地 `~/workspace/picopaste` 只有 1 个提交、仅含本设计文档、未配置 remote。属交付前置项。
 
 ### 4.5 P1-6：实现级补充
 
 - `async_log.hpp` 在非 Linux/macOS 走 `std::time`+`localtime` 回退 → 日志时间戳仅秒级精度（`log.hpp:148-153`）。若 Windows 日志要求毫秒，需要在 `platform.hpp` 提供 `FormatTimestamp` 的 Windows 分支。
-- `config.hpp` 的 INI 后端（`inicpp`）默认开启，TOML 后端默认关闭 → cc-clip-cpp 需显式 `-DOSP_CONFIG_TOML=ON`，否则文档 §6 的「toml.hpp 配置解析」不会生效（会静默回退）。
+- `config.hpp` 的 INI 后端（`inicpp`）默认开启，TOML 后端默认关闭 → picopaste 需显式 `-DOSP_CONFIG_TOML=ON`，否则文档 §6 的「toml.hpp 配置解析」不会生效（会静默回退）。
 - `tssh/tsshd` 环境下 `-s <host> sftp` 的可用性属未验证假设（文档已给出「子系统缺失时报可操作错误」的兜底，保留即可，但应在 M2 用真实环境验证一次）。
 
 ---
@@ -275,13 +275,13 @@ VERIFY exists=True sha256_match=True
 | M | 内容 | 完成判据 |
 |---|---|---|
 | **M0（新增）** | newosp `windows` 分支：`io_poller` 修补 + `thread`/`shutdown`/`process`/`system_monitor` 四个后端 + Windows CI | 全头冒烟 TU 编译通过；Linux 测试全绿；新增测试在 Windows 通过 |
-| M1 | cc-clip-cpp 骨架 + 双平台构建（依赖 M0） | Linux 与 MSVC 均能产出 exe |
+| M1 | picopaste 骨架 + 双平台构建（依赖 M0） | Linux 与 MSVC 均能产出 exe |
 | M2 | SFTP v3 编解码 + 集成测试 + **修正 RENAME/MKDIR/ATTRS 语义** | 上传/校验/改名测试全绿，含三类边界用例 |
 | M3 | win32 层：剪贴板采集 + WIC + `SendInput` + 焦点守卫 + `selftest` | `selftest` 各项通过（Windows） |
 | M4 | 单实例 + Job Object + 托盘 + 热键 + 日志轮转 + HSM 监督（`hsm.hpp`）+ `system_monitor` 后端 | 长跑无增长、无残留、空闲 CPU 为 0；内存基线有实测数字 |
 | M5 | 端到端 + hook 注入（改用非覆盖写回）+ 远端 `uploads` 保留策略 + 文档 | 热键粘贴可用；失败路径均有明确报错 |
 
-新增两项交付物：**远端上传目录保留策略**（否则 `~/.cache/cc-clip/uploads` 无界增长，与「极致省资源」相悖；若用 SFTP 清理则 opcode 从 10 增至 13：`OPENDIR`/`READDIR`/`REMOVE`），**newosp Windows 后端与分支文档**。
+新增两项交付物：**远端上传目录保留策略**（否则 `~/.cache/picopaste/uploads` 无界增长，与「极致省资源」相悖；若用 SFTP 清理则 opcode 从 10 增至 13：`OPENDIR`/`READDIR`/`REMOVE`），**newosp Windows 后端与分支文档**。
 
 ---
 
@@ -317,5 +317,5 @@ ssh -o ClearAllForwardings=yes -o BatchMode=yes -s localhost sftp
 # 上游核实
 gh api repos/DeguiLiu/cc-clip/branches --jq '.[].name'      # windows-single-process 存在
 gh api repos/DeguiLiu/cc-clip/issues/140                     # 404（issues 已禁用）
-gh api repos/DeguiLiu/cc-clip-cpp                            # 404（目标仓库未创建）
+gh api repos/DeguiLiu/picopaste                            # 404（目标仓库未创建）
 ```

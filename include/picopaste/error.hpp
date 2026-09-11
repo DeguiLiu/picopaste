@@ -1,4 +1,4 @@
-// cc-clip-cpp — error vocabulary shared by every layer.
+// picopaste — error vocabulary shared by every layer.
 //
 // Deliberately a flat enum with fixed-width underlying type: it crosses the
 // core/win32 boundary, is logged verbatim, and must stay POD.
@@ -8,7 +8,7 @@
 
 #include "osp/vocabulary.hpp"
 
-namespace ccclip {
+namespace picopaste {
 
 enum class Error : std::uint8_t {
   kOk = 0,
@@ -47,10 +47,14 @@ enum class Error : std::uint8_t {
 
   // Lifecycle
   kConfigParseFailed,
+  kConfigWriteFailed,
   kSingleInstanceExists,
   kHotkeyRegisterFailed,
   kJobObjectFailed,
   kBusy,                // an upload is already in flight
+
+  // Bounded logging
+  kLogIoFailed,         // open/write/rotate/flush of the log file failed
 };
 
 template <typename V>
@@ -58,4 +62,4 @@ using Result = osp::expected<V, Error>;
 
 using Status = osp::expected<void, Error>;
 
-}  // namespace ccclip
+}  // namespace picopaste

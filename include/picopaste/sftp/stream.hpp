@@ -1,4 +1,4 @@
-// cc-clip-cpp — byte-stream contract for the SFTP subsystem channel.
+// picopaste — byte-stream contract for the SFTP subsystem channel.
 //
 // A function-pointer table rather than an abstract base class: newosp's stated
 // dispatch preference ranks function-pointer+ctx above virtual, and this lets
@@ -16,7 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ccclip::sftp {
+namespace picopaste::sftp {
 
 struct ByteStream {
   void* ctx = nullptr;
@@ -35,4 +35,4 @@ struct ByteStream {
   }
 };
 
-}  // namespace ccclip::sftp
+}  // namespace picopaste::sftp

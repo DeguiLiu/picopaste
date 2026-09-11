@@ -17,21 +17,23 @@ if(NOT Catch2_FOUND)
   FetchContent_MakeAvailable(Catch2)
 endif()
 
-add_executable(ccclip_tests
+add_executable(picopaste_tests
   test_sftp_packet.cpp
   test_sftp_client.cpp
   test_config.cpp
   test_log.cpp
   test_lifecycle.cpp
+  test_hook_install.cpp
+  test_dir_ops.cpp
 )
-target_link_libraries(ccclip_tests PRIVATE ccclip_core Catch2::Catch2WithMain)
+target_link_libraries(picopaste_tests PRIVATE picopaste_core Catch2::Catch2WithMain)
 
 if(MSVC)
-  target_compile_options(ccclip_tests PRIVATE /W4 /permissive- /utf-8)
-  set_property(TARGET ccclip_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+  target_compile_options(picopaste_tests PRIVATE /W4 /permissive- /utf-8)
+  set_property(TARGET picopaste_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 else()
-  target_compile_options(ccclip_tests PRIVATE -Wall -Wextra)
+  target_compile_options(picopaste_tests PRIVATE -Wall -Wextra)
 endif()
 
 include(Catch)
-catch_discover_tests(ccclip_tests)
+catch_discover_tests(picopaste_tests)

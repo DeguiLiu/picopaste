@@ -1,4 +1,4 @@
-// cc-clip-cpp — runtime configuration.
+// picopaste — runtime configuration.
 //
 // Fixed-capacity strings only: the config is read once at start-up and must not
 // introduce heap traffic or an unbounded allocation driven by a file's
@@ -7,15 +7,20 @@
 
 #include <cstdint>
 
-#include "ccclip/error.hpp"
+#include "picopaste/error.hpp"
 #include "osp/vocabulary.hpp"
 
-namespace ccclip {
+namespace picopaste {
 
+// Capacities are 255, not 256, on purpose. newosp's ConfigStore copies every
+// value into a `char[256]` staging buffer before we see it, so a value longer
+// than 255 characters would already be silently shortened by the library and
+// we could never reject it. Keeping our capacity one below the staging buffer
+// makes "too long" detectable instead of silently accepted.
 inline constexpr std::uint32_t kHostBytes = 128;
-inline constexpr std::uint32_t kRemoteDirBytes = 256;
+inline constexpr std::uint32_t kRemoteDirBytes = 255;
 inline constexpr std::uint32_t kHotkeyBytes = 64;
-inline constexpr std::uint32_t kSshCommandBytes = 256;
+inline constexpr std::uint32_t kSshCommandBytes = 255;
 inline constexpr std::uint32_t kLogLevelBytes = 16;
 
 struct Config {
@@ -58,7 +63,7 @@ struct Config {
 };
 
 // Defaults for a fresh install. remote_dir defaults to
-// "~/.cache/cc-clip/uploads" for continuity with the upstream tool.
+// "~/.cache/picopaste/uploads" for continuity with the upstream tool.
 Config DefaultConfig() noexcept;
 
 // Parse `path`. A missing file is not an error: defaults are returned and
@@ -68,4 +73,4 @@ Result<Config> LoadConfig(const char* path, bool* created_defaults = nullptr) no
 // Write `cfg` to `path` atomically (temp file + replace).
 Status SaveConfig(const char* path, const Config& cfg) noexcept;
 
-}  // namespace ccclip
+}  // namespace picopaste

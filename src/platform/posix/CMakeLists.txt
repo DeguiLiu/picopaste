@@ -4,5 +4,5 @@
 # runs it against the machine's own /usr/lib/openssh/sftp-server. Not built on
 # Windows, where platform/win32 supplies the equivalent.
 if(NOT WIN32)
-  target_sources(ccclip_core PRIVATE stream_posix.cpp)
+  target_sources(picopaste_core PRIVATE stream_posix.cpp)
 endif()
