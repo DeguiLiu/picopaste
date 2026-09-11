@@ -1,10 +1,10 @@
-# Configuration, lifecycle state machine, and remote settings.json management.
-# Owned by the lifecycle workstream; hook_install by the remote-config workstream.
-#
-# upload_pipeline.cpp is added during integration, once the SFTP client and the
-# platform clipboard layer both exist — it is the seam between them.
+# Configuration, lifecycle state machine, remote settings.json management, and
+# the platform-neutral upload-and-paste pipeline. The pipeline depends on the
+# SFTP client (src/core/sftp) and on two injected function tables for the win32
+# clipboard and keystroke layers; it names no platform header itself.
 target_sources(picopaste_core PRIVATE
   config.cpp
   lifecycle.cpp
   hook_install.cpp
+  upload_pipeline.cpp
 )

@@ -72,16 +72,24 @@ jobs:
           # other end is this same sftp-server binary either way.
           /usr/sbin/sshd -t -f ~/.ssh/ci_sshd_config
           /usr/sbin/sshd -f ~/.ssh/ci_sshd_config -E ~/.ssh/ci_sshd.log
+          # AddressFamily inet is load-bearing. sshd listens on 127.0.0.1 only,
+          # and on this image `localhost` resolves to ::1 first, so without this
+          # every connection is refused by an address nothing is listening on --
+          # which is exactly how the first attempt failed: sshd was up and
+          # listening (ss showed 127.0.0.1:2222), yet keyscan never got an answer.
           cat > ~/.ssh/config <<'EOF'
           Host localhost
+            AddressFamily inet
             Port 2222
           EOF
           chmod 600 ~/.ssh/config
           # Wait for the listener, then trust its host key under the alias the
-          # tests connect with ([localhost]:2222 for a non-default port).
+          # tests connect with ([localhost]:2222 for a non-default port). -4
+          # matches AddressFamily above so keyscan probes the address the client
+          # will actually use.
           up=no
           for _ in $(seq 1 20); do
-            if ssh-keyscan -p 2222 -T 2 localhost 2>/dev/null | grep -q .; then
+            if ssh-keyscan -4 -p 2222 -T 2 localhost 2>/dev/null | grep -q .; then
               up=yes
               break
             fi
@@ -95,7 +103,7 @@ jobs:
             echo "--- effective config ---"; cat ~/.ssh/ci_sshd_config
             exit 1
           fi
-          ssh-keyscan -p 2222 localhost >> ~/.ssh/known_hosts
+          ssh-keyscan -4 -p 2222 localhost >> ~/.ssh/known_hosts
           # Fail loudly if passwordless ssh still does not work rather than
           # letting the integration tests quietly report SKIP.
           if ! ssh -o BatchMode=yes -o LogLevel=ERROR -s localhost sftp </dev/null; then

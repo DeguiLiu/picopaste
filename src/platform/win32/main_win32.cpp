@@ -14,11 +14,15 @@
 //       no mandatory capability failed. This is the Windows verification
 //       vehicle, so it is deliberately runnable from a terminal.
 //   picopaste
-//       Interactive tray mode. NOT WIRED YET: the hotkey/tray/paste loop is the
-//       remaining integration work. This path says so and exits non-zero rather
-//       than starting a daemon that silently does nothing -- reporting success
-//       for work that did not happen is the other failure mode this project
-//       exists to remove.
+//       Interactive tray mode. The main thread blocks on GetMessageW; a hotkey
+//       posts WM_HOTKEY to this thread's queue and signals a worker thread that
+//       runs the upload pipeline. Every periodic action waits on a kernel
+//       object (the message loop, the worker's wait event, the child process
+//       handle, or a WaitForMultipleObjects timeout), so idle CPU is zero.
+//
+// The platform seam for the pipeline lives here: Win32Platform below adapts the
+// existing clipboard/inject modules into the function-pointer tables the
+// platform-neutral core expects. It is the ONLY place those two layers meet.
 
 #include "win32_util.hpp"
 
@@ -26,25 +30,51 @@
 // win32_util.hpp defines it, so CommandLineToArgvW needs this explicitly.
 #include <shellapi.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <new>
+#include <string>
+#include <thread>
+#include <type_traits>
 
+#include "clip.h"  // vendored dacap/clip: the same set_text path inject.cpp uses
+
+#include "../../core/app/lifecycle.hpp"       // picopaste::Lifecycle
+#include "../../core/app/upload_pipeline.hpp"  // picopaste::UploadPipeline
+#include "clipboard.hpp"
+#include "hotkey.hpp"
+#include "inject.hpp"
 #include "picopaste/config.hpp"
 #include "selftest.hpp"
+#include "single_instance.hpp"
+#include "stream_win32.hpp"
+#include "tray.hpp"
 
 namespace {
 
-using picopaste::LoadConfig;
+using picopaste::Config;
+using picopaste::Error;
+using picopaste::InjectOps;
+using picopaste::Lifecycle;
+using picopaste::LifecycleEvent;
+using picopaste::LifecycleState;
 using picopaste::Status;
+using picopaste::TrayHealth;
+using picopaste::UploadPipeline;
 using picopaste::win32::SelfTestOptions;
 
 // Exit codes. 0 is reserved for "everything mandatory passed".
 constexpr std::int32_t kExitOk = 0;
 constexpr std::int32_t kExitSelftestFailed = 1;
-constexpr std::int32_t kExitNotImplemented = 2;
+
+// One hotkey id; the WM_HOTKEY this produces is dispatched directly by the
+// message loop (never by a window proc).
+constexpr int kHotkeyId = 1;
 
 // Longest config path accepted on the command line; a longer one is reported
 // rather than cut short.
@@ -53,6 +83,16 @@ constexpr std::size_t kConfigPathChars = 512;
 // One diagnostic line's ceiling. A truncated diagnostic is acceptable; a buffer
 // overrun is not.
 constexpr std::size_t kLineChars = 192;
+
+// Posted by the worker when its lifecycle state (and therefore the tray colour)
+// changes. The tray's Shell_NotifyIcon is called only from the main thread, the
+// one that created the tray window; the worker never touches it directly.
+constexpr UINT kWmWorkerStatus = WM_APP + 2;
+
+enum class WorkerNotice : std::uint8_t {
+  kHealth = 0,  // wParam is the TrayState to render
+  kStopped = 1,
+};
 
 // RAII: attach to the console that launched us, and detach again on scope exit.
 // FreeConsole is only called when we were the ones who attached, so a process
@@ -102,7 +142,7 @@ class ArgvBlock final {
 // absent (no console attached) is not an error: the exit code carries the
 // result in that case.
 void Emit(HANDLE handle, const char* text) noexcept {
-  if (nullptr == handle || INVALID_HANDLE_VALUE == handle) {
+  if ((nullptr == handle) || (INVALID_HANDLE_VALUE == handle)) {
     return;
   }
   const std::size_t length = std::strlen(text);
@@ -125,7 +165,7 @@ void EmitFormatted(HANDLE handle, const char* format, ...) noexcept {
   }
 }
 
-// Narrow a wide argument into `out`. Returns false when it does not fit, so an
+// Narrow a wide path into `out`. Returns false when it does not fit, so an
 // over-long path is reported instead of being silently shortened.
 bool NarrowPath(const wchar_t* wide, char* out, std::size_t out_chars) noexcept {
   const int written =
@@ -151,6 +191,556 @@ Options ParseArgs(wchar_t* const* items, std::int32_t count) noexcept {
   return options;
 }
 
+// ---------------------------------------------------------------------------
+// Platform seam: the win32 clipboard and injector as the pipeline's two tables.
+//
+// Single-flight in the pipeline means at most one captured snapshot exists at a
+// time, so this holds exactly one. `target_` is the foreground window captured
+// when the hotkey fired, BEFORE anything touches the clipboard, and is read on
+// the worker thread; it is atomic because the two threads cross here.
+// ---------------------------------------------------------------------------
+class Win32Platform final {
+ public:
+  Win32Platform() noexcept = default;
+  Win32Platform(const Win32Platform&) = delete;
+  Win32Platform& operator=(const Win32Platform&) = delete;
+
+  void SetRestoreHint(bool restore) noexcept { restore_hint_ = restore; }
+  void SetTarget(HWND window) noexcept { target_.store(window, std::memory_order_release); }
+
+  picopaste::ClipboardOps Clipboard() noexcept {
+    picopaste::ClipboardOps ops{};
+    ops.ctx = this;
+    ops.capture = &Win32Platform::Capture;
+    ops.set_text = &Win32Platform::SetText;
+    ops.restore = &Win32Platform::Restore;
+    ops.release = &Win32Platform::Release;
+    return ops;
+  }
+
+  InjectOps Inject() noexcept {
+    InjectOps ops{};
+    ops.ctx = this;
+    ops.paste = &Win32Platform::Paste;
+    return ops;
+  }
+
+ private:
+  // CaptureClipboardImage opens, snapshots to one temp file, and closes the
+  // clipboard before returning -- the contract the pipeline depends on.
+  static Error Capture(void* ctx, const Config& cfg, picopaste::CapturedClip& out) noexcept {
+    Win32Platform* self = static_cast<Win32Platform*>(ctx);
+    const auto captured = picopaste::win32::CaptureClipboardImage(cfg);
+    if (!captured.has_value()) {
+      return captured.get_error();
+    }
+    self->snapshot_ = captured.value();
+    out.local_path.assign(osp::TruncateToCapacity, self->snapshot_.path_utf8.c_str());
+    out.bytes = self->snapshot_.bytes;
+    out.restore_token = self;  // opaque: identifies the one snapshot
+    out.captured = true;
+    return Error::kOk;
+  }
+
+  static Error SetText(void* ctx, const char* utf8) noexcept {
+    (void)ctx;
+    if (nullptr == utf8) {
+      return Error::kClipboardSetFailed;
+    }
+    const std::string text(utf8);  // bounded by the remote path cap
+    if (clip::set_text(text) == false) {
+      return Error::kClipboardSetFailed;
+    }
+    return Error::kOk;
+  }
+
+  static Error Restore(void* ctx, void* token) noexcept {
+    (void)token;
+    Win32Platform* self = static_cast<Win32Platform*>(ctx);
+    if (L'\0' == self->snapshot_.wide_path[0]) {
+      return Error::kClipboardSetFailed;
+    }
+    const Status s = picopaste::win32::SetClipboardPngFile(self->snapshot_.wide_path);
+    return s.has_value() ? Error::kOk : s.get_error();
+  }
+
+  static void Release(void* ctx, void* token) noexcept {
+    (void)token;
+    Win32Platform* self = static_cast<Win32Platform*>(ctx);
+    picopaste::win32::DeleteCapturedImage(self->snapshot_);
+    self->snapshot_ = picopaste::win32::CapturedImage{};
+  }
+
+  // The focus guard from inject.cpp's DeliverPaste, split out so the pipeline
+  // can put the text on the clipboard itself and observe the chord separately.
+  static Error Paste(void* ctx, std::uint32_t delay_ms) noexcept {
+    Win32Platform* self = static_cast<Win32Platform*>(ctx);
+    const HWND target = self->target_.load(std::memory_order_acquire);
+    if (nullptr == target) {
+      // No baseline: never type into whatever happens to be focused.
+      return Error::kFocusChanged;
+    }
+    if (delay_ms > 0) {
+      Sleep(delay_ms);
+    }
+    if (GetForegroundWindow() != target) {
+      return Error::kFocusChanged;
+    }
+    const picopaste::win32::SendChordResult chord = picopaste::win32::SendPasteChord();
+    if (chord.ok == false) {
+      return Error::kSendInputRejected;
+    }
+    // Let the terminal consume the paste before the image is restored over it;
+    // DeliverPaste waited the same 150 ms. This is a bounded active wait on the
+    // worker thread while a paste is in flight -- never an idle poll.
+    if (self->restore_hint_) {
+      Sleep(150);
+    }
+    return Error::kOk;
+  }
+
+  picopaste::win32::CapturedImage snapshot_{};
+  std::atomic<HWND> target_{nullptr};
+  bool restore_hint_ = false;
+};
+
+// Owner of the long-lived SFTP Client. Client is non-movable and ~128 KB, so it
+// cannot live on the worker's stack (design section 5: a 256 KB stack with an
+// 82 KB client leaves too little for the chunk buffers). Aligned storage plus
+// placement new lets the worker rebuild it across a reconnect; Client is
+// trivially destructible, which is what makes the placement new legal.
+class ClientSlot final {
+ public:
+  ClientSlot() noexcept = default;
+  ~ClientSlot() noexcept { Destroy(); }
+  ClientSlot(const ClientSlot&) = delete;
+  ClientSlot& operator=(const ClientSlot&) = delete;
+
+  picopaste::sftp::Client* Get() noexcept { return client_; }
+
+  void Create(picopaste::sftp::ByteStream stream) noexcept {
+    Destroy();
+    client_ = ::new (static_cast<void*>(storage_)) picopaste::sftp::Client(stream);
+  }
+
+  void Destroy() noexcept {
+    if (nullptr != client_) {
+      client_->~Client();
+      client_ = nullptr;
+    }
+  }
+
+ private:
+  static_assert(std::is_trivially_destructible<picopaste::sftp::Client>::value,
+                "ClientSlot placement-news Client and therefore needs a trivial destructor");
+  alignas(picopaste::sftp::Client) std::byte storage_[sizeof(picopaste::sftp::Client)];
+  picopaste::sftp::Client* client_ = nullptr;
+};
+
+// Map the lifecycle's traffic light onto the tray's own state enum.
+picopaste::win32::TrayState MapTrayState(TrayHealth health) noexcept {
+  switch (health) {
+    case TrayHealth::kGreen:
+      return picopaste::win32::TrayState::kHealthy;
+    case TrayHealth::kRed:
+      return picopaste::win32::TrayState::kError;
+    case TrayHealth::kYellow:
+    default:
+      return picopaste::win32::TrayState::kWarning;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Upload worker. One thread, blocked on a waitable event when idle; it owns the
+// ssh child and the SFTP client, runs the pipeline on each hotkey, and drives
+// the Lifecycle machine for the whole process. Lifecycle is touched by this
+// thread alone, so its state machine needs no locking.
+// ---------------------------------------------------------------------------
+class UploadWorker final {
+ public:
+  UploadWorker() noexcept = default;
+  ~UploadWorker() noexcept { Stop(); }
+  UploadWorker(const UploadWorker&) = delete;
+  UploadWorker& operator=(const UploadWorker&) = delete;
+
+  // Wire to the process-lifetime objects. Call once, on the main thread, before
+  // Start().
+  void Configure(const Config* cfg, HANDLE containment_job, UploadPipeline* pipeline,
+                 Lifecycle* lifecycle) noexcept {
+    cfg_ = cfg;
+    containment_job_ = containment_job;
+    pipeline_ = pipeline;
+    lifecycle_ = lifecycle;
+    main_thread_ = GetCurrentThreadId();
+    platform_.SetRestoreHint((nullptr != cfg) && cfg->restore_clipboard);
+  }
+
+  Status Start() noexcept {
+    if (thread_.joinable()) {
+      return Status::success();
+    }
+    wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+    if (nullptr == wake_) {
+      return Status::error(Error::kTempFileFailed);
+    }
+    try {
+      thread_ = std::thread(&UploadWorker::Loop, this);
+    } catch (...) {
+      // Allocation failure under the job's commit ceiling must be reported,
+      // never allowed to terminate the process.
+      (void)CloseHandle(wake_);
+      wake_ = nullptr;
+      return Status::error(Error::kTempFileFailed);
+    }
+    return Status::success();
+  }
+
+  // Idempotent. Signals the worker, joins it, then finishes the lifecycle.
+  void Stop() noexcept {
+    if (thread_.joinable()) {
+      quit_.store(true, std::memory_order_release);
+      Wake();
+      thread_.join();
+    }
+    DropChannel();
+    if (nullptr != wake_) {
+      (void)CloseHandle(wake_);
+      wake_ = nullptr;
+    }
+    if (nullptr != lifecycle_) {
+      lifecycle_->Stop();
+      (void)lifecycle_->Post(LifecycleEvent::kStopped);
+    }
+    PostStopped();
+  }
+
+  void SetTarget(HWND window) noexcept { platform_.SetTarget(window); }
+  void Wake() noexcept {
+    if (nullptr != wake_) {
+      (void)SetEvent(wake_);
+    }
+  }
+  bool InFlight() const noexcept { return (nullptr != pipeline_) && pipeline_->in_flight(); }
+
+ private:
+  void Loop() noexcept {
+    picopaste::win32::ComApartment com;
+    (void)com.Init();  // WIC and the clipboard need COM on this thread
+    lifecycle_->Start();
+    (void)lifecycle_->Post(LifecycleEvent::kStart);  // Init -> Connecting
+    PostHealth();
+
+    while (quit_.load(std::memory_order_acquire) == false) {
+      const bool channel_alive = channel_.running();
+      HANDLE handles[2] = {wake_, nullptr};
+      DWORD count = 1;
+      if (channel_alive) {
+        handles[1] = channel_.process_handle();
+        count = 2;
+      }
+      // When the link is down we wait with the backoff as a timeout, so the
+      // reconnect is driven by the wait itself rather than by a polling tick.
+      const DWORD timeout = NeedsRetry() ? lifecycle_->RetryDelayMs() : INFINITE;
+      const DWORD woken = WaitForMultipleObjects(count, handles, FALSE, timeout);
+      if (quit_.load(std::memory_order_acquire)) {
+        break;
+      }
+      if (WAIT_OBJECT_0 == woken) {
+        RunOnce();  // hotkey trigger
+      } else if (channel_alive && ((WAIT_OBJECT_0 + 1) == woken)) {
+        // The ssh child died while idle: a real channel-loss signal with no
+        // polling. Degraded is entered from Ready; any other state is a no-op.
+        DropChannel();
+        (void)lifecycle_->Post(LifecycleEvent::kChannelLost);
+        PostHealth();
+      } else if (WAIT_TIMEOUT == woken) {
+        // The supervisory timer fired: re-establish the channel.
+        (void)lifecycle_->Post(LifecycleEvent::kRetry);
+        EnsureChannel();
+      } else {
+        break;  // WAIT_FAILED or unexpected: stop rather than spin
+      }
+    }
+  }
+
+  void RunOnce() noexcept {
+    if (EnsureChannel() == false) {
+      return;  // EnsureChannel already posted the failure
+    }
+    const std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
+    const auto result =
+        pipeline_->Run(*client_.Get(), platform_.Clipboard(), platform_.Inject(), now);
+    if (result.has_value()) {
+      PostHealth();
+      return;
+    }
+    if (Error::kBusy == result.get_error()) {
+      return;  // a queued trigger raced the running one; nothing happened
+    }
+    // Any other failure may mean the channel is bad: drop it and let the
+    // supervisory loop back off and retry, with the tray showing the failure.
+    DropChannel();
+    (void)lifecycle_->Post(LifecycleEvent::kConnectFail);
+    PostHealth();
+  }
+
+  bool EnsureChannel() noexcept {
+    if (nullptr != client_.Get()) {
+      return true;
+    }
+    if (SpawnChannel() == false) {
+      (void)lifecycle_->Post(LifecycleEvent::kConnectFail);
+      PostHealth();
+      return false;
+    }
+    (void)lifecycle_->Post(LifecycleEvent::kConnectOk);
+    PostHealth();
+    return true;
+  }
+
+  bool SpawnChannel() noexcept {
+    wchar_t command[picopaste::win32::kMaxCommandLineChars] = {};
+    if (BuildCommand(command, picopaste::win32::kMaxCommandLineChars) == false) {
+      return false;
+    }
+    const picopaste::win32::ChildStreamOptions options{command, nullptr, containment_job_};
+    const Status spawned = channel_.Spawn(options);
+    if (spawned.has_value() == false) {
+      return false;
+    }
+    client_.Create(channel_.stream());
+    const Status inited = client_.Get()->Init();
+    if (inited.has_value() == false) {
+      DropChannel();
+      return false;
+    }
+    return true;
+  }
+
+  void DropChannel() noexcept {
+    client_.Destroy();
+    channel_.Close();
+  }
+
+  // `<ssh> -o ClearAllForwardings=yes -o BatchMode=yes -o LogLevel=ERROR -s <host> sftp`.
+  // The options mirror the integration tests and keep a user's forwarding
+  // config from firing on this channel.
+  bool BuildCommand(wchar_t* out, std::size_t cap) const noexcept {
+    wchar_t ssh[360] = {};
+    wchar_t host[256] = {};
+    if (picopaste::win32::Utf8ToWide(cfg_->ssh_command.c_str(), ssh, 360) == false) {
+      return false;
+    }
+    if (picopaste::win32::Utf8ToWide(cfg_->host.c_str(), host, 256) == false) {
+      return false;
+    }
+    const wchar_t* parts[] = {
+        ssh, L" -o ClearAllForwardings=yes -o BatchMode=yes -o LogLevel=ERROR -s ", host, L" sftp"};
+    std::size_t used = 0u;
+    for (const wchar_t* part : parts) {
+      for (const wchar_t* p = part; L'\0' != *p; ++p) {
+        if ((used + 1u) >= cap) {
+          return false;  // report overflow rather than truncate the command
+        }
+        out[used] = *p;
+        ++used;
+      }
+    }
+    out[used] = L'\0';
+    return true;
+  }
+
+  bool NeedsRetry() const noexcept {
+    const LifecycleState state = lifecycle_->State();
+    return (LifecycleState::kDegraded == state) || (LifecycleState::kReconnecting == state);
+  }
+
+  void PostHealth() noexcept {
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus,
+                             static_cast<WPARAM>(MapTrayState(lifecycle_->Health())),
+                             static_cast<LPARAM>(WorkerNotice::kHealth));
+  }
+
+  void PostStopped() noexcept {
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus,
+                             static_cast<WPARAM>(picopaste::win32::TrayState::kError),
+                             static_cast<LPARAM>(WorkerNotice::kStopped));
+  }
+
+  Win32Platform platform_{};
+  picopaste::win32::ChildStream channel_{};
+  ClientSlot client_{};
+  const Config* cfg_ = nullptr;
+  HANDLE containment_job_ = nullptr;
+  HANDLE wake_ = nullptr;
+  UploadPipeline* pipeline_ = nullptr;
+  Lifecycle* lifecycle_ = nullptr;
+  DWORD main_thread_ = 0;
+  std::atomic<bool> quit_{false};
+  std::thread thread_{};
+};
+
+// ---------------------------------------------------------------------------
+// Interactive mode
+// ---------------------------------------------------------------------------
+
+bool LoadInteractiveConfig(HANDLE out, HANDLE err, const wchar_t* config_path, Config& out_cfg) noexcept {
+  char narrow[kConfigPathChars] = {};
+  const char* path = nullptr;
+  if (config_path != nullptr) {
+    if (NarrowPath(config_path, narrow, sizeof(narrow)) == false) {
+      EmitFormatted(err, "FAIL config-path: the --config path exceeds %u bytes\n",
+                    static_cast<unsigned>(kConfigPathChars));
+      return false;
+    }
+    path = narrow;
+  }
+
+  bool created_defaults = false;
+  const auto loaded = picopaste::LoadConfig(path, &created_defaults);
+  if (loaded.has_value() == false) {
+    EmitFormatted(err, "FAIL config-load: error %u\n", static_cast<unsigned>(loaded.get_error()));
+    return false;
+  }
+  if (created_defaults == true) {
+    Emit(out, "note: no config file found; using defaults\n");
+  }
+  out_cfg = loaded.value();
+  return true;
+}
+
+const wchar_t* TipFor(picopaste::win32::TrayState state, bool stopped) noexcept {
+  if (stopped) {
+    return L"picopaste: stopped";
+  }
+  switch (state) {
+    case picopaste::win32::TrayState::kHealthy:
+      return L"picopaste: ready";
+    case picopaste::win32::TrayState::kError:
+      return L"picopaste: channel lost, retrying";
+    case picopaste::win32::TrayState::kWarning:
+    default:
+      return L"picopaste: connecting";
+  }
+}
+
+std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
+                            const wchar_t* config_path) noexcept {
+  Config config = picopaste::DefaultConfig();
+  if (LoadInteractiveConfig(out, err, config_path, config) == false) {
+    return kExitSelftestFailed;
+  }
+  if (config.host.empty()) {
+    Emit(err, "picopaste: config 'host' is empty; set host = <ssh alias> and retry.\n");
+    return kExitSelftestFailed;
+  }
+
+  // Function-locals with static storage: the SFTP Client is ~128 KB and must
+  // never sit on a 256 KB worker stack (design section 5). Process-lifetime
+  // storage is also exactly the lifetime the design requires for the client.
+  static UploadPipeline pipeline(config);
+  static Lifecycle lifecycle;
+  static UploadWorker worker;
+
+  picopaste::win32::SingleInstance single;
+  picopaste::win32::Tray tray;
+
+  std::uint32_t owner_pid = 0;
+  wchar_t owner_image[picopaste::win32::kOwnerImageChars] = {};
+  Status setup = single.Acquire(&owner_pid, owner_image, picopaste::win32::kOwnerImageChars);
+  if (!setup) {
+    if (Error::kSingleInstanceExists == setup.get_error()) {
+      char owner_narrow[picopaste::win32::kOwnerImageChars * 3] = {};
+      (void)picopaste::win32::WideToUtf8(owner_image, owner_narrow, sizeof(owner_narrow));
+      EmitFormatted(err,
+                    "picopaste: already running (pid %u, image %s); refusing a second instance.\n",
+                    static_cast<unsigned>(owner_pid), owner_narrow);
+    } else {
+      EmitFormatted(err, "picopaste: could not create the single-instance mutex (error %u)\n",
+                    static_cast<unsigned>(setup.get_error()));
+    }
+  }
+  if (setup) {
+    setup = single.SetupJobObjects(config.job_memory_limit_mb);
+  }
+  if (setup) {
+    setup = tray.Create(instance, L"picopaste: starting");
+  }
+  if (setup) {
+    setup = tray.Show();
+  }
+
+  const auto binding = picopaste::win32::ParseHotkey(config.hotkey.c_str());
+  if (setup && !binding) {
+    setup = Status::error(binding.get_error());
+  }
+  DWORD hotkey_error = 0;
+  if (setup) {
+    setup = picopaste::win32::RegisterHotkey(nullptr, kHotkeyId, binding.value(), &hotkey_error);
+  }
+  if (!setup) {
+    EmitFormatted(err, "picopaste: startup failed (error %u, hotkey %lu)\n",
+                  static_cast<unsigned>(setup.get_error()),
+                  static_cast<unsigned long>(hotkey_error));
+    return kExitSelftestFailed;
+  }
+
+  worker.Configure(&config, single.containment_job(), &pipeline, &lifecycle);
+  const Status started = worker.Start();
+  if (!started) {
+    EmitFormatted(err, "picopaste: could not start the upload worker (error %u)\n",
+                  static_cast<unsigned>(started.get_error()));
+    single.Close();
+    tray.Destroy();
+    return kExitSelftestFailed;
+  }
+
+  // Prime this thread's message queue so the worker's first PostThreadMessageW
+  // has a queue to land in even if it posts before the loop's first GetMessageW.
+  MSG prime{};
+  (void)PeekMessageW(&prime, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+  std::int32_t exit_code = kExitOk;
+  bool loop_error = false;
+  for (;;) {
+    MSG msg{};
+    const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+    if (0 == got) {  // WM_QUIT
+      exit_code = static_cast<std::int32_t>(msg.wParam);
+      break;
+    }
+    if (-1 == got) {
+      loop_error = true;
+      break;
+    }
+    if ((picopaste::win32::kWmHotkey == msg.message) && (nullptr == msg.hwnd)) {
+      // WM_HOTKEY registered against the thread (hwnd == nullptr) arrives here,
+      // not at the tray window. The message loop itself never blocks on I/O.
+      if (worker.InFlight()) {
+        tray.Notify(L"picopaste", L"an upload is already in flight", false);
+      } else {
+        worker.SetTarget(picopaste::win32::CaptureForegroundWindow());
+        worker.Wake();
+      }
+      continue;
+    }
+    if (kWmWorkerStatus == msg.message) {
+      const bool stopped = (static_cast<WorkerNotice>(msg.lParam) == WorkerNotice::kStopped);
+      const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
+      tray.SetState(state, TipFor(state, stopped));
+      continue;
+    }
+    (void)TranslateMessage(&msg);
+    (void)DispatchMessageW(&msg);
+  }
+
+  worker.Stop();
+  picopaste::win32::UnregisterHotkey(nullptr, kHotkeyId);
+  tray.Destroy();
+  single.Close();
+  return loop_error ? kExitSelftestFailed : exit_code;
+}
+
 std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noexcept {
   char narrow[kConfigPathChars] = {};
   const char* path = nullptr;
@@ -164,7 +754,7 @@ std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noe
   }
 
   bool created_defaults = false;
-  const auto loaded = LoadConfig(path, &created_defaults);
+  const auto loaded = picopaste::LoadConfig(path, &created_defaults);
   if (loaded.has_value() == false) {
     // The error type has no stringifier yet, so report the numeric code rather
     // than a vague "failed".
@@ -189,21 +779,12 @@ std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noe
   return kExitOk;
 }
 
-std::int32_t RunInteractive(HANDLE err) noexcept {
-  Emit(err,
-       "picopaste: interactive mode is not wired yet -- the tray/hotkey/paste loop is still\n"
-       "           missing, so there is nothing to run. This build can verify itself only:\n"
-       "           run `picopaste --selftest` from a terminal.\n");
-  return kExitNotImplemented;
-}
-
 }  // namespace
 
 // The exception specification on this definition must match the one Win32
 // declares for wWinMain, which is not noexcept, so this entry point is the one
 // function here that cannot carry it.
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show) {
-  (void)instance;
   (void)previous;
   (void)command_line;
   (void)show;
@@ -223,5 +804,5 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   if (options.selftest == true) {
     return RunSelftest(out, err, options.config_path);
   }
-  return RunInteractive(err);
+  return RunInteractive(instance, out, err, options.config_path);
 }

@@ -23,12 +23,27 @@ target_sources(picopaste PRIVATE
 # error handler) becomes a no-op, because this project builds without
 # exceptions. See the comment at that function.
 # ---------------------------------------------------------------------------
-target_sources(picopaste PRIVATE
+# The vendored sources are not ours to fix, and they are not warning-clean under
+# MSVC /W4: C4018 signed/unsigned comparison, C4267 size_t narrowing, C4456 and
+# C4458 shadowing. picopaste_apply_vendor_includes() marks the third_party
+# *include directory* external, which silences warnings from headers reached
+# through it -- but these files are compiled as sources of this target, so their
+# warnings land on us. Suppress warnings for these files alone; lowering the
+# warning level for the whole target would blind us to our own code.
+set(PICOPASTE_CLIP_SOURCES
   "${CMAKE_SOURCE_DIR}/third_party/clip/clip.cpp"
   "${CMAKE_SOURCE_DIR}/third_party/clip/image.cpp"
   "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win.cpp"
   "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win_bmp.cpp"
   "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win_wic.cpp"
 )
+target_sources(picopaste PRIVATE ${PICOPASTE_CLIP_SOURCES})
+
+if(MSVC)
+  # /w turns off all warnings for these translation units only.
+  set_source_files_properties(${PICOPASTE_CLIP_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
+else()
+  set_source_files_properties(${PICOPASTE_CLIP_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+endif()
 target_include_directories(picopaste PRIVATE "${CMAKE_SOURCE_DIR}/third_party/clip")
 target_compile_definitions(picopaste PRIVATE CLIP_ENABLE_IMAGE=1)

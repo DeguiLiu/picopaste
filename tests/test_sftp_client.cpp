@@ -474,13 +474,16 @@ TEST_CASE("end-to-end WriteFile/ReadFile/ListDir against local OpenSSH sftp-serv
   CHECK(got == payload);
 
   /* One byte short: a size problem must surface as kBufferTooSmall, not as a
-     silent truncation and not as a parse failure. */
-  std::vector<std::uint8_t> small(payload.size() - 1u);
+     silent truncation and not as a parse failure.
+     Not named `small`: <rpcndr.h>, which windows.h drags in, defines `small`
+     as a macro for `char` under MSVC, and the declaration then fails to parse
+     (C2628). GCC never sees that macro, so only the MSVC job catches it. */
+  std::vector<std::uint8_t> one_short(payload.size() - 1u);
   std::uint32_t n_small = 0u;
   bool missing_small = false;
   const Status too_small =
-      c.ReadFile(remote.c_str(), small.data(), static_cast<std::uint32_t>(small.size()), n_small,
-                 missing_small);
+      c.ReadFile(remote.c_str(), one_short.data(), static_cast<std::uint32_t>(one_short.size()),
+                 n_small, missing_small);
   REQUIRE_FALSE(too_small);
   CHECK(too_small.get_error() == Error::kBufferTooSmall);
 
@@ -488,8 +491,8 @@ TEST_CASE("end-to-end WriteFile/ReadFile/ListDir against local OpenSSH sftp-serv
   const std::string absent = dir + "/absent.bin";
   std::uint32_t n_absent = 7u;
   bool missing_absent = false;
-  REQUIRE(c.ReadFile(absent.c_str(), small.data(), static_cast<std::uint32_t>(small.size()),
-                     n_absent, missing_absent));
+  REQUIRE(c.ReadFile(absent.c_str(), one_short.data(),
+                     static_cast<std::uint32_t>(one_short.size()), n_absent, missing_absent));
   CHECK(missing_absent);
   CHECK(n_absent == 0u);
 

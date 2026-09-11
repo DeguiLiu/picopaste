@@ -26,6 +26,8 @@ add_executable(picopaste_tests
   test_memory_budget.cpp
   test_hook_install.cpp
   test_dir_ops.cpp
+  test_upload_pipeline.cpp
+  test_supervision.cpp
 )
 target_link_libraries(picopaste_tests PRIVATE picopaste_core Catch2::Catch2WithMain
   picopaste_msvc_crt)

@@ -22,7 +22,7 @@ flowchart LR
 
   PP["picopaste.exe<br/>单进程 · 内核单实例 · Job Object 32MB"]
 
-  subgraph CH["ssh.exe 子进程（每次粘贴现拉，随主进程消亡）"]
+  subgraph CH["ssh.exe 子进程（常驻于 worker，随主进程消亡）"]
     SS["ssh -s HOST sftp"]
   end
 
@@ -52,7 +52,9 @@ flowchart LR
   class REM,SF,UP,JS rem
 ```
 
-**图中最关键的一点**：那条常驻转发端口不存在。原方案依赖长驻的 RemoteForward 端口，它断了不会有任何信号。这里每次粘贴现拉一个 `ssh -s <host> sftp` 子系统通道——隧道死掉立刻变成 `kChannelSpawnFailed`，而不是静默无操作。
+**图中最关键的一点**：那条转发端口不存在。原方案依赖长驻的 RemoteForward 端口，而它断了不会有任何信号。这里由 worker 持有一条**常驻**的 `ssh -s <host> sftp` 子系统通道，并**阻塞等待该子进程的句柄**——子进程一死，句柄立刻发出信号，失联因此变成一个真实事件（Ready → Degraded，托盘转红）而不是沉默；随后按退避重建。
+
+代价说清楚：常驻通道省掉每次粘贴的握手，但它**确实可能悄悄死掉**，所以必须盯着子进程句柄。这个等待的超时同时充当退避定时器，空闲时线程全部阻塞在内核对象上，不轮询。
 
 ## 一次粘贴发生了什么
 
@@ -66,7 +68,7 @@ sequenceDiagram
 
   U->>P: 按下全局热键
   P->>P: 读取剪贴板 DIB（零拷贝）→ WIC 编码 PNG
-  P->>S: 拉起子系统通道，发出 SFTP 请求
+  P->>S: 复用常驻通道发出 SFTP 请求
   S->>R: OPEN / WRITE / CLOSE
   P->>S: STAT 回查实际大小
   S->>R: STAT
@@ -128,10 +130,10 @@ ctest --test-dir build --output-on-failure
 | 远端 `settings.json` 钩子安装（含备份与还原） | 完成，有集成测试 |
 | Windows 平台层（剪贴板 / 注入 / 单实例 / 托盘 / 热键） | 代码完成，**仅交叉编译语法检查过** |
 | 能力自检 `picopaste.exe --selftest` | 完成，可在真实 Windows 上报告各项能力与内存上限 |
-| **交互模式（托盘 / 热键 / 粘贴主循环）** | **未接线**。不带参数运行会明确报告未接线并以退出码 2 结束，而不是启动一个静默无作为的守护进程 |
-| MSVC 真实构建 | CI 已接入；首次运行暴露的问题正在修复 |
+| 交互模式（托盘 / 热键 / 粘贴主循环） | **已接线**：`GetMessageW` 消息循环、worker 线程、常驻通道与失联重建全部由 C++ 承担。Windows 运行时行为**未经真机验证** |
+| MSVC 真实构建 | CI 已接入，并已抓到三批本机看不到的真实缺陷（C4996、`small` 宏冲突、vendored 警告归属）；修复在推进 |
 
-`picopaste.exe` 目前只能自证：在终端运行 `picopaste --selftest`，它会逐个能力打印 PASS / FAIL / SKIP 与具体数值。
+`picopaste --selftest` 可在终端逐个能力打印 PASS / FAIL / SKIP 与具体数值，用于在真机上核对。
 
 ## 目录结构
 
