@@ -18,6 +18,13 @@ target_sources(picopaste_core PRIVATE
 # warning for that single file rather than weakening -Werror for the target.
 # MSVC does not emit this warning at all.
 if(NOT MSVC)
-  set_source_files_properties(hook_install.cpp PROPERTIES
-    COMPILE_OPTIONS "-Wno-maybe-uninitialized")
+  # TARGET_DIRECTORY is load-bearing, not decoration. picopaste_core is declared
+  # in the root CMakeLists and only extended here, and a source-file property set
+  # without an explicit target directory applies to THIS directory's scope only,
+  # so it never reaches the root-scoped target and is dropped silently. Both the
+  # bare relative path and the absolute path were tried and neither took effect;
+  # the flag was verifiably absent from the generated build tree until this form.
+  set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/hook_install.cpp"
+    TARGET_DIRECTORY picopaste_core
+    PROPERTIES COMPILE_OPTIONS "-Wno-maybe-uninitialized")
 endif()
