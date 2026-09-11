@@ -12,6 +12,17 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# One CRT for every target in the build, including FetchContent'd dependencies.
+# Setting MSVC_RUNTIME_LIBRARY per target is not enough: it leaves third-party
+# targets (Catch2) on the default /MD while ours are /MT, and mixing the two in
+# one link produces LNK2005 on STL internals -- basic_ios, basic_streambuf,
+# locale::facet -- reported as "already defined in <some other test>.obj", which
+# points at the symptom rather than the cause. Static CRT stays the goal: the
+# shipped exe must run without a redistributable install.
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "" FORCE)
+endif()
+
 option(PICOPASTE_BUILD_TESTS "Build the host test suite" ON)
 option(PICOPASTE_WERROR "Treat warnings as errors" OFF)
 # newosp config backend. INI ships vendored in newosp (include/osp/inicpp.hpp),
