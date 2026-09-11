@@ -65,7 +65,13 @@ jobs:
           StrictModes no
           Subsystem sftp /usr/lib/openssh/sftp-server
           EOF
-          /usr/sbin/sshd -f ~/.ssh/ci_sshd_config
+          # -t validates the config before anything depends on it; -E captures
+          # sshd's own log, which is otherwise discarded and turns a failure
+          # into silence. Production runs tsshd, but tsshd executes whatever
+          # `Subsystem sftp` names in sshd_config, so the SFTP server on the
+          # other end is this same sftp-server binary either way.
+          /usr/sbin/sshd -t -f ~/.ssh/ci_sshd_config
+          /usr/sbin/sshd -f ~/.ssh/ci_sshd_config -E ~/.ssh/ci_sshd.log
           cat > ~/.ssh/config <<'EOF'
           Host localhost
             Port 2222
@@ -73,16 +79,30 @@ jobs:
           chmod 600 ~/.ssh/config
           # Wait for the listener, then trust its host key under the alias the
           # tests connect with ([localhost]:2222 for a non-default port).
+          up=no
           for _ in $(seq 1 20); do
             if ssh-keyscan -p 2222 -T 2 localhost 2>/dev/null | grep -q .; then
+              up=yes
               break
             fi
             sleep 1
           done
+          if [ "$up" != yes ]; then
+            echo "::error::sshd never listened on 2222 -- diagnostics follow"
+            echo "--- sshd processes ---"; pgrep -a sshd || echo "  none"
+            echo "--- listeners ---"; ss -ltn 2>/dev/null | head -20 || true
+            echo "--- sshd log ---"; cat ~/.ssh/ci_sshd.log 2>/dev/null || echo "  no log"
+            echo "--- effective config ---"; cat ~/.ssh/ci_sshd_config
+            exit 1
+          fi
           ssh-keyscan -p 2222 localhost >> ~/.ssh/known_hosts
           # Fail loudly if passwordless ssh still does not work rather than
           # letting the integration tests quietly report SKIP.
-          ssh -o BatchMode=yes -o LogLevel=ERROR -s localhost sftp </dev/null
+          if ! ssh -o BatchMode=yes -o LogLevel=ERROR -s localhost sftp </dev/null; then
+            echo "::error::passwordless ssh to the local sshd failed"
+            echo "--- sshd log ---"; cat ~/.ssh/ci_sshd.log 2>/dev/null || true
+            exit 1
+          fi
           echo "local sftp subsystem is up"
 
       - name: Configure
