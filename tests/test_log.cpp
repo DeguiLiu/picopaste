@@ -183,6 +183,13 @@ TEST_CASE("LogSink reports writes before Open", "[log]") {
   CHECK_FALSE(sink.Write(picopaste::MakeLogRecord(picopaste::LogLevel::kInfo, "nope")).has_value());
 }
 
+#if defined(__linux__)
+
+// Linux-only: memsample.hpp defines SampleMemory() under __linux__ alone (it
+// reads /proc/self/status and /proc/self/fd). Windows declares the symbol but
+// defines it in the win32 layer, so an unguarded case here fails to link.
+// The assertions below are about /proc values, so there is nothing honest to
+// check on another platform.
 TEST_CASE("SampleMemory reports a live snapshot on Linux", "[log][memsample]") {
   const picopaste::MemorySnapshot snapshot = picopaste::SampleMemory();
   REQUIRE(snapshot.valid);
@@ -191,3 +198,5 @@ TEST_CASE("SampleMemory reports a live snapshot on Linux", "[log][memsample]") {
   CHECK(snapshot.thread_count >= 1U);
   CHECK(snapshot.handle_count >= 1U);
 }
+
+#endif  // __linux__

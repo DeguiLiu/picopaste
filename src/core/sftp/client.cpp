@@ -24,6 +24,18 @@
 #include <unistd.h>
 #endif
 
+// The stat buffer aliases must be declared at global scope. An
+// elaborated-type-specifier (`struct _stat64` / `struct stat`) written inside a
+// namespace declares a *new* incomplete type in that namespace rather than
+// finding the one <sys/stat.h> defined at global scope: the alias would then
+// name an incomplete local struct and every use of it would fail to compile.
+// At global scope the same spelling finds the real type.
+#if defined(_WIN32)
+using StatBuf = struct _stat64;
+#else
+using StatBuf = struct stat;
+#endif
+
 namespace picopaste::sftp {
 namespace {
 
@@ -38,7 +50,6 @@ inline constexpr std::uint32_t kWriteDataOffset(std::uint32_t handle_len) noexce
 // ---------------------------------------------------------------------------
 
 #if defined(_WIN32)
-using StatBuf = struct _stat64;
 int LocalOpen(const char* path) noexcept { return ::_open(path, _O_RDONLY | _O_BINARY); }
 int LocalClose(int fd) noexcept { return ::_close(fd); }
 int LocalFstat(int fd, StatBuf* st) noexcept { return ::_fstat64(fd, st); }
@@ -46,7 +57,6 @@ long long LocalRead(int fd, void* buf, std::size_t len) noexcept {
   return static_cast<long long>(::_read(fd, buf, static_cast<unsigned int>(len)));
 }
 #else
-using StatBuf = struct stat;
 int LocalOpen(const char* path) noexcept { return ::open(path, O_RDONLY); }
 int LocalClose(int fd) noexcept { return ::close(fd); }
 int LocalFstat(int fd, StatBuf* st) noexcept { return ::fstat(fd, st); }
