@@ -101,7 +101,8 @@ and is testable with fake tables.
 1. Put `picopaste.ini` next to the exe — `host = user@host` is the minimum. Every key and its default
    is in [`docs/design/picopaste-design.md`](docs/design/picopaste-design.md); a missing file is not an
    error, the defaults are used and the program says so.
-2. Run `picopaste.exe`. A tray icon appears: yellow while connecting, green once the channel is up.
+2. Run `picopaste.exe`. A tray icon appears and connects immediately: green once the channel is up
+   (a sub-second flicker of yellow at most), amber while retrying in the background.
 3. Screenshot, then press the hotkey (default `alt+shift+v`). The remote path lands on the clipboard
    and is typed into the focused window.
 4. A red tray means the link is down, or the deadline probe could not arm. `picopaste.exe --selftest`

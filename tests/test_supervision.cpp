@@ -33,7 +33,8 @@ TEST_CASE("supervision loop: idle channel loss -> Degraded -> backoff -> Reconne
   REQUIRE(loop.State() == LifecycleState::kConnecting);
   CHECK(loop.Health() == TrayHealth::kYellow);
 
-  // First successful channel open / first successful paste.
+  // First kConnectOk: posted by the loop's startup EnsureChannel(), before any
+  // hotkey press. The tray settles green without waiting for the first upload.
   loop.Post(LifecycleEvent::kConnectOk);
   REQUIRE(loop.State() == LifecycleState::kReady);
   CHECK(loop.Health() == TrayHealth::kGreen);

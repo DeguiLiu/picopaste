@@ -184,7 +184,10 @@ osp::TransitionResult Lifecycle::HandleReady(Context& ctx, const osp::Event& eve
       // channel before posting this, so the link is gone and the tray must not
       // stay green; without this the bounded upload's kUploadTimeout would be
       // dropped here as unhandled -- failure indistinguishable from success,
-      // which is the one thing this project refuses to ship.
+      // which is the one thing this project refuses to ship. (kConnectFail is
+      // also produced by startup and reconnect attempts, but from Connecting or
+      // Reconnecting; reaching Ready through this event means a live channel
+      // broke.)
       ++ctx.connect_fail_count;
       return Degrade(ctx);
     case LifecycleEvent::kStop:

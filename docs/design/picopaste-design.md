@@ -73,6 +73,8 @@ sequenceDiagram
     participant W as 上传 worker
     participant C as 剪贴板
     participant S as SFTP 通道
+    W->>S: 启动即建连（EnsureChannel），成功即 Ready（托盘变绿）
+    note over W: 连接失败则进入退避重连，由等待超时驱动，无需轮询
     M->>W: 热键触发，投递上传任务（不阻塞消息循环）
     W->>C: OpenClipboard → 取图 → CloseClipboard
     note over W: PNG 直写临时文件；否则 DIBV5/DIB → WIC 编码（不复制像素）
@@ -149,8 +151,8 @@ Job Object 的上限必须覆盖它，否则 `GetClipboardData` 直接返回 NUL
 | 堆 / 私有提交 | ≤ 6 MB | 启动期一次性分配，热路径**零动态分配** |
 | 图片缓冲 | 0 或不复制 | WIC 直接指向锁定的剪贴板内存；走临时文件时不额外缓冲；分块缓冲 64 KB 复用 |
 | 日志环 / 配置 | 64 KB / ≤ 16 KB | 定长容器，不用 `std::string` |
-| **稳态私有提交** | **≤ 12 MB** | 实测：空闲 7.8 MB，建立 SFTP 通道后 9.8–11.9 MB |
-| **稳态工作集** | **≤ 40 MB** | 含共享 DLL 页。实测：空闲 24.7 MB，建链后 28–37 MB |
+| **稳态私有提交** | **≤ 12 MB** | 实测：启动后 9.8–11.9 MB（通道在启动即建立，空闲期就是建链后的数字） |
+| **稳态工作集** | **≤ 40 MB** | 含共享 DLL 页。实测：建链后 28–37 MB |
 | **硬上限** | **256 MB** | Job Object 的内核强制 commit 上限。它不是稳态占用，而是要覆盖"取图时整张图被复制进本进程"这一瞬时峰值；空闲与建链后的实测值仍是上面的 12 MB / 40 MB |
 
 **为什么用 Job Object 做内存上限**：它是内核强制的。超过上限时不是"程序变慢"或"GC 更勤快"，
@@ -160,7 +162,8 @@ Job Object 的上限必须覆盖它，否则 `GetClipboardData` 直接返回 NUL
 **空闲 CPU 为 0 的准确含义**：不是"什么都不做"，而是**不忙等**。空闲时进程里**没有任何定时器**——
 不存在 `CreateWaitableTimerEx`，也没有周期性的心跳或资源采样。四个线程全部阻塞在内核等待对象上：
 主线程在 `GetMessageW`，日志线程与上传 worker 在各自的信号量上，SFTP 读线程在管道的 `ReadFile` 上。
-worker 的等待是 `WaitForMultipleObjects({唤醒事件, ssh 子进程句柄})`：链路正常时超时是 `INFINITE`
+worker 在启动时即执行一次 `EnsureChannel()` 建立通道（见上面的时序图），此后它的等待是
+`WaitForMultipleObjects({唤醒事件, ssh 子进程句柄})`：链路正常时超时是 `INFINITE`
 （真正无限等待，不轮询）；只有在需要退避重连时才用 `RetryDelayMs()` 当超时，让重连由这次等待本身驱动。
 
 因此健康判定**完全由事件驱动**，没有采样参与：管道 EOF、ssh 子进程退出、任一请求失败。

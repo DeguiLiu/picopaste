@@ -567,6 +567,12 @@ class UploadWorker final {
     lifecycle_->Start();
     (void)lifecycle_->Post(LifecycleEvent::kStart);  // Init -> Connecting
     PostHealth();
+    // Establish the channel up front rather than waiting for the first hotkey:
+    // a tray that sits on "connecting" until the user presses the chord looks
+    // broken even though nothing is. A failure here posts ConnectFail, hands
+    // the machine to Reconnecting and the supervisory retry below takes over;
+    // a stop latched during the spawn is re-checked inside SpawnChannel.
+    EnsureChannel();
 
     while (quit_.load(std::memory_order_acquire) == false) {
       const bool channel_alive = channel_.running();

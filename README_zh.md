@@ -99,7 +99,8 @@ flowchart LR
 1. 把 `picopaste.ini` 放在 exe 同目录——最少只需 `host = user@host`。每个键及其默认值见
    [`docs/design/picopaste-design.md`](docs/design/picopaste-design.md)；文件不存在不算错误，会用
    内置默认值并提示。
-2. 运行 `picopaste.exe`。托盘出现图标：连接中为黄，通道就绪后为绿。
+2. 运行 `picopaste.exe`。托盘图标出现即立刻建连：通道就绪后为绿（启动至多闪一下黄），
+   后台重试期间为琥珀色。
 3. 截图后按热键（默认 `alt+shift+v`）。远端路径写入剪贴板并敲进当前焦点窗口。
 4. 托盘变红表示链路已断，或截止探针未能武装。`picopaste.exe --selftest` 对每项能力打印一行
    `PASS`/`FAIL`/`SKIP` 并附具体数字，任一必需能力失败即返回非零。
