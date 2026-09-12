@@ -41,15 +41,18 @@ PICOPASTE_ICON_ERR ICON "resources/picopaste-err.ico"
 // What the shell reads in the file Properties dialog. FILEVERSION is the fixed
 // 4-part numeric form, the strings are what a user actually sees, and both come
 // from the same @PROJECT_VERSION@. Without this block the executable carries no
-// version at all and the dialog shows a blank.
+// version at all and the dialog shows a blank. The numeric keywords are spelled
+// as literals rather than VS_FFI_FILEFLAGSMASK / VOS_NT_WINDOWS32 / VFT_APP:
+// rc.exe includes no headers of its own, so the symbolic forms are undefined
+// unless the .rc pulls in winver.h, and that is a dependency worth not having.
 VS_VERSION_INFO VERSIONINFO
   FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
   PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
-  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
-  FILEFLAGS 0x0L
-  FILEOS VOS_NT_WINDOWS32
-  FILETYPE VFT_APP
-  FILESUBTYPE VFT2_UNKNOWN
+  FILEFLAGSMASK 0x3fL              /* VS_FFI_FILEFLAGSMASK */
+  FILEFLAGS 0x0L                   /* no VS_FF_PRERELEASE / _PRIVATEBUILD / _SPECIALBUILD */
+  FILEOS 0x40004L                  /* VOS_NT_WINDOWS32 */
+  FILETYPE 0x1L                    /* VFT_APP */
+  FILESUBTYPE 0x0L                 /* VFT2_UNKNOWN */
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
