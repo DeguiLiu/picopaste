@@ -24,9 +24,9 @@
 
 /**
  * @file tray_icons.h
- * @brief Resource ids shared by picopaste.rc and tray.cpp.
+ * @brief Resource ids shared by picopaste.rc.in and tray.cpp.
  *
- * Resource ids shared by picopaste.rc (which defines the icons) and tray.cpp
+ * Resource ids shared by picopaste.rc.in (which defines the icons) and tray.cpp
  * (which loads them). Kept in one place so the two cannot drift.
  *
  * The lowest id must stay the executable's own icon: the shell takes the

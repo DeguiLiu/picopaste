@@ -2,6 +2,16 @@
 #
 # Linked into the picopaste executable target, which is created by the root
 # CMakeLists before this directory is added.
+# The version lives in the root project() and nowhere else. Configuring the .rc
+# from it means the version the shell reads out of picopaste.exe cannot drift
+# from the one the build was configured with. The generated file lands in the
+# binary dir, which changes nothing about how rc.exe resolves the icon paths
+# below: it looks for them along the include path, and the source dir stays on it.
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/picopaste.rc.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/picopaste.rc"
+  @ONLY)
+
 target_sources(picopaste PRIVATE
   main_win32.cpp     # wWinMain: console-attached --selftest runner; interactive mode not wired
   clipboard.cpp      # Win32 clipboard capture; WIC PNG encode; single temp-file path
@@ -11,7 +21,7 @@ target_sources(picopaste PRIVATE
   tray.cpp           # Shell_NotifyIconW tray, TaskbarCreated re-add, balloon
   hotkey.cpp         # RegisterHotKey, message loop integration
   selftest.cpp       # per-capability self-check table, also exposed as a subcommand
-  picopaste.rc       # icon resources: the tray's three states + the .exe icon
+  "${CMAKE_CURRENT_BINARY_DIR}/picopaste.rc"  # icon + version resources
 )
 
 # rc.exe looks for the .ico files named in picopaste.rc along its include path,

@@ -51,7 +51,7 @@ constexpr wchar_t kWindowClass[] = L"picopaste-tray";
 constexpr DWORD kRelaunchProbeMs = 1000;
 
 // Three colour-coded icons: blue for healthy, amber for warning, red for error.
-// They are this executable's own resources (see picopaste.rc; the ids live in
+// They are this executable's own resources (see picopaste.rc.in; the ids live in
 // tray_icons.h), so the tray does not depend on which stock system icons a given
 // Windows version happens to ship. LoadIconW returns a shared handle, which must
 // NOT be passed to DestroyIcon.
