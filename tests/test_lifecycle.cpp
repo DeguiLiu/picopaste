@@ -202,3 +202,41 @@ TEST_CASE("Post before Start is refused", "[lifecycle]") {
   CHECK_FALSE(lc.Post(LifecycleEvent::kStart));
   CHECK(lc.State() == LifecycleState::kInit);
 }
+
+TEST_CASE("A channel rebuilt while Degraded returns the machine to Ready", "[lifecycle]") {
+  // A hotkey fired during the backoff window can rebuild the channel before the
+  // supervisory timer fires. The state machine must accept that recovery: if it
+  // dropped kConnectOk here, the tray would stay red on a link that demonstrably
+  // works, which is the failure mode this case exists to prevent.
+  Lifecycle lc;
+  lc.Start();
+  lc.Post(LifecycleEvent::kStart);
+  lc.Post(LifecycleEvent::kConnectOk);
+  REQUIRE(lc.State() == LifecycleState::kReady);
+
+  lc.Post(LifecycleEvent::kChannelLost);
+  REQUIRE(lc.State() == LifecycleState::kDegraded);
+  REQUIRE(lc.Health() == TrayHealth::kRed);
+
+  lc.Post(LifecycleEvent::kConnectOk);
+  CHECK(lc.State() == LifecycleState::kReady);
+  CHECK(lc.Health() == TrayHealth::kGreen);
+}
+
+TEST_CASE("A failed rebuild while Degraded stays Degraded and ramps the backoff", "[lifecycle]") {
+  // kConnectFail from Degraded must not be treated as an unhandled no-op: the
+  // attempt genuinely failed, so the next wait has to be longer, and the tray
+  // must stay red rather than pretending to be reconnecting.
+  Lifecycle lc;
+  lc.Start();
+  lc.Post(LifecycleEvent::kStart);
+  lc.Post(LifecycleEvent::kConnectOk);
+  lc.Post(LifecycleEvent::kChannelLost);
+  REQUIRE(lc.State() == LifecycleState::kDegraded);
+  const std::uint32_t first_delay = lc.RetryDelayMs();
+
+  lc.Post(LifecycleEvent::kConnectFail);
+  CHECK(lc.State() == LifecycleState::kDegraded);
+  CHECK(lc.Health() == TrayHealth::kRed);
+  CHECK(lc.RetryDelayMs() >= first_delay);
+}

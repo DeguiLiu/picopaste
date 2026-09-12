@@ -202,6 +202,21 @@ osp::TransitionResult Lifecycle::HandleDegraded(Context& ctx, const osp::Event& 
     case LifecycleEvent::kRetry:
       ctx.retry_delay_ms = RetryDelay(ctx, ctx.stable_ms);
       return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kReconnecting));
+    case LifecycleEvent::kConnectOk:
+      // A channel was rebuilt while degraded -- a hotkey retry can do this
+      // before the supervisory timer fires. Without this case the event would be
+      // dropped and the tray would stay red on a link that is demonstrably
+      // working.
+      ++ctx.connect_ok_count;
+      return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kReady));
+    case LifecycleEvent::kConnectFail:
+      // A rebuild attempt failed while degraded: stay degraded and take the
+      // next backoff step rather than re-entering through kRetry, which would
+      // reset the ramp for a link that has not come back.
+      ++ctx.connect_fail_count;
+      ++ctx.attempt;
+      ctx.retry_delay_ms = RetryDelay(ctx, ctx.stable_ms);
+      return osp::TransitionResult::kHandled;
     case LifecycleEvent::kStop:
       return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kStopping));
     default:

@@ -106,6 +106,20 @@ constexpr std::uint32_t UploadTickMs(std::uint32_t timeout_ms) noexcept {
   return quarter;
 }
 
+// Handshake budget used when the upload deadline is disabled (upload_timeout_ms
+// = 0). The user has opted out of deadlines for uploads, but a connect that
+// never returns would leave the worker unable to reach its own loop, so it can
+// never even observe a quit request; this backstop keeps that impossible. It
+// applies only to the handshake, never to an upload the user chose to leave
+// unbounded.
+constexpr std::uint64_t kConnectBudgetDefaultMs = 60000u;
+
+// Monotonic milliseconds. A steady clock, not wall time: the deadline must not
+// jump when the system clock is adjusted, and only the difference matters.
+std::uint64_t NowMs() noexcept {
+  return static_cast<std::uint64_t>(GetTickCount64());
+}
+
 // The hotkey path chosen for this run, so the tray tooltip can name it. Only
 // the main thread writes and reads it.
 picopaste::win32::HotkeyBackend g_hotkey_backend = picopaste::win32::HotkeyBackend::kNone;
@@ -133,6 +147,26 @@ enum class WorkerNotice : std::uint8_t {
                        // one-shot balloon so a silent no-op looks like a dead
                        // hotkey and the user can act on it.
 };
+
+// Why the worker is reporting health, for the kHealth notice. It rides in the
+// high bits of lParam so the notice id itself stays a small enum. The tray
+// colour cannot carry this: Connecting and Reconnecting are both amber, and the
+// first is normal while the second is a failure the user should hear about.
+enum class ConnectionOutcome : std::uint8_t {
+  kNone = 0,       // routine report; nothing happened worth a balloon
+  kFailed = 1,     // an attempt to build the channel just failed
+  kRecovered = 2,  // the channel came back after a failure
+};
+// Bit 8, so the low byte remains the WorkerNotice value.
+constexpr std::uintptr_t kOutcomeShift = 8;
+constexpr std::uintptr_t kOutcomeMask = 0xFFu << kOutcomeShift;
+
+constexpr WorkerNotice NoticeOf(std::uintptr_t lparam) noexcept {
+  return static_cast<WorkerNotice>(lparam & 0xFFu);
+}
+constexpr ConnectionOutcome OutcomeOf(std::uintptr_t lparam) noexcept {
+  return static_cast<ConnectionOutcome>((lparam & kOutcomeMask) >> kOutcomeShift);
+}
 
 // RAII: attach to the console that launched us, and detach again on scope exit.
 // FreeConsole is only called when we were the ones who attached, so a process
@@ -560,6 +594,18 @@ class UploadWorker final {
     }
   }
 
+  // True when a handshake has outlived its budget. Read by the main thread's
+  // timer tick, on the same thread that calls AbortChannel: the worker cannot
+  // notice its own stall because it is blocked in the read. Both the deadline
+  // and this check are cheap atomics.
+  bool ConnectOverdue() const noexcept {
+    const std::uint64_t deadline = connect_deadline_ms_.load(std::memory_order_acquire);
+    if (0u == deadline) {
+      return false;  // no handshake in progress
+    }
+    return NowMs() >= deadline;
+  }
+
  private:
   void Loop() noexcept {
     picopaste::win32::ComApartment com;
@@ -572,7 +618,16 @@ class UploadWorker final {
     // broken even though nothing is. A failure here posts ConnectFail, hands
     // the machine to Reconnecting and the supervisory retry below takes over;
     // a stop latched during the spawn is re-checked inside SpawnChannel.
+    //
+    // The handshake is a blocking pipe read with no timeout of its own, so it is
+    // bracketed by the deadline probe: without that, an ssh that accepts the
+    // connection and then never speaks leaves the worker stuck before it ever
+    // reaches the loop, with no retry armed and no way to recover but a quit.
+    // The main thread may not be in its message loop yet, but its queue exists
+    // (the tray window was created before Start), so both posts land.
+    PostUploadStarted();
     EnsureChannel();
+    PostUploadEnded();
 
     while (quit_.load(std::memory_order_acquire) == false) {
       const bool channel_alive = channel_.running();
@@ -594,9 +649,11 @@ class UploadWorker final {
       } else if (channel_alive && ((WAIT_OBJECT_0 + 1) == woken)) {
         // The ssh child died while idle: a real channel-loss signal with no
         // polling. Degraded is entered from Ready; any other state is a no-op.
+        // The outcome is Failed so the tray announces it -- a link that broke
+        // while the user was not looking is exactly what must not pass silently.
         DropChannel();
         (void)lifecycle_->Post(LifecycleEvent::kChannelLost);
-        PostHealth();
+        PostHealth(ConnectionOutcome::kFailed);
       } else if (WAIT_TIMEOUT == woken) {
         // The supervisory timer fired: re-establish the channel.
         (void)lifecycle_->Post(LifecycleEvent::kRetry);
@@ -642,13 +699,18 @@ class UploadWorker final {
   }
 
   void RunOnce() noexcept {
+    // Arm the deadline BEFORE touching the channel. EnsureChannel can block
+    // indefinitely inside the SFTP handshake -- a blocking pipe read with no
+    // timeout, limited only by ssh's own TCP timeout -- and the probe is the
+    // only thing that can tear that down. Arming after the channel came up, as
+    // this used to, left exactly the reconnect-then-hang window the deadline
+    // exists to close. PostUploadEnded matches this on every exit below.
+    PostUploadStarted();
     if (EnsureChannel() == false) {
+      PostUploadEnded();
       return;  // EnsureChannel already posted the failure
     }
     const std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
-    // Tell the main thread an upload is about to start so it can arm the
-    // deadline probe, and again however Run returns so it is always disarmed.
-    PostUploadStarted();
     const auto result = pipeline_->Run(*client_.Get(), platform_.Clipboard(), platform_.Inject(), now);
     PostUploadEnded();
     if (result.has_value()) {
@@ -671,21 +733,45 @@ class UploadWorker final {
     // loop back off and retry, with the tray showing the failure.
     DropChannel();
     (void)lifecycle_->Post(LifecycleEvent::kConnectFail);
-    PostHealth();
+    PostHealth(ConnectionOutcome::kFailed);
   }
 
   bool EnsureChannel() noexcept {
     if (nullptr != client_.Get()) {
+      // A channel is already up. It may still be that the state machine never
+      // heard about it: a rebuild from Degraded posts kConnectOk, which
+      // HandleDegraded drops, so the tray would sit amber on a working link
+      // forever. Re-announcing here is the only place that can notice -- the
+      // event is idempotent from Ready, and from Degraded it is the recovery
+      // the machine was waiting for.
+      if (LifecycleState::kReady != lifecycle_->State()) {
+        (void)lifecycle_->Post(LifecycleEvent::kConnectOk);
+        PostHealth(ConnectionOutcome::kRecovered);
+      }
       return true;
     }
-    if (SpawnChannel() == false) {
+    // Publish the handshake deadline before the spawn blocks. ssh can accept the
+    // connection and then never speak SFTP, and every read involved is an
+    // unbounded blocking pipe read, so without this the worker would sit inside
+    // Client::Init() for as long as the peer stayed silent.
+    connect_deadline_ms_.store(NowMs() + ConnectionBudgetMs(), std::memory_order_release);
+    const bool spawned = SpawnChannel();
+    connect_deadline_ms_.store(0u, std::memory_order_release);
+    if (spawned == false) {
       (void)lifecycle_->Post(LifecycleEvent::kConnectFail);
-      PostHealth();
+      PostHealth(ConnectionOutcome::kFailed);
       return false;
     }
     (void)lifecycle_->Post(LifecycleEvent::kConnectOk);
-    PostHealth();
+    PostHealth(ConnectionOutcome::kRecovered);
     return true;
+  }
+
+  // How long a handshake may take. Reuses the upload deadline the user already
+  // configured: both are "the peer has gone quiet" budgets, and a second knob
+  // for the same failure would just be one more thing to get wrong.
+  std::uint64_t ConnectionBudgetMs() const noexcept {
+    return (0u == cfg_->upload_timeout_ms) ? kConnectBudgetDefaultMs : cfg_->upload_timeout_ms;
   }
 
   bool SpawnChannel() noexcept {
@@ -773,6 +859,17 @@ class UploadWorker final {
                              static_cast<LPARAM>(WorkerNotice::kHealth));
   }
 
+  // Health, with the reason attached. The tray colour alone cannot tell a first
+  // connection in progress from a link that just broke -- both are amber -- so
+  // the worker names the cause and the main thread decides whether it is worth
+  // a balloon.
+  void PostHealth(ConnectionOutcome outcome) noexcept {
+    const std::uintptr_t lparam =
+        static_cast<std::uintptr_t>(WorkerNotice::kHealth) | (static_cast<std::uintptr_t>(outcome) << kOutcomeShift);
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(MapTrayState(lifecycle_->Health())),
+                             static_cast<LPARAM>(lparam));
+  }
+
   void PostStopped() noexcept {
     (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(picopaste::win32::TrayState::kError),
                              static_cast<LPARAM>(WorkerNotice::kStopped));
@@ -797,6 +894,10 @@ class UploadWorker final {
   // The ssh child's process handle, published for AbortChannel. Set on spawn,
   // cleared before the channel closes; read by the main thread only.
   std::atomic<HANDLE> abort_process_{nullptr};
+  // Absolute steady-clock deadline for a handshake in progress; 0 means none.
+  // Written only by the worker (before and after the blocking spawn), read by
+  // the main thread's timer tick, which is what makes it atomic.
+  std::atomic<std::uint64_t> connect_deadline_ms_{0u};
   DWORD main_thread_ = 0;
   std::atomic<bool> quit_{false};
   std::thread thread_{};
@@ -853,28 +954,25 @@ const wchar_t* TipFor(picopaste::win32::TrayState state, bool stopped) noexcept 
   return tip;
 }
 
-// Balloon text for a transition into a non-healthy state. The tray only changes
-// colour, which is easy to miss on a busy taskbar; the design's rule is that a
-// failure must be noticed, so the transition is announced once.
-const wchar_t* NoticeFor(picopaste::win32::TrayState state) noexcept {
-  switch (state) {
-    case picopaste::win32::TrayState::kError:
-      return L"channel lost - retrying in the background";
-    case picopaste::win32::TrayState::kWarning:
-    default:
-      return L"reconnecting";
-  }
-}
-
 // Maps a local, user-caused pipeline error to a one-line balloon the user can
 // act on. Anything not in this list is intentionally silent: a hotkey that
 // hits nothing for some unforeseen reason should not invent a story.
-const wchar_t* NoticeForLocalError(Error err) noexcept {
+//
+// kImageTooLarge is the one entry that depends on configuration -- the ceiling
+// is cfg.max_image_bytes -- so its text is formatted by the caller into
+// `size_balloon` rather than returned as a literal, and statically returning a
+// number here would go stale the moment a user raised the limit.
+const wchar_t* NoticeForLocalError(Error err, const Config& cfg, wchar_t* buf, std::size_t buf_chars) noexcept {
   switch (err) {
     case Error::kNoImageInClipboard:
       return L"clipboard has no image";
-    case Error::kImageTooLarge:
-      return L"image too large (max 20 MB)";
+    case Error::kImageTooLarge: {
+      const unsigned mb = static_cast<unsigned>(cfg.max_image_bytes / (1024u * 1024u));
+      // snprintf failure leaves buf untouched, and buf is pre-filled by the
+      // caller, so a truncation can never surface a half-built sentence.
+      (void)std::swprintf(buf, buf_chars, L"image too large (max %u MB)", mb);
+      return buf;
+    }
     case Error::kPngEncodeFailed:
       return L"image encode failed";
     case Error::kClipboardOpenFailed:
@@ -982,7 +1080,15 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
   UINT_PTR upload_timer = 0;
   // Last health the tray was told about, so a balloon fires on the transition
   // into a bad state rather than on every health post the worker sends.
-  auto last_state = picopaste::win32::TrayState::kHealthy;
+  //
+  // Seeded to kWarning, not kHealthy: the worker's first post after kStart is
+  // Connecting/yellow, which is the tray's *initial* state, not a transition
+  // into trouble. Starting from kHealthy would make every healthy launch
+  // announce "reconnecting" the moment the worker came up -- the tray claiming
+  // a failure that never happened, which is the one thing this project refuses
+  // to ship. A later move to kError still differs from this seed and is
+  // announced.
+  auto last_state = picopaste::win32::TrayState::kWarning;
   const auto disarm_timer = [&upload_timer]() noexcept {
     if (0u != upload_timer) {
       (void)KillTimer(nullptr, upload_timer);
@@ -1020,13 +1126,19 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
       continue;
     }
     if (kWmWorkerStatus == msg.message) {
-      const auto notice = static_cast<WorkerNotice>(msg.lParam);
+      const auto notice = NoticeOf(static_cast<std::uintptr_t>(msg.lParam));
       if (WorkerNotice::kUploadStarted == notice) {
-        // Arm the probe only while an upload is in flight. A disabled deadline
-        // (0) never latches, so arming then would be pure wake-ups; the idle
-        // promise is exactly zero CPU, not "near zero".
-        if ((0u != config.upload_timeout_ms) && (0u == upload_timer)) {
-          const std::uint32_t tick_ms = UploadTickMs(config.upload_timeout_ms);
+        // Arm the probe while an upload OR a handshake is in flight. A disabled
+        // upload deadline (0) still needs a tick during a handshake -- that is
+        // the only thing that can break a worker stuck in an unbounded read --
+        // so the budget for that case is the connect backstop. In a fully idle
+        // process nothing arms anything, which keeps the idle-CPU promise
+        // exactly zero rather than "near zero".
+        const std::uint32_t budget = (0u != config.upload_timeout_ms)
+                                         ? config.upload_timeout_ms
+                                         : static_cast<std::uint32_t>(kConnectBudgetDefaultMs);
+        if (0u == upload_timer) {
+          const std::uint32_t tick_ms = UploadTickMs(budget);
           upload_timer = SetTimer(nullptr, kUploadTimerId, static_cast<UINT>(tick_ms), nullptr);
           if (0u == upload_timer) {
             // A probe that will not arm is the one failure this loop must not
@@ -1053,7 +1165,10 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
         // otherwise look exactly like a dead hotkey, with no state change to
         // announce it. We do not touch the tray state or the tooltip -- the
         // link is healthy -- we only say what went wrong.
-        const wchar_t* detail = NoticeForLocalError(static_cast<Error>(msg.wParam));
+        wchar_t size_balloon[64] = {};
+        const wchar_t* detail =
+            NoticeForLocalError(static_cast<Error>(msg.wParam), config, size_balloon,
+                                sizeof(size_balloon) / sizeof(size_balloon[0]));
         if (detail != nullptr && config.notify_enabled) {
           tray.Notify(L"picopaste", detail, true);
         }
@@ -1063,11 +1178,23 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
         tray.SetState(state, TipFor(state, true));
       } else {
         const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
-        // Announce the transition into a bad state once. Every health post also
-        // sets the tooltip, so repeating the balloon would turn a failure into
-        // noise; notify_enabled switches it off entirely.
-        if (config.notify_enabled && (state != last_state) && (picopaste::win32::TrayState::kHealthy != state)) {
-          tray.Notify(L"picopaste", NoticeFor(state), true);
+        const ConnectionOutcome outcome = OutcomeOf(static_cast<std::uintptr_t>(msg.lParam));
+        // Announce a *failure*, not a colour change. The colour cannot carry
+        // this: Connecting and Reconnecting are both amber, so the old
+        // "different from last_state" test could not see a first connection
+        // fail, and it fired on the normal launch sequence instead (the worker's
+        // first post is Connecting, which differs from the healthy seed). The
+        // worker now names the outcome, so a balloon is driven by what actually
+        // happened. notify_enabled switches it off entirely.
+        if (config.notify_enabled) {
+          if ((ConnectionOutcome::kFailed == outcome) && (state != last_state)) {
+            tray.Notify(L"picopaste", L"channel lost - retrying in the background", true);
+          } else if ((ConnectionOutcome::kRecovered == outcome) &&
+                     (picopaste::win32::TrayState::kHealthy != last_state)) {
+            // Only worth saying when the tray was not already green: a recovery
+            // the user could not see fail needs no announcement.
+            tray.Notify(L"picopaste", L"channel restored", false);
+          }
         }
         last_state = state;
         tray.SetState(state, TipFor(state, false));
@@ -1082,7 +1209,12 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
       // breaks its pipe, so the worker's blocked read returns and Run unwinds
       // into RunOnce's normal failure path (drop, degrade, red tray). The timer
       // stays armed until kUploadEnded so a missed first abort is retried.
-      if (pipeline.UploadOverdue()) {
+      //
+      // Two budgets are covered: an upload's (pipeline) and a handshake's
+      // (worker). The handshake check matters because Client::Init is a blocking
+      // read reached before the pipeline has any generation to expire, so the
+      // pipeline cannot see that stall at all.
+      if (pipeline.UploadOverdue() || worker.ConnectOverdue()) {
         worker.AbortChannel();
       }
       continue;
