@@ -16,7 +16,7 @@ flowchart LR
   CL["剪贴板 DIB<br/>零拷贝读取"]:::win
   IN["SendInput ctrl+shift+v<br/>核对事件数"]:::win
   TR["托盘图标"]:::win
-  PP["picopaste.exe<br/>单进程 · Job Object 256 MB"]:::core
+  PP["picopaste.exe<br/>单进程 · Job Object 64 MB"]:::core
   SS["ssh.exe · ssh -s HOST sftp<br/>长生命周期，随主进程终止"]:::chan
   SF["sshd sftp-server 子系统"]:::rem
   RF["/tmp/picopaste/clip-*.png"]:::rem
@@ -105,7 +105,7 @@ flowchart LR
 4. 托盘变红表示链路已断，或截止探针未能武装。`picopaste.exe --selftest` 对每项能力打印一行
    `PASS`/`FAIL`/`SKIP` 并附具体数字，任一必需能力失败即返回非零。
 5. 大截图的成败取决于 `job_memory_limit_mb`：Windows 会把整张剪贴板图片落地在 picopaste 自己的
-   进程里，默认 256 MB 足以容纳 4K 与 8K 截图。若只有大截图失败，先调高这个上限。
+   进程里，默认 64 MB 足以容纳 4K 截图。若只有大截图失败，先调高这个上限——8K 截图约需 132 MB。
 
 ## 构建
 必须使用 newosp 的 `windows` 分支，因为 `main` 上 `osp/platform.hpp` 会把 `<windows.h>` 定义的

@@ -88,8 +88,10 @@ struct Config {
   // space, so a full-screen 4K screenshot (~33 MB of DIB) cannot be captured at
   // all under the old 32 MB value -- the fetch itself returns NULL. The ceiling
   // is a transient peak, not the footprint: the idle numbers the selftest
-  // reports are unchanged and stay around 12 MB.
-  std::uint32_t job_memory_limit_mb = 256;
+  // reports are unchanged and stay around 12 MB. 64 MB covers one 4K image plus
+  // this process and the ssh child with room to spare; an 8K capture (~132 MB)
+  // is the case that needs this raised by hand.
+  std::uint32_t job_memory_limit_mb = 64;
 
   // Bounded logging: rotate at log_max_bytes, keep log_keep_files generations.
   std::uint32_t log_max_bytes = 8u * 1024u * 1024u;
