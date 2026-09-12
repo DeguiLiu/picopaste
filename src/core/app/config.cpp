@@ -195,7 +195,7 @@ bool SyncFile(std::FILE* file) noexcept {
 Config DefaultConfig() noexcept {
   Config cfg;
   cfg.host.clear();
-  cfg.remote_dir = "~/.cache/picopaste/uploads";
+  cfg.remote_dir = "/tmp/picopaste";
   cfg.hotkey = "alt+shift+v";
   cfg.ssh_command = "ssh";
   cfg.log_level = "info";

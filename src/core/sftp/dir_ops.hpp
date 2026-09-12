@@ -1,6 +1,6 @@
 // picopaste — upload-directory retention policy.
 //
-// The remote has no shell, so bounding ~/.cache/picopaste/uploads is expressed
+// The remote has no shell, so bounding /tmp/picopaste is expressed
 // purely as a decision over a directory listing. The listing itself is produced
 // by sftp::Client::ListDir (the single owner of the wire protocol); this layer
 // keeps only the pure policy and a thin driver that applies it through Client.

@@ -62,8 +62,8 @@ struct Config {
   osp::FixedString<kSshCommandBytes> ssh_command{};
 };
 
-// Defaults for a fresh install. remote_dir defaults to
-// "~/.cache/picopaste/uploads" for continuity with the upstream tool.
+// Defaults for a fresh install. remote_dir defaults to "/tmp/picopaste" so the
+// server's own tmp cleanup reclaims uploads; it stays fully config-overridable.
 Config DefaultConfig() noexcept;
 
 // Parse `path`. A missing file is not an error: defaults are returned and

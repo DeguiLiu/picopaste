@@ -43,7 +43,7 @@ void WriteFile(const std::string& path, const std::string& content) {
 
 TEST_CASE("DefaultConfig matches the documented defaults", "[config]") {
   const picopaste::Config cfg = picopaste::DefaultConfig();
-  CHECK(std::string(cfg.remote_dir.c_str()) == "~/.cache/picopaste/uploads");
+  CHECK(std::string(cfg.remote_dir.c_str()) == "/tmp/picopaste");
   CHECK(std::string(cfg.hotkey.c_str()) == "alt+shift+v");
   CHECK(std::string(cfg.ssh_command.c_str()) == "ssh");
   CHECK(cfg.delay_ms == 150U);
@@ -63,7 +63,7 @@ TEST_CASE("A missing file yields defaults and flags created_defaults", "[config]
   REQUIRE(result.has_value());
   CHECK(created);
   CHECK(result.value().delay_ms == 150U);
-  CHECK(std::string(result.value().remote_dir.c_str()) == "~/.cache/picopaste/uploads");
+  CHECK(std::string(result.value().remote_dir.c_str()) == "/tmp/picopaste");
 }
 
 TEST_CASE("Save then Load round-trips every field", "[config]") {
@@ -173,6 +173,13 @@ TEST_CASE("SaveConfig is atomic and leaves no temp files on success", "[config]"
   CHECK(ReadFile(path).find("original") != std::string::npos);
 }
 
+#if !defined(_WIN32)
+
+// POSIX-only: the failure is forced by clearing write permission on the parent
+// directory. Windows maps std::filesystem::permissions onto the read-only file
+// attribute, which does not gate writes to a directory, so SaveConfig has no
+// reason to fail and the assertions below cannot hold. The invariant itself
+// (a failed save must not clobber the original) stays covered on Linux.
 TEST_CASE("A failed atomic save leaves the original file intact", "[config]") {
   TempDir dir("readonly");
   const std::filesystem::path ro = dir.path / "ro";
@@ -198,6 +205,8 @@ TEST_CASE("A failed atomic save leaves the original file intact", "[config]") {
 
   std::filesystem::permissions(ro, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
 }
+
+#endif  // !_WIN32
 
 TEST_CASE("SaveConfig to a path in a nonexistent directory reports an error", "[config]") {
   TempDir dir("nodir");
