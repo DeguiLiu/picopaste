@@ -1,16 +1,18 @@
 // picopaste — fixed-allocation memory budget gate (design §5).
 //
-// The design promises a steady state ≤ 12 MB (hard Job Object cap 32 MB) and
-// backs it with a discipline of fixed-capacity buffers and zero hot-path
-// allocation. A full end-to-end memory figure cannot be reproduced honestly on
-// Linux: the working set depends on the Windows CRT, the WIC/COM stack and the
-// ssh child process, none of which exist here. What CAN be checked honestly is
-// the part the project controls at compile time — the sizes of the fixed
-// buffers whose growth is exactly what would blow the budget.
+// The design promises a steady state ≤ 12 MB and a hard Job Object cap that must
+// also cover the one full clipboard image Windows materialises inside this
+// process (256 MB by default); it backs that with a discipline of
+// fixed-capacity buffers and zero hot-path allocation. A full end-to-end memory
+// figure cannot be reproduced honestly on Linux: the working set depends on the
+// Windows CRT, the WIC/COM stack and the ssh child process, none of which exist
+// here. What CAN be checked honestly is the part the project controls at
+// compile time — the sizes of the fixed buffers whose growth is exactly what
+// would blow the budget.
 //
 // This is deliberately narrow. It catches an accidental large static or a
 // scratch buffer that doubles; it does not claim to measure runtime memory.
-// The real 12 MB / 32 MB numbers come from the Windows `selftest` and the Job
+// The real 12 MB / 256 MB numbers come from the Windows `selftest` and the Job
 // Object, per design §5 and §10.
 
 #include <catch2/catch_test_macros.hpp>

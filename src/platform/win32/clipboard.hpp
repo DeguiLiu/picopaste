@@ -79,16 +79,31 @@ struct CapturedImage {
   osp::FixedString<16> source{};
 };
 
-// Which image-bearing clipboard formats are present right now. Used by the
-// selftest report so "no image" is a visible, specific answer.
+// Which image-bearing clipboard formats are really on the clipboard right now.
+// `has_bitmap` is CF_BITMAP, which carries no DIB block and can only be read
+// through a conversion Windows performs on request.
+//
+// A format is listed only when the owner actually published that block.
+// Formats Windows could *synthesize* from another one are deliberately absent:
+// answering GetClipboardData for one materialises a full second copy of the
+// image inside this process (a 27 MB CF_DIB makes CF_DIBV5 look available and
+// then costs another 27 MB to hand over), and the job object's commit ceiling
+// refuses exactly that allocation for a large screenshot.
 struct ClipboardFormats {
   bool has_png = false;
   bool has_dibv5 = false;
   bool has_dib = false;
+  bool has_bitmap = false;
   bool has_any_image = false;
 };
 
-/** @brief Pure format probe. Does not read pixels and does not create a temp file. */
+/**
+ * @brief Format probe. Does not read pixels and does not create a temp file.
+ *
+ * Enumerates the clipboard, so the clipboard must be open on this thread when
+ * it is called (CaptureClipboardImage opens it first; the selftest opens it
+ * around this call).
+ */
 ClipboardFormats InspectClipboardFormats() noexcept;
 
 /**
@@ -96,8 +111,9 @@ ClipboardFormats InspectClipboardFormats() noexcept;
  *
  * The clipboard is closed before return.
  * @return kNoImageInClipboard when the clipboard holds no image; kImageTooLarge
- * when the encoded image would exceed cfg.max_image_bytes; kPngEncodeFailed /
- * kTempFileFailed / kClipboardOpenFailed on hard failures.
+ * when the encoded image would exceed cfg.max_image_bytes; kClipboardReadFailed
+ * when an image format is listed but its block cannot be fetched;
+ * kPngEncodeFailed / kTempFileFailed / kClipboardOpenFailed on hard failures.
  */
 Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept;
 

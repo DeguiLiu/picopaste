@@ -275,7 +275,7 @@ Config DefaultConfig() noexcept {
   cfg.log_max_bytes = 8u * 1024u * 1024u;
   cfg.log_keep_files = 2;
   cfg.max_image_bytes = 20u * 1024u * 1024u;
-  cfg.job_memory_limit_mb = 32;
+  cfg.job_memory_limit_mb = 256;
   cfg.restore_clipboard = true;
   cfg.notify_enabled = true;
   return cfg;

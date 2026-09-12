@@ -80,9 +80,16 @@ struct Config {
   // Refuse images larger than this instead of holding them.
   std::uint32_t max_image_bytes = 20u * 1024u * 1024u;
 
-  // Hard commit ceiling enforced by a Job Object on this process. Sized after
-  // measuring the real baseline; see selftest.
-  std::uint32_t job_memory_limit_mb = 32;
+  // Hard commit ceiling enforced by a Job Object on this process.
+  //
+  // It must cover one clipboard image on top of the idle baseline, because
+  // Windows materialises the clipboard block *inside the reading process*:
+  // GetClipboardData hands back a handle whose storage lives in our address
+  // space, so a full-screen 4K screenshot (~33 MB of DIB) cannot be captured at
+  // all under the old 32 MB value -- the fetch itself returns NULL. The ceiling
+  // is a transient peak, not the footprint: the idle numbers the selftest
+  // reports are unchanged and stay around 12 MB.
+  std::uint32_t job_memory_limit_mb = 256;
 
   // Bounded logging: rotate at log_max_bytes, keep log_keep_files generations.
   std::uint32_t log_max_bytes = 8u * 1024u * 1024u;

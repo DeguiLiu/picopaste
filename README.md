@@ -17,7 +17,7 @@ flowchart LR
   CL["Clipboard DIB<br/>zero-copy read"]:::win
   IN["SendInput ctrl+shift+v<br/>count verified"]:::win
   TR["Tray icon"]:::win
-  PP["picopaste.exe<br/>single process · Job Object 32 MB"]:::core
+  PP["picopaste.exe<br/>single process · Job Object 256 MB"]:::core
   SS["ssh.exe · ssh -s HOST sftp<br/>long-lived, dies with the parent"]:::chan
   SF["sshd sftp-server subsystem"]:::rem
   RF["/tmp/picopaste/clip-*.png"]:::rem
@@ -107,6 +107,9 @@ and is testable with fake tables.
 4. A red tray means the link is down, or the deadline probe could not arm. `picopaste.exe --selftest`
    prints one `PASS`/`FAIL`/`SKIP` line per capability with a concrete number, and exits non-zero if
    any mandatory one failed.
+5. A large screenshot needs room in `job_memory_limit_mb`: Windows materialises the clipboard image
+   inside picopaste's own process, so the default 256 MB covers 4K and 8K captures. If only big
+   screenshots fail, that ceiling is the first thing to raise.
 
 ## Build
 newosp's `windows` branch is required: on `main`, `osp/platform.hpp` mistakes the `RT_VERSION` macro

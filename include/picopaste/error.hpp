@@ -44,6 +44,7 @@ enum class Error : std::uint8_t {
   kNoImageInClipboard,
   kClipboardOpenFailed,
   kClipboardLockFailed,
+  kClipboardReadFailed,  // a format listed by the clipboard refused to hand over its bytes
   kImageTooLarge,
   kPngEncodeFailed,
   kTempFileFailed,

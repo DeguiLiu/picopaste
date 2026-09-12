@@ -76,6 +76,11 @@ constexpr std::uint32_t kBitmapV4HeaderSize = 108u;
 constexpr std::uint32_t kBiRgb = 0u;
 constexpr std::uint32_t kBiBitfields = 3u;
 
+// A clipboard fetch is retried over this bounded window. Both values stay small
+// because the clipboard is held open for the whole retry.
+constexpr std::int32_t kFetchAttempts = 10;
+constexpr DWORD kFetchRetryMs = 10;
+
 std::uint16_t ReadU16(const std::uint8_t* p) noexcept {
   std::uint16_t v = 0;
   std::memcpy(&v, p, sizeof(v));
@@ -644,6 +649,22 @@ void FillCaptured(CapturedImage* image, const wchar_t* wide_path, std::uint64_t 
   image->source.assign(osp::TruncateToCapacity, source);
 }
 
+// Fetch one clipboard block by format. GetClipboardData can answer NULL while
+// the owner is still handing the block over, so it is retried briefly. Only
+// formats the clipboard really carries are ever passed in, so this can never
+// pull in a synthesized block (see InspectClipboardFormats for why that
+// matters).
+HANDLE FetchClipboardBlock(UINT format) noexcept {
+  for (std::int32_t attempt = 0; attempt < kFetchAttempts; ++attempt) {
+    const HANDLE data = GetClipboardData(format);
+    if (nullptr != data) {
+      return data;
+    }
+    Sleep(kFetchRetryMs);
+  }
+  return nullptr;
+}
+
 // Fast path: a registered "PNG" format carries ready-to-upload bytes, so the
 // block is copied to the temp file without re-encoding.
 Result<CapturedImage> CaptureRegisteredPng(HANDLE data, const Config& cfg, const wchar_t* temp_path) noexcept {
@@ -665,28 +686,65 @@ Result<CapturedImage> CaptureRegisteredPng(HANDLE data, const Config& cfg, const
   return Result<CapturedImage>::success(image);
 }
 
-// Fallback: unpack and encode the DIB. The DIB is read in place -- no heap copy
-// of the uncompressed pixels.
-Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path, bool has_dibv5) noexcept {
-  const UINT dib_format = has_dibv5 ? CF_DIBV5 : CF_DIB;
-  HANDLE data = GetClipboardData(dib_format);
+// Snapshot one DIB block the clipboard really carries. The pixels are read in
+// place -- the encoder points straight at the locked HGLOBAL, so no copy of the
+// image is made here. `label` names the block for the report.
+Result<CapturedImage> CaptureOneDib(const Config& cfg, const wchar_t* temp_path, UINT format,
+                                    const char* label) noexcept {
+  const HANDLE data = FetchClipboardBlock(format);
   if (nullptr == data) {
-    return Result<CapturedImage>::error(Error::kNoImageInClipboard);
+    return Result<CapturedImage>::error(Error::kClipboardReadFailed);
   }
   const SIZE_T size = GlobalSize(data);
-  if (size == 0) {
+  const void* locked = (size == 0) ? nullptr : GlobalLock(data);
+  if (nullptr == locked) {
     return Result<CapturedImage>::error(Error::kClipboardLockFailed);
   }
-  const std::uint8_t* locked = static_cast<const std::uint8_t*>(GlobalLock(data));
-  if (locked == nullptr) {
-    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
-  }
-  Result<CapturedImage> encoded = EncodeDibToPngFile(locked, size, temp_path, cfg.max_image_bytes);
+  Result<CapturedImage> encoded =
+      EncodeDibToPngFile(static_cast<const std::uint8_t*>(locked), static_cast<std::size_t>(size), temp_path,
+                         cfg.max_image_bytes);
   GlobalUnlock(data);
   if (encoded.has_value()) {
-    encoded.value().source.assign(osp::TruncateToCapacity, has_dibv5 ? "DIBV5" : "DIB");
+    encoded.value().source.assign(osp::TruncateToCapacity, label);
   }
   return encoded;
+}
+
+// Fallback: unpack and encode a DIB. The clipboard can carry both flavours at
+// once, and a block that is listed can still refuse to hand over its bytes (the
+// owner may die between the listing and the fetch), so every candidate is tried
+// before a failure is reported: an unreadable CF_DIBV5 next to a perfectly good
+// CF_DIB must not surface as "no image".
+Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path,
+                                         const ClipboardFormats& formats) noexcept {
+  Error failure = Error::kNoImageInClipboard;
+  if (formats.has_dibv5) {
+    Result<CapturedImage> v5 = CaptureOneDib(cfg, temp_path, CF_DIBV5, "DIBV5");
+    if (v5.has_value()) {
+      return v5;
+    }
+    failure = v5.get_error();
+  }
+  if (formats.has_dib) {
+    Result<CapturedImage> dib = CaptureOneDib(cfg, temp_path, CF_DIB, "DIB");
+    if (dib.has_value()) {
+      return dib;
+    }
+    failure = dib.get_error();
+  }
+  if (formats.has_bitmap) {
+    // Last resort for a clipboard that publishes only CF_BITMAP: it carries no
+    // DIB block, so Windows has to build one on request. That build is a full
+    // copy of the pixels inside this process -- exactly what the commit ceiling
+    // refuses for a large screenshot -- but without it such a clipboard is
+    // unreadable, so it is tried once nothing better exists.
+    Result<CapturedImage> built = CaptureOneDib(cfg, temp_path, CF_DIB, "BITMAP");
+    if (built.has_value()) {
+      return built;
+    }
+    failure = built.get_error();
+  }
+  return Result<CapturedImage>::error(failure);
 }
 
 }  // namespace
@@ -698,10 +756,20 @@ Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_
 ClipboardFormats InspectClipboardFormats() noexcept {
   ClipboardFormats formats{};
   const UINT png_format = RegisterClipboardFormatW(L"PNG");
-  formats.has_png = (png_format != 0u) && (IsClipboardFormatAvailable(png_format) != 0);
-  formats.has_dibv5 = IsClipboardFormatAvailable(CF_DIBV5) != 0;
-  formats.has_dib = IsClipboardFormatAvailable(CF_DIB) != 0;
-  formats.has_any_image = formats.has_png || formats.has_dibv5 || formats.has_dib;
+  // EnumClipboardFormats lists the blocks the owner really published, which is
+  // the question the capture path must ask. IsClipboardFormatAvailable answers a
+  // different one -- "could you get this format?" -- and counts formats Windows
+  // would have to synthesize; asking for one of those costs a full extra copy of
+  // the image inside this process, which is what a large screenshot could not
+  // afford under the commit ceiling.
+  UINT format = 0;
+  while ((format = EnumClipboardFormats(format)) != 0u) {
+    formats.has_png = formats.has_png || (format == png_format);
+    formats.has_dibv5 = formats.has_dibv5 || (format == CF_DIBV5);
+    formats.has_dib = formats.has_dib || (format == CF_DIB);
+    formats.has_bitmap = formats.has_bitmap || (format == CF_BITMAP);
+  }
+  formats.has_any_image = formats.has_png || formats.has_dibv5 || formats.has_dib || formats.has_bitmap;
   return formats;
 }
 
@@ -765,8 +833,8 @@ Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept {
 
   // Fast path: a registered "PNG" format carries ready-to-upload bytes.
   if (formats.has_png) {
-    HANDLE png_data = GetClipboardData(RegisterClipboardFormatW(L"PNG"));
-    if (png_data != nullptr) {
+    const HANDLE png_data = FetchClipboardBlock(RegisterClipboardFormatW(L"PNG"));
+    if (nullptr != png_data) {
       Result<CapturedImage> png = CaptureRegisteredPng(png_data, cfg, temp_path);
       if (png.has_value()) {
         temp_guard.Keep();
@@ -777,7 +845,7 @@ Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept {
 
   // Fallback: unpack and encode the DIB. The DIB is read in place -- no heap
   // copy of the uncompressed pixels.
-  Result<CapturedImage> encoded = CaptureDibFallback(cfg, temp_path, formats.has_dibv5);
+  Result<CapturedImage> encoded = CaptureDibFallback(cfg, temp_path, formats);
   if (encoded.has_value()) {
     temp_guard.Keep();
   }

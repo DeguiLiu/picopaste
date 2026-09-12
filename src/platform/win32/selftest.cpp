@@ -116,10 +116,19 @@ bool QueryMemory(std::uint64_t* working_set, std::uint64_t* private_bytes) noexc
 
 // --- 1. clipboard formats ---------------------------------------------------
 void CheckClipboard() noexcept {
-  const ClipboardFormats formats = InspectClipboardFormats();
   char detail[256] = {};
-  (void)std::snprintf(detail, sizeof(detail), "PNG=%d DIBV5=%d DIB=%d any=%d", formats.has_png ? 1 : 0,
-                      formats.has_dibv5 ? 1 : 0, formats.has_dib ? 1 : 0, formats.has_any_image ? 1 : 0);
+  // The probe enumerates the clipboard, which requires it to be open; the
+  // capture path holds it open the same way. Opening it here also tells the user
+  // the difference between "no image" and "somebody else is copying".
+  if (OpenClipboard(nullptr) == 0) {
+    Report("clipboard-formats", true, "clipboard is held by another process");
+    return;
+  }
+  const ClipboardFormats formats = InspectClipboardFormats();
+  (void)CloseClipboard();
+  (void)std::snprintf(detail, sizeof(detail), "PNG=%d DIBV5=%d DIB=%d BMP=%d any=%d", formats.has_png ? 1 : 0,
+                      formats.has_dibv5 ? 1 : 0, formats.has_dib ? 1 : 0, formats.has_bitmap ? 1 : 0,
+                      formats.has_any_image ? 1 : 0);
   Report("clipboard-formats", true, detail);
 }
 
@@ -250,7 +259,7 @@ void CheckSingleInstance() noexcept {
 
 // --- 6. Job Object limits ---------------------------------------------------
 void CheckJobObjects(const Config* config) noexcept {
-  const std::uint32_t limit_mb = (config != nullptr) ? config->job_memory_limit_mb : 32u;
+  const std::uint32_t limit_mb = (config != nullptr) ? config->job_memory_limit_mb : 256u;
 
   // Memory job: assign this process and read the enforced number back. No
   // KILL_ON_JOB_CLOSE here, so closing the handle at the end cannot kill us.

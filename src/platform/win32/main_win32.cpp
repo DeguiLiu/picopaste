@@ -616,6 +616,7 @@ class UploadWorker final {
       case Error::kNoImageInClipboard:
       case Error::kClipboardOpenFailed:
       case Error::kClipboardLockFailed:
+      case Error::kClipboardReadFailed:
       case Error::kImageTooLarge:
       case Error::kPngEncodeFailed:
       case Error::kTempFileFailed:
@@ -869,6 +870,7 @@ const wchar_t* NoticeForLocalError(Error err) noexcept {
     case Error::kPngEncodeFailed:    return L"image encode failed";
     case Error::kClipboardOpenFailed:return L"another program is holding the clipboard";
     case Error::kClipboardLockFailed:return L"clipboard lock failed";
+    case Error::kClipboardReadFailed:return L"could not read the image from the clipboard";
     case Error::kTempFileFailed:     return L"could not create temp file";
     default:                         return nullptr;
   }

@@ -51,7 +51,7 @@ TEST_CASE("DefaultConfig matches the documented defaults", "[config]") {
   CHECK(cfg.log_max_bytes == 8U * 1024U * 1024U);
   CHECK(cfg.log_keep_files == 2U);
   CHECK(cfg.max_image_bytes == 20U * 1024U * 1024U);
-  CHECK(cfg.job_memory_limit_mb == 32U);
+  CHECK(cfg.job_memory_limit_mb == 256U);
   CHECK(cfg.restore_clipboard);
   CHECK(cfg.notify_enabled);
   CHECK(cfg.host.empty());
