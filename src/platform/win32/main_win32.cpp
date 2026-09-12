@@ -865,14 +865,22 @@ const wchar_t* NoticeFor(picopaste::win32::TrayState state) noexcept {
 // hits nothing for some unforeseen reason should not invent a story.
 const wchar_t* NoticeForLocalError(Error err) noexcept {
   switch (err) {
-    case Error::kNoImageInClipboard: return L"clipboard has no image";
-    case Error::kImageTooLarge:      return L"image too large (max 20 MB)";
-    case Error::kPngEncodeFailed:    return L"image encode failed";
-    case Error::kClipboardOpenFailed:return L"another program is holding the clipboard";
-    case Error::kClipboardLockFailed:return L"clipboard lock failed";
-    case Error::kClipboardReadFailed:return L"could not read the image from the clipboard";
-    case Error::kTempFileFailed:     return L"could not create temp file";
-    default:                         return nullptr;
+    case Error::kNoImageInClipboard:
+      return L"clipboard has no image";
+    case Error::kImageTooLarge:
+      return L"image too large (max 20 MB)";
+    case Error::kPngEncodeFailed:
+      return L"image encode failed";
+    case Error::kClipboardOpenFailed:
+      return L"another program is holding the clipboard";
+    case Error::kClipboardLockFailed:
+      return L"clipboard lock failed";
+    case Error::kClipboardReadFailed:
+      return L"could not read the image from the clipboard";
+    case Error::kTempFileFailed:
+      return L"could not create temp file";
+    default:
+      return nullptr;
   }
 }
 

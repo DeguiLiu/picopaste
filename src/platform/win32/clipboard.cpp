@@ -700,9 +700,8 @@ Result<CapturedImage> CaptureOneDib(const Config& cfg, const wchar_t* temp_path,
   if (nullptr == locked) {
     return Result<CapturedImage>::error(Error::kClipboardLockFailed);
   }
-  Result<CapturedImage> encoded =
-      EncodeDibToPngFile(static_cast<const std::uint8_t*>(locked), static_cast<std::size_t>(size), temp_path,
-                         cfg.max_image_bytes);
+  Result<CapturedImage> encoded = EncodeDibToPngFile(static_cast<const std::uint8_t*>(locked),
+                                                     static_cast<std::size_t>(size), temp_path, cfg.max_image_bytes);
   GlobalUnlock(data);
   if (encoded.has_value()) {
     encoded.value().source.assign(osp::TruncateToCapacity, label);
