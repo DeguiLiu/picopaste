@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(picopaste LANGUAGES CXX VERSION 0.2.4)
+project(picopaste LANGUAGES CXX VERSION 0.2.5)
 
 # The executable carries its own icons — the tray's three states and, through the
 # lowest-numbered ICON resource, the .exe icon itself. `LANGUAGES CXX` alone
