@@ -503,11 +503,21 @@ class UploadWorker final {
     return Status::success();
   }
 
+  // Latch the stop and wake the loop without joining. The exit path calls this
+  // BEFORE it terminates the ssh child, and the order is what makes the pair
+  // safe. The worker publishes the child's handle immediately before it blocks
+  // in a read; an abort that arrives before that store finds nothing to kill.
+  // But it can only have arrived before the latch if the store came first, in
+  // which case the abort does find the handle. One of the two always lands.
+  void RequestStop() noexcept {
+    quit_.store(true, std::memory_order_release);
+    Wake();
+  }
+
   // Idempotent. Signals the worker, joins it, then finishes the lifecycle.
   void Stop() noexcept {
     if (thread_.joinable()) {
-      quit_.store(true, std::memory_order_release);
-      Wake();
+      RequestStop();
       thread_.join();
     }
     DropChannel();
@@ -675,6 +685,14 @@ class UploadWorker final {
       return false;
     }
     abort_process_.store(channel_.process_handle(), std::memory_order_release);
+    // A stop latched while this spawn was in flight could not have been seen by
+    // the exit path's AbortChannel: that ran before the handle above existed, so
+    // its load found nothing to terminate. Re-check the latch here instead of
+    // blocking in Init, where Stop's join would have nothing to wake it.
+    if (quit_.load(std::memory_order_acquire)) {
+      DropChannel();
+      return false;
+    }
     client_.Create(channel_.stream());
     const Status inited = client_.Get()->Init();
     if (inited.has_value() == false) {
@@ -928,6 +946,9 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
 
   std::int32_t exit_code = kExitOk;
   bool loop_error = false;
+  // Set when this loop released the chord for a tray Restart; see the re-install
+  // below the dispatch.
+  bool chord_released = false;
   for (;;) {
     MSG msg{};
     const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
@@ -1017,17 +1038,48 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
       // starts; on the hook path this also stops the old callback from
       // swallowing the replacement's keystrokes.
       hotkey.Uninstall();
+      chord_released = true;
     }
     (void)TranslateMessage(&msg);
     (void)DispatchMessageW(&msg);
+    if (chord_released) {
+      // A Restart that failed leaves this process running -- tray.cpp reports it
+      // and does not quit -- so the chord released above has to come back, or
+      // the hotkey is dead for the rest of this process's life while the app
+      // still looks alive. A pending WM_QUIT is how the tray says it did decide
+      // to leave (Quit, a successful Restart, or WM_CLOSE), and then the chord
+      // stays released for the replacement.
+      MSG pending{};
+      const bool leaving = (PeekMessageW(&pending, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE) != 0);
+      chord_released = false;
+      if (!leaving) {
+        // One attempt, not a retry loop: nobody else can have taken the chord
+        // yet, so a failure here means the registration is gone for good and
+        // repeating it on every queued message would only spin.
+        const Status reinstalled = hotkey.Install(nullptr, kHotkeyId, binding.value());
+        if (!reinstalled) {
+          // Say so. A hotkey that is silently gone is the very failure this
+          // branch exists to prevent, so it must not end in a discarded result.
+          tray.SetState(picopaste::win32::TrayState::kError, L"picopaste: hotkey lost after a failed restart");
+          if (config.notify_enabled) {
+            tray.Notify(L"picopaste", L"hotkey could not be re-registered", true);
+          }
+        }
+      }
+    }
   }
 
-  // Leaving the loop: the worker may be blocked inside Run on a silent peer, in
-  // which case Stop's join would wait forever. Use the same abort lever to break
-  // the channel, then disarm the probe so no wake-up outlives this queue.
-  if (worker.InFlight()) {
-    worker.AbortChannel();
-  }
+  // Leaving the loop: the worker may be blocked on a live ssh child, in which
+  // case Stop's join would wait forever. Latch the stop first and only then
+  // terminate the child -- see RequestStop for why that order is the one that
+  // leaves no window, and SpawnChannel for the matching re-check. The worker
+  // also blocks in the SFTP handshake: SpawnChannel calls Client::Init, a
+  // synchronous read, before RunOnce reaches the pipeline, so during that window
+  // in_flight() is still false and an InFlight() guard would skip the one case
+  // where the join has nothing to wake. Disarm the probe last so no wake-up
+  // outlives this queue.
+  worker.RequestStop();
+  worker.AbortChannel();
   disarm_timer();
   worker.Stop();
   hotkey.Uninstall();

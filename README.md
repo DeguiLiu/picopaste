@@ -110,10 +110,15 @@ and is testable with fake tables.
 
 ## Build
 newosp's `windows` branch is required: on `main`, `osp/platform.hpp` mistakes the `RT_VERSION` macro
-from `<windows.h>` for an RT-Thread marker and includes a non-existent `<rtthread.h>`.
+from `<windows.h>` for an RT-Thread marker and includes a non-existent `<rtthread.h>`. Pin that branch
+to the same commit CI uses — `git clone --branch` accepts only a branch or tag name, so a SHA needs
+init + fetch + a detached checkout, and a moving ref could be force-pushed out from under the build.
 
 ```sh
-git clone --branch windows https://github.com/DeguiLiu/newosp.git ~/newosp-windows
+git init ~/newosp-windows
+git -C ~/newosp-windows remote add origin https://github.com/DeguiLiu/newosp.git
+git -C ~/newosp-windows fetch --depth 1 origin 67c0a23b74d15f8ac33439072dea722631c530f5
+git -C ~/newosp-windows checkout --detach FETCH_HEAD
 cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON \
   -DPICOPASTE_NEWOSP_DIR=$HOME/newosp-windows
 cmake --build build -j"$(nproc)" && ctest --test-dir build --output-on-failure

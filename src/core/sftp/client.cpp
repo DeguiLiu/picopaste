@@ -738,10 +738,16 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
 
   /* WRITE chunks, streaming from the local fd directly into the frame. */
   std::uint64_t offset = 0u;
-  if (Error::kOk == err) {
+  const bool opened = (0u != handle_len);
+  if ((Error::kOk == err) && opened) {
     err = StreamWrites(stream_, tx_, sizeof(tx_), rx_, sizeof(rx_), next_id_, fd, handle, handle_len, offset);
   }
-  if ((Error::kOk == err) && !CloseHandle(handle, handle_len)) {
+  /* The remote handle is closed even when a WRITE failed. Gating the CLOSE on
+     err left the handle open on the server for the rest of the session -- one
+     per rejected upload -- and CLOSE is exactly the request that releases it. A
+     close that itself fails only becomes the reported error when nothing worse
+     already happened; the failed WRITE is the actionable one. */
+  if (opened && !CloseHandle(handle, handle_len) && (Error::kOk == err)) {
     err = Error::kCloseFailed;
   }
   if (Error::kOk == err) {

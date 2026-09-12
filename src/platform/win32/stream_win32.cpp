@@ -86,9 +86,19 @@ bool CreateChildChannel(SECURITY_ATTRIBUTES* security, HANDLE* stdin_read, HANDL
   }
   // ssh writes first-connection warnings and errors to stderr. Those must not
   // reach the SFTP stdout pipe or they would corrupt the framing, so stderr
-  // goes to the NUL device; a missing NUL falls back to the stdout pipe.
+  // goes to the NUL device. There is no second-best handle: pointing stderr at
+  // the stdout pipe would put ssh's warnings inside a frame and desynchronise
+  // the protocol, which is silent and looks like a remote fault. A NUL that
+  // cannot be opened therefore fails the spawn instead.
   *nul_device =
       CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, security, OPEN_EXISTING, 0, nullptr);
+  if (*nul_device == INVALID_HANDLE_VALUE) {
+    CloseIfValid(stdin_read);
+    CloseIfValid(stdin_write);
+    CloseIfValid(stdout_read);
+    CloseIfValid(stdout_write);
+    return false;
+  }
   return true;
 }
 
@@ -130,12 +140,8 @@ Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
   (void)InitializeProcThreadAttributeList(nullptr, 1, 0, &required);
   if (required != 0 && required <= sizeof(attribute_buffer)) {
     if (InitializeProcThreadAttributeList(attribute_list, 1, 0, &required) != 0) {
-      HANDLE inherit[3] = {stdin_read, stdout_write, nullptr};
-      DWORD inherit_count = 2;
-      if (nul_device != INVALID_HANDLE_VALUE) {
-        inherit[2] = nul_device;
-        inherit_count = 3;
-      }
+      HANDLE inherit[3] = {stdin_read, stdout_write, nul_device};
+      const DWORD inherit_count = 3;
       if (UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
                                     sizeof(HANDLE) * inherit_count, nullptr, nullptr) != 0) {
         have_attribute_list = TRUE;
@@ -148,7 +154,7 @@ Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = stdin_read;
   startup.StartupInfo.hStdOutput = stdout_write;
-  startup.StartupInfo.hStdError = (nul_device != INVALID_HANDLE_VALUE) ? nul_device : stdout_write;
+  startup.StartupInfo.hStdError = nul_device;
   DWORD creation_flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
   if (have_attribute_list != FALSE) {
     startup.StartupInfo.cb = sizeof(STARTUPINFOEXW);

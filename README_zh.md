@@ -106,10 +106,15 @@ flowchart LR
 
 ## 构建
 必须使用 newosp 的 `windows` 分支，因为 `main` 上 `osp/platform.hpp` 会把 `<windows.h>` 定义的
-`RT_VERSION` 误判为 RT-Thread 标记，进而包含一个不存在的头文件。
+`RT_VERSION` 误判为 RT-Thread 标记，进而包含一个不存在的头文件。该分支与 CI 一样钉在同一个提交上：
+`git clone --branch` 只接受分支名或标签名，钉提交得走 init + fetch + 分离检出；而分支是会移动的
+引用，一次 force-push 就能在本仓库毫无改动的情况下弄坏构建。
 
 ```sh
-git clone --branch windows https://github.com/DeguiLiu/newosp.git ~/newosp-windows
+git init ~/newosp-windows
+git -C ~/newosp-windows remote add origin https://github.com/DeguiLiu/newosp.git
+git -C ~/newosp-windows fetch --depth 1 origin 67c0a23b74d15f8ac33439072dea722631c530f5
+git -C ~/newosp-windows checkout --detach FETCH_HEAD
 cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON \
   -DPICOPASTE_NEWOSP_DIR=$HOME/newosp-windows
 cmake --build build -j"$(nproc)" && ctest --test-dir build --output-on-failure

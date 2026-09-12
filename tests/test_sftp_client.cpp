@@ -105,6 +105,27 @@ void AppendVersionOk(FakePipe& p) {
   AppendFrame(p, Pkt::kVersion, v);
 }
 
+// Walks the recorded outbound frames looking for one of `type`. The 4-byte
+// big-endian prefix counts the type byte too. A zero or out-of-range length means
+// the recording is malformed, so the walk stops rather than looping or reading
+// past the end.
+bool ContainsFrame(const std::vector<std::uint8_t>& out, Pkt type) {
+  std::size_t pos = 0u;
+  bool found = false;
+  while (!found && ((pos + 5u) <= out.size())) {
+    const std::uint32_t frame_len = (static_cast<std::uint32_t>(out[pos]) << 24u) |
+                                    (static_cast<std::uint32_t>(out[pos + 1u]) << 16u) |
+                                    (static_cast<std::uint32_t>(out[pos + 2u]) << 8u) |
+                                    static_cast<std::uint32_t>(out[pos + 3u]);
+    if ((frame_len < 1u) || ((pos + 4u + frame_len) > out.size())) {
+      return false;
+    }
+    found = (out[pos + 4u] == static_cast<std::uint8_t>(type));
+    pos += 4u + frame_len;
+  }
+  return found;
+}
+
 // ---------------------------------------------------------------------------
 // Integration plumbing
 // ---------------------------------------------------------------------------
@@ -353,6 +374,34 @@ TEST_CASE("Remove treats NO_SUCH_FILE as success but rejects other errors", "[sf
     REQUIRE_FALSE(s);
     CHECK(s.get_error() == Error::kRemoveFailed);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Upload: a failed WRITE must still release the remote handle
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a WRITE the server rejects is still followed by CLOSE", "[sftp][client]") {
+  FakePipe p;
+  AppendVersionOk(p);
+  std::vector<std::uint8_t> handle;
+  PushU32(handle, 1u); /* OPEN id */
+  PushString(handle, "h");
+  AppendFrame(p, Pkt::kHandle, handle);                                /* OPEN (id 1) */
+  AppendFrame(p, Pkt::kStatus, StatusPayload(2u, FxStatus::kFailure)); /* WRITE (id 2) rejected */
+  AppendFrame(p, Pkt::kStatus, StatusPayload(3u, FxStatus::kOk));      /* CLOSE (id 3) acked */
+
+  const std::uint8_t bytes[3] = {0x11u, 0x22u, 0x33u};
+  const test::TempFile local = test::TempFile::Create(bytes, sizeof(bytes));
+  REQUIRE(local.valid());
+
+  Client c(MakeFake(p));
+  REQUIRE(c.Init());
+  const Status up = c.UploadFile("/remote/out.bin", local.path());
+  REQUIRE_FALSE(up);
+  CHECK(up.get_error() == Error::kWriteFailed);
+  /* The handle the server already handed out must be released even though the
+     WRITE failed; otherwise it leaks for the rest of the session. */
+  CHECK(ContainsFrame(p.out, Pkt::kClose));
 }
 
 // ---------------------------------------------------------------------------
