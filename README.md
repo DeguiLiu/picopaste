@@ -29,7 +29,7 @@ flowchart LR
   subgraph REM["远端主机 · 零自定义服务端代码"]
     direction TB
     SF["sshd sftp-server 子系统"]
-    UP["~/.cache/picopaste/uploads/<br/>clip-YYYYMMDD-HHMMSS-hex.png"]
+    UP["/tmp/picopaste/<br/>clip-YYYYMMDD-HHMMSS-hex.png"]
     JS["~/.claude/settings.json<br/>改写前先备份并回读校验"]
   end
 
