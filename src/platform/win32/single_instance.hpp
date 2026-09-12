@@ -80,8 +80,12 @@ inline constexpr wchar_t kSingleInstanceOwnerName[] = L"Local\\picopaste.owner";
 inline constexpr wchar_t kAwaitInstanceEnvName[] = L"PICOPASTE_AWAIT_INSTANCE";
 
 // Ceiling on that wait, so a predecessor that never exits cannot hang the new
-// process's start-up for ever.
-inline constexpr std::uint32_t kAwaitInstanceMaxMs = 10000;
+// process's start-up for ever. Kept short because this wait runs on the main
+// thread before the tray exists: the predecessor is a process that was asked to
+// quit and has already been given its own bounded teardown, so a second or two
+// covers every normal handover, and anything longer is a stalled predecessor the
+// user is better off seeing reported than waiting out.
+inline constexpr std::uint32_t kAwaitInstanceMaxMs = 2000;
 
 // Owns the named mutex, the owner-info section, and the two job objects for the
 // process lifetime. Move-only-free: create one at start-up and keep it.

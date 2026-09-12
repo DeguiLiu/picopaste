@@ -47,8 +47,11 @@ constexpr wchar_t kWindowClass[] = L"picopaste-tray";
 // How long a relaunched instance is given to prove it got past its own start-up.
 // The child cannot take the single-instance mutex while this process still
 // holds it, so a healthy child is still running when the probe expires; a child
-// that has already exited by then refused to start.
-constexpr DWORD kRelaunchProbeMs = 1000;
+// that has already exited by then refused to start. The probe blocks the main
+// thread (it runs inside the WM_COMMAND handler), so it stays short: a child
+// that failed to start does so within milliseconds, and one that is merely slow
+// is indistinguishable from healthy at any length worth waiting.
+constexpr DWORD kRelaunchProbeMs = 300;
 
 // Three colour-coded icons: blue for healthy, amber for warning, red for error.
 // They are this executable's own resources (see picopaste.rc.in; the ids live in

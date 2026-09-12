@@ -222,7 +222,11 @@ void ChildStream::Close() noexcept {
     if (GetExitCodeProcess(process_, &exit_code) != 0 && exit_code == kStillActive) {
       (void)TerminateProcess(process_, 1);
     }
-    (void)WaitForSingleObject(process_, 2000);
+    // A short reap, not a two-second one. The process has just been terminated,
+    // so the wait normally returns immediately; when it does not, the handle is
+    // still safe to close and the containment job is what guarantees the child
+    // dies with us. Waiting longer only delays a quit the user is watching.
+    (void)WaitForSingleObject(process_, 200);
     CloseHandle(process_);
     process_ = nullptr;
   }
