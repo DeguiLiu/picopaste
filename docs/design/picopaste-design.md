@@ -147,11 +147,18 @@ sequenceDiagram
 而是**分配直接失败并报错**——这正是"内存必须有硬上限"想要的行为。上限要覆盖 ssh.exe 子进程，
 所以实际数字需要在目标机器上实测后再校准。
 
-**空闲 CPU 为 0 的准确含义**：不是"什么都不做"，而是**不忙等**。所有周期性动作都由可等待计时器
-（`CreateWaitableTimerEx` + `WaitForMultipleObjects`）或管道 `ReadFile` 驱动，空闲时线程全部睡在内核对象上。
-心跳与资源采样各由一个计时器唤醒（默认 60 s / 1 s），唤醒成本是微秒级。健康与否主要靠**事件**判断
-（管道 EOF、子进程退出、任一请求失败），计时器只负责低频采样，不参与健康判定。
-采样记录状态变化与峰值，而不是每次心跳都写一行——日志曾经就是这么膨胀起来的。
+**空闲 CPU 为 0 的准确含义**：不是"什么都不做"，而是**不忙等**。空闲时进程里**没有任何定时器**——
+不存在 `CreateWaitableTimerEx`，也没有周期性的心跳或资源采样。四个线程全部阻塞在内核等待对象上：
+主线程在 `GetMessageW`，日志线程与上传 worker 在各自的信号量上，SFTP 读线程在管道的 `ReadFile` 上。
+worker 的等待是 `WaitForMultipleObjects({唤醒事件, ssh 子进程句柄})`：链路正常时超时是 `INFINITE`
+（真正无限等待，不轮询）；只有在需要退避重连时才用 `RetryDelayMs()` 当超时，让重连由这次等待本身驱动。
+
+因此健康判定**完全由事件驱动**，没有采样参与：管道 EOF、ssh 子进程退出、任一请求失败。
+实测空闲 85 秒，CPU 时间在启动抖动结束后**完全平**——因为确实一次都不会醒，所以"为 0"是字面意义的 0，
+不是"接近 0"。内存基线由 `--selftest` 一次性采样，不做周期采样。
+
+（这段曾经写着"心跳与资源采样各由一个计时器唤醒（60 s / 1 s）"。**代码里从来没有这两个计时器**，
+已按实测改正。要加周期采样就得同时放弃"空闲 CPU 为 0"这条承诺，那是另一个取舍。）
 
 **单实例、收容与残留清理**：
 
@@ -162,10 +169,17 @@ sequenceDiagram
 | 互斥体被占用时怎么办 | **报告占用者的 PID 与程序名后退出，绝不擅自结束别人的进程** |
 | 退出不留残留 | 托盘图标注销、互斥体由内核释放、临时文件删除 |
 
-**通知怎么回传**：Windows 侧再开一条常驻通道 `ssh <host> 'tail -F <events.jsonl>'`，远端 Claude Code 的 hook
-只要往那个文件里追加一行就行。通道断开时管道 EOF 会**立刻**被感知，不需要轮询，也不用开监听端口。
+**通知怎么回传（设计已定，尚未接线）**：Windows 侧再开一条常驻通道 `ssh <host> 'tail -F <events.jsonl>'`，
+远端 Claude Code 的 hook 只要往那个文件里追加一行就行。通道断开时管道 EOF 会**立刻**被感知，
+不需要轮询，也不用开监听端口。
+
 需要注意：**回写远端的 `~/.claude/settings.json` 不能用"临时名 + 改名覆盖"**（见 §二第 1 条），
 而是截断覆盖写入，并在写之前先存一份带时间戳的备份。
+
+**当前真实状态**：这条通道**代码里一行都没有**（`tail -F` / `events.jsonl` 全树搜不到）；
+`~/.claude/settings.json` 的改写逻辑在 `src/core/app/hook_install.*` 里**实现完整且有单元测试**，
+但 `main_win32.cpp` 不包含它、也没有任何命令行入口能到达它——**运行时从不调用**。
+两件都按"已设计、未接线"记，不要当成可用功能。
 
 **为什么截图默认放 `/tmp`**：`/tmp` 一般会随重启被系统清掉，用户不必自己收拾。默认值是固定的 `/tmp/picopaste`，
 由客户端经 SFTP 创建，随时可以改 `remote_dir` 换到别处。需要注意 `/tmp` 是**全局可写**的共享目录，
@@ -235,6 +249,7 @@ stateDiagram-v2
 | Connecting | `kConnectFail` | Reconnecting | `connect_fail_count++`、`attempt++`、按 `(attempt, stable)` 算退避 |
 | Connecting | `kStop` | Stopping | — |
 | Ready | `kChannelLost` | Degraded | `channel_lost_count++`；`stable = now − ready_since`；`stable ≥ 3 分钟` 则 `attempt = 0`；按 `(attempt, stable)` 算退避 |
+| Ready | `kConnectFail` | Degraded | `connect_fail_count++`；worker 在上传失败时已先断开通道，与 `kChannelLost` 同样降级。否则 `kUploadTimeout` 等失败会被当作 unhandled，托盘在真实失败后仍是绿色 |
 | Ready | `kStop` | Stopping | — |
 | Degraded | `kRetry` | Reconnecting | 按 `(attempt, stable)` 算退避 |
 | Degraded | `kStop` | Stopping | — |
@@ -262,6 +277,7 @@ stateDiagram-v2
 | 上传中断 | 远端只留 `.tmp-` 临时名，Claude Code 看不到半成品；本地报错 |
 | 传输出错（字节数不符） | `STAT` 比对不一致立即中止，**绝不发布** |
 | 通道断开 / ssh 子进程退出 | 立刻感知（管道 EOF），托盘变红 + 写日志 + 失败计数 +1 |
+| 远端静默（连接不断、既无 EOF 也无回复） | `upload_timeout_ms` 到期后按失败处理：返回独立错误码 `kUploadTimeout`、释放单飞、计数 +1，并走与通道断开相同的降级路径让托盘变红、自动重连 |
 | 热键被别的程序占用 | 注册失败立即报错并返回非零退出码，不假装"已启动" |
 | 自动粘贴被终端忽略 | 核对 `SendInput` 返回值，不符即报错 |
 | 粘贴前焦点被切走 | 二次校验发现窗口变了，就不敲键 |
@@ -278,8 +294,8 @@ stateDiagram-v2
 
 ## 五、配置文件
 
-配置文件是 INI 格式，用 `--config <路径>` 指定。**路径不存在也没关系**：程序会用内置默认值继续运行
-（并提示用的是默认值），所以你可以只写需要改的那几行。`;` 或 `#` 开头是注释。
+配置文件是 INI 格式，用 `--config <路径>` 指定；**不指定时用 exe 同目录下的 `picopaste.ini`**。
+两种情况都**不要求文件真的存在**：找不到就用内置默认值继续运行（并提示用的是默认值），所以你可以只写需要改的那几行。`;` 或 `#` 开头是注释。
 
 ```ini
 [picopaste]
@@ -304,10 +320,16 @@ log_keep_files = 2
 ; 写入剪贴板后、敲 Ctrl+Shift+V 之前等待的毫秒数。
 delay_ms = 150
 
+; 单次上传允许存活的最长时间（毫秒）。超过即按失败处理：返回独立错误码、
+; 释放单飞、计数并让托盘变红。0 表示不设上限。
+upload_timeout_ms = 30000
+
 ; 粘贴完成后是否把图片剪贴板还原回去。
 restore_clipboard = true
 
-; 是否发送桌面通知。
+; 是否发送桌面通知。只在右下角弹气泡，不弹任何模态对话框。
+; 只在**状态变差的那一刻**弹一次（从正常掉到异常/过渡态），不是每次健康上报都弹——
+; 否则失败会变成噪音。设为 false 就完全不弹，只靠托盘颜色。
 notify_enabled = true
 
 ; 单张图片大小上限（20 MB），超过直接报错而不是试着传。
@@ -327,8 +349,9 @@ job_memory_limit_mb = 32
 | `ssh_command` | `ssh` | ssh 客户端可执行文件名 |
 | `log_level` | `info` | 日志级别 |
 | `delay_ms` | `150` | 写剪贴板到敲键之间的等待毫秒数 |
+| `upload_timeout_ms` | `30000` | 单次上传的最长存活时间（毫秒）。是对端静默（无 EOF 也无回复）时唯一的出路；到期按失败处理并释放单飞。`0` 关闭该上限 |
 | `restore_clipboard` | `true` | 粘贴后是否还原图片剪贴板 |
-| `notify_enabled` | `true` | 是否发桌面通知 |
+| `notify_enabled` | `true` | 是否发桌面通知。只弹右下角气泡（无模态框），且只在**状态变差的那一刻**弹一次 |
 | `max_image_bytes` | `20971520` | 单张图上限（20 MB） |
 | `job_memory_limit_mb` | `32` | 内核强制内存上限（MB） |
 | `log_max_bytes` | `8388608` | 单个日志文件上限（8 MB） |

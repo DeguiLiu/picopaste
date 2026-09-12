@@ -1,36 +1,44 @@
+[English](README.md) | [中文](README_zh.md)
+
 # picopaste
 
-把 Windows 上的剪贴板贴图，变成远端 Claude Code 里的一条路径。
+[![CI](https://github.com/DeguiLiu/picopaste/actions/workflows/ci.yml/badge.svg)](https://github.com/DeguiLiu/picopaste/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-在 Windows 按一个全局热键，截图就上传到远端主机，远端绝对路径自动落在剪贴板并粘贴进终端。远端**不需要安装任何自定义服务端代码**——用的是 sshd 自带的 `sftp-server` 子系统。
+A Windows clipboard-to-remote-SFTP screenshot uploader, rewritten in C++17.
 
-这是一个 C++17 重写，目标不是"能用"，而是长期稳定、极低开销、失败立刻可见。
+Press one global hotkey and the clipboard image is uploaded to a Linux host; the
+remote absolute path lands on the clipboard and is typed into the terminal, so
+Claude Code can read the image. The remote needs **no custom server-side code at
+all** — it is plain `sshd` and its own `sftp-server` subsystem.
 
----
+The rewrite's goal is not "it works" but long-term stability, very low overhead,
+and failures that are always visible. It is a single process with a
+kernel-enforced single instance, kernel-enforced child containment, zero idle
+CPU, and no scripts anywhere in the tree.
 
-## 拓扑
+## Overview
 
 ```mermaid
 flowchart LR
-  subgraph WIN["Windows 桌面会话"]
+  subgraph WIN["Windows desktop session"]
     direction TB
-    HK["全局热键<br/>RegisterHotKey + MOD_NOREPEAT"]
-    CL["剪贴板位图<br/>零拷贝读 DIB"]
-    IN["粘贴注入<br/>SendInput"]
-    TR["托盘<br/>Shell_NotifyIconW"]
+    HK["Global hotkey<br/>RegisterHotKey + MOD_NOREPEAT<br/>(low-level hook fallback)"]
+    CL["Clipboard bitmap<br/>zero-copy DIB read"]
+    IN["Paste injection<br/>SendInput"]
+    TR["Tray icon<br/>Shell_NotifyIconW"]
   end
 
-  PP["picopaste.exe<br/>单进程 · 内核单实例 · Job Object 32MB"]
+  PP["picopaste.exe<br/>single process · kernel single instance · Job Object 32 MB"]
 
-  subgraph CH["ssh.exe 子进程（常驻于 worker，随主进程消亡）"]
+  subgraph CH["ssh.exe child (long-lived, dies with the main process)"]
     SS["ssh -s HOST sftp"]
   end
 
-  subgraph REM["远端主机 · 零自定义服务端代码"]
+  subgraph REM["Remote host · zero custom server-side code"]
     direction TB
-    SF["sshd sftp-server 子系统"]
+    SF["sshd sftp-server subsystem"]
     UP["/tmp/picopaste/<br/>clip-YYYYMMDD-HHMMSS-hex.png"]
-    JS["~/.claude/settings.json<br/>改写前先备份并回读校验"]
   end
 
   HK --> PP
@@ -40,7 +48,6 @@ flowchart LR
   PP --> SS
   SS --> SF
   SF --> UP
-  SF --> JS
 
   classDef win fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
   classDef core fill:#fde68a,stroke:#d97706,stroke-width:2px,color:#78350f
@@ -49,62 +56,400 @@ flowchart LR
   class WIN,HK,CL,IN,TR win
   class PP core
   class CH,SS chan
-  class REM,SF,UP,JS rem
+  class REM,SF,UP rem
 ```
 
-**图中最关键的一点**：那条转发端口不存在。原方案依赖长驻的 RemoteForward 端口，而它断了不会有任何信号。这里由 worker 持有一条**常驻**的 `ssh -s <host> sftp` 子系统通道，并**阻塞等待该子进程的句柄**——子进程一死，句柄立刻发出信号，失联因此变成一个真实事件（Ready → Degraded，托盘转红）而不是沉默；随后按退避重建。
+**The most important thing in that picture is the port that is not there.** The
+previous design depended on a long-lived `RemoteForward` port, and when it died
+nothing said so. Here the worker holds one **long-lived** `ssh -s <host> sftp`
+subsystem channel and waits on the child's process handle; the moment the child
+dies the handle signals, so a lost link becomes a real event (Ready → Degraded,
+the tray turns red) instead of silence, and the worker then rebuilds it with
+backoff.
 
-代价说清楚：常驻通道省掉每次粘贴的握手，但它**确实可能悄悄死掉**，所以必须盯着子进程句柄。这个等待的超时同时充当退避定时器，空闲时线程全部阻塞在内核对象上，不轮询。
+The cost is stated plainly: a persistent channel removes the handshake from
+every paste, but it **can quietly die**, so the child handle must be watched.
+That same wait's timeout doubles as the backoff timer, and while idle every
+thread blocks on a kernel object — no polling.
 
-## 一次粘贴发生了什么
+## How it works
+
+One hotkey press runs a fixed order of steps, and the order is the contract.
+Every step that can fail runs before anything is written to the clipboard or
+typed into a terminal, so a failed paste is a visible failure and never a silent
+no-op.
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant U as 用户
+  participant U as User
   participant P as picopaste.exe
-  participant S as ssh.exe（SFTP 通道）
-  participant R as 远端主机
+  participant S as ssh.exe (SFTP channel)
+  participant R as Remote host
 
-  U->>P: 按下全局热键
-  P->>P: 读取剪贴板 DIB（零拷贝）→ WIC 编码 PNG
-  P->>S: 复用常驻通道发出 SFTP 请求
-  S->>R: OPEN / WRITE / CLOSE
-  P->>S: STAT 回查实际大小
+  U->>P: press the global hotkey
+  P->>P: capture clipboard DIB -> temp file (zero-copy PNG encode)
+  P->>S: MKDIR /tmp/picopaste (MkdirAll, tolerant of existing)
+  P->>S: OPEN / WRITE / CLOSE
+  S->>R: SFTP v3 frames over the sshd sftp-server subsystem
+  P->>S: STAT the remote path
   S->>R: STAT
-  Note over P,R: 大小不符即报错终止，绝不"传完了"了事
-  P->>U: 远端绝对路径写入剪贴板
-  P->>U: SendInput 发送 Ctrl+Shift+V
-  U->>R: 终端把路径粘贴进 Claude Code
+  Note over P,R: on a size mismatch it aborts; nothing is published
+  P->>U: put the remote absolute path on the clipboard
+  P->>U: SendInput ctrl+shift+v (every event count verified)
+  U->>R: the terminal pastes the path into Claude Code
+  P->>S: OPENDIR / REMOVE (retention housekeeping)
 ```
 
-注入的按键序列含 Ctrl 与 Shift 的释放事件，共 6 个，并校验 `SendInput` 的返回条数；数量不符即报 `kSendInputRejected`。焦点在等待期间发生变化则不发键、报 `kFocusChanged`。
+Injection sends six events (Ctrl and Shift down, V down, V up, Ctrl and Shift
+up) and checks `SendInput`'s return count; a short insert is reported as
+`kSendInputRejected`. If the focus changes during the wait, no key is sent and
+`kFocusChanged` is reported instead.
 
-## 远端为什么不需要服务端代码
+The remote needs no server-side code because everything it must do is expressed
+in SFTP v3 operations the stock subsystem already implements:
 
-| 需要的能力 | 用什么实现 |
+| Capability needed | How it is done |
 |---|---|
-| 写文件 | sshd 自带的 `sftp-server` 子系统 |
-| 建目录、列目录、删除旧文件 | 同一子系统上的 SFTP v3 `MKDIR` / `OPENDIR` / `REMOVE` |
-| 解析 `~/` 前缀 | SFTP `REALPATH`，不经过 shell |
-| 改写 `~/.claude/settings.json` | SFTP `OPEN` / `READ` / `WRITE`，改写前备份 |
+| Write a file | `sftp-server` from `sshd`, over `ssh -s <host> sftp` |
+| Create, list and delete files | SFTP v3 `MKDIR` / `OPENDIR` / `REMOVE` on the same channel |
+| Resolve a `~/` prefix | SFTP `REALPATH`; no shell, no `HOME` probe |
+| Read or write a remote file | SFTP `OPEN` / `READ` / `WRITE` |
 
-服务端是**纯 sshd + coreutils**。协议不追求与既有工具兼容，按上述场景自设计。
+The server side is **stock `sshd` + coreutils**. The protocol is not trying to
+be compatible with other tools; it is designed for exactly the calls above.
 
-## 设计要点
+### Run-time health
 
-- **失败必可见**：上传后回查远端大小；注入校验返回条数；通道断开立即上报。任何一步不成立就报错，不退回"大致成功"。
-- **零拷贝读位图**：剪贴板的 DIB 通常自下而上，而 WIC 编码假定自顶向下；这里用一个按行映射的 `IWICBitmapSource` 直接读源 DIB，不整幅复制。4K 截图下这省掉约 33 MB 的峰值。
-- **内核级单实例**：`Local\picopaste` 命名互斥体。会话作用域是刻意的——Windows 剪贴板本身按会话隔离。
-- **子进程收容**：containment job 设 `KILL_ON_JOB_CLOSE`，主进程无论以何种方式退出（包括强杀）都由内核收走 `ssh.exe`，孤儿进程在原理上不可能存在。
-- **运行时硬上限**：嵌套 Job Object 的 `JOB_OBJECT_LIMIT_JOB_MEMORY`，父进程与 `ssh.exe` 同受此限；越界是分配失败并报错，而不是静默增长。
-- **无脚本**：监督、重启、日志轮转全部由二进制承担，树内没有 VBS / cmd / PowerShell。
+The link is supervised by a 7-state machine built on newosp's `osp/hsm.hpp`:
 
-## 构建
+`Init → Connecting → Ready → Degraded → Reconnecting → Stopping → Stopped`
 
-### Linux（主机测试）
+- `Connecting --kConnectOk--> Ready`, `Connecting --kConnectFail--> Reconnecting`
+- `Ready --kChannelLost--> Degraded` and `Ready --kConnectFail--> Degraded`: a
+  dropped channel *or* a failed upload immediately turns the tray red rather
+  than leaving it green while paste is quietly broken
+- `Degraded --kRetry--> Reconnecting`; `Reconnecting` retries with exponential
+  backoff (5 s base, 60 s cap, reset after 3 minutes of stability)
+- `Stop` from any live state goes to `Stopping`, then `Stopped`
 
-核心层与平台无关，在 Linux 上直接可测，包含对**本机真实 `sftp-server`** 的端到端集成测试。
+Tray colour follows the state: green in `Ready`, red in `Degraded` and
+`Stopped`, yellow in the transitional states. The backoff policy is a pure
+function and the clock is injectable, so the ramp is tested without real time.
+
+### Design points
+
+- **Failure must be visible**: the remote size is re-checked after upload, the
+  `SendInput` event count is verified, and a dropped channel is reported at
+  once. Any step that does not hold becomes an error — never a "close enough".
+- **Zero-copy bitmap read**: a clipboard DIB is usually bottom-up while WIC
+  encodes top-down. A per-scanline `IWICBitmapSource` reads the locked source
+  DIB in place instead of copying the whole image; for a 4K screenshot that
+  avoids a ~33 MB peak allocation.
+- **Kernel-level single instance**: a `Local\picopaste` named mutex. The session
+  scope is deliberate — the Windows clipboard is itself per-session.
+- **Child containment**: the containment job sets `KILL_ON_JOB_CLOSE`, so
+  whatever way the main process dies (including a hard kill) the kernel reaps
+  `ssh.exe`; an orphan is impossible by construction.
+- **Hard run-time ceiling**: a nested Job Object with
+  `JOB_OBJECT_LIMIT_JOB_MEMORY` is applied to this process *and* to its
+  `ssh.exe` children; exceeding it is an allocation failure that is reported,
+  not silent growth.
+- **No scripts**: supervision, restart and log rotation are all done in the
+  binary; there is no VBS / cmd / PowerShell in the tree.
+
+## Dependencies and call graph
+
+This is the real include graph of the `.hpp` / `.cpp` files under
+`include/`, `src/core/` and `src/platform/`. Edges are `#include` relationships;
+`osp/*` (newosp) and `third_party/*` are external and are shown collapsed.
+
+```mermaid
+flowchart TB
+  subgraph PUB["include/picopaste - public interfaces"]
+    P_ERR["error.hpp"]
+    P_CFG["config.hpp"]
+    P_MEM["memsample.hpp"]
+    P_PROTO["sftp/protocol.hpp"]
+    P_STREAM["sftp/stream.hpp"]
+    P_CLIENT["sftp/client.hpp"]
+  end
+
+  subgraph CS["src/core/sftp - SFTP v3 codec and client"]
+    PKT_H["packet.hpp"]
+    PKT_C["packet.cpp"]
+    CLIENT_C["client.cpp"]
+    DIR_H["dir_ops.hpp"]
+    DIR_C["dir_ops.cpp"]
+  end
+
+  subgraph CA["src/core/app - application core"]
+    CFG_C["config.cpp"]
+    LIF_H["lifecycle.hpp"]
+    LIF_C["lifecycle.cpp"]
+    UP_H["upload_pipeline.hpp"]
+    UP_C["upload_pipeline.cpp"]
+    HOOK_H["hook_install.hpp"]
+    HOOK_C["hook_install.cpp"]
+  end
+
+  subgraph CLOG["src/core/log - bounded logging"]
+    LR_H["log_ring.hpp"]
+    LR_C["log_ring.cpp"]
+    LS_H["log_sink.hpp"]
+    LS_C["log_sink.cpp"]
+  end
+
+  subgraph POSIX["src/platform/posix - host-side stream"]
+    POS_H["stream_posix.hpp"]
+    POS_C["stream_posix.cpp"]
+  end
+
+  subgraph PWIN["src/platform/win32 - Windows layer"]
+    WU["win32_util.hpp"]
+    CLP_H["clipboard.hpp"]
+    CLP_C["clipboard.cpp"]
+    HOT_H["hotkey.hpp"]
+    HOT_C["hotkey.cpp"]
+    INJ_H["inject.hpp"]
+    INJ_C["inject.cpp"]
+    SI_H["single_instance.hpp"]
+    SI_C["single_instance.cpp"]
+    SW_H["stream_win32.hpp"]
+    SW_C["stream_win32.cpp"]
+    TR_H["tray.hpp"]
+    TR_C["tray.cpp"]
+    TR_I["tray_icons.h"]
+    ST_H["selftest.hpp"]
+    ST_C["selftest.cpp"]
+    MAIN["main_win32.cpp"]
+  end
+
+  subgraph EXT["external"]
+    OSP["osp/* (newosp)"]
+    PJ["third_party/picojson"]
+    CLIPLIB["third_party/clip"]
+  end
+
+  P_CFG --> P_ERR
+  P_CLIENT --> P_ERR
+  P_CLIENT --> P_PROTO
+  P_CLIENT --> P_STREAM
+
+  PKT_H --> P_PROTO
+  PKT_C --> PKT_H
+  CLIENT_C --> PKT_H
+  CLIENT_C --> P_CLIENT
+  DIR_H --> P_ERR
+  DIR_H --> P_CLIENT
+  DIR_C --> DIR_H
+
+  CFG_C --> P_CFG
+  LIF_C --> LIF_H
+  UP_H --> DIR_H
+  UP_H --> P_CFG
+  UP_H --> P_ERR
+  UP_H --> P_CLIENT
+  UP_C --> UP_H
+  HOOK_H --> P_ERR
+  HOOK_H --> P_CLIENT
+  HOOK_H --> P_STREAM
+  HOOK_C --> HOOK_H
+  HOOK_C --> PJ
+
+  LR_C --> LR_H
+  LS_H --> LR_H
+  LS_H --> P_ERR
+  LS_C --> LS_H
+
+  POS_H --> P_ERR
+  POS_H --> P_STREAM
+  POS_C --> POS_H
+
+  WU --> P_ERR
+  CLP_H --> P_CFG
+  CLP_H --> P_ERR
+  CLP_C --> CLP_H
+  CLP_C --> WU
+  HOT_H --> P_ERR
+  HOT_C --> HOT_H
+  INJ_H --> P_ERR
+  INJ_C --> CLIPLIB
+  INJ_C --> INJ_H
+  INJ_C --> WU
+  SI_H --> P_ERR
+  SI_C --> SI_H
+  SI_C --> WU
+  SW_H --> P_ERR
+  SW_H --> P_STREAM
+  SW_C --> SW_H
+  SW_C --> WU
+  TR_H --> P_ERR
+  TR_C --> SI_H
+  TR_C --> SW_H
+  TR_C --> TR_H
+  TR_C --> TR_I
+  TR_C --> WU
+  ST_H --> P_CFG
+  ST_H --> P_ERR
+  ST_C --> CLP_H
+  ST_C --> HOT_H
+  ST_C --> P_CLIENT
+  ST_C --> ST_H
+  ST_C --> SI_H
+  ST_C --> SW_H
+  ST_C --> WU
+  MAIN --> LIF_H
+  MAIN --> UP_H
+  MAIN --> CLIPLIB
+  MAIN --> CLP_H
+  MAIN --> HOT_H
+  MAIN --> INJ_H
+  MAIN --> ST_H
+  MAIN --> SI_H
+  MAIN --> SW_H
+  MAIN --> TR_H
+  MAIN --> WU
+  MAIN --> P_CFG
+
+  PUB -.-> OSP
+  CS -.-> OSP
+  CA -.-> OSP
+  CLOG -.-> OSP
+  POSIX -.-> OSP
+  PWIN -.-> OSP
+
+  classDef pub fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+  classDef sftpcore fill:#e9d5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+  classDef appcore fill:#fde68a,stroke:#d97706,stroke-width:2px,color:#78350f
+  classDef logcore fill:#ccfbf1,stroke:#0d9488,stroke-width:2px,color:#134e4a
+  classDef posix fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+  classDef win fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
+  classDef ext fill:#e5e7eb,stroke:#6b7280,stroke-width:2px,color:#374151
+
+  class P_ERR,P_CFG,P_MEM,P_PROTO,P_STREAM,P_CLIENT pub
+  class PKT_H,PKT_C,CLIENT_C,DIR_H,DIR_C sftpcore
+  class CFG_C,LIF_H,LIF_C,UP_H,UP_C,HOOK_H,HOOK_C appcore
+  class LR_H,LR_C,LS_H,LS_C logcore
+  class POS_H,POS_C posix
+  class WU,CLP_H,CLP_C,HOT_H,HOT_C,INJ_H,INJ_C,SI_H,SI_C,SW_H,SW_C,TR_H,TR_C,TR_I,ST_H,ST_C,MAIN win
+  class OSP,PJ,CLIPLIB ext
+```
+
+### Layering
+
+| Layer | Files | Depends on | Runtime role |
+|---|---|---|---|
+| Public interfaces | `error.hpp` (leaf), `memsample.hpp` (leaf), `config.hpp` → `error.hpp`, `sftp/protocol.hpp` (leaf), `sftp/stream.hpp` (leaf), `sftp/client.hpp` → `error.hpp`, `protocol.hpp`, `stream.hpp` | each other, nothing below | The stable contract surface. No header here includes a `src/` file. |
+| SFTP core | `packet.hpp` → `protocol.hpp`; `packet.cpp` → `packet.hpp`; `client.cpp` → `packet.hpp`, `client.hpp`; `dir_ops.hpp` → `error.hpp`, `client.hpp`; `dir_ops.cpp` → `dir_ops.hpp` | public interfaces only | `packet.*` is the v3 wire codec; `client.cpp` is the single owner of the channel; `dir_ops.*` is the retention policy over `Client::ListDir`. |
+| App core | `config.cpp` → `config.hpp`; `lifecycle.hpp` (leaf, uses `osp/hsm.hpp`) and `lifecycle.cpp` → `lifecycle.hpp`; `upload_pipeline.hpp` → `config.hpp`, `error.hpp`, `client.hpp`, `../sftp/dir_ops.hpp`, and `upload_pipeline.cpp` → `upload_pipeline.hpp`; `hook_install.hpp` → `error.hpp`, `client.hpp`, `stream.hpp` and `hook_install.cpp` → `hook_install.hpp`, `third_party/picojson` | public interfaces + SFTP core | `config.cpp` loads the INI; `lifecycle.*` supervises health; `upload_pipeline.*` is the ordered paste pipeline; `hook_install.*` manages a remote settings file. |
+| Logging core | `log_ring.hpp` (leaf), `log_ring.cpp` → `log_ring.hpp`, `log_sink.hpp` → `log_ring.hpp`, `error.hpp`, `log_sink.cpp` → `log_sink.hpp` | public interfaces | Bounded in-memory ring plus rotation. |
+| POSIX platform | `stream_posix.hpp` → `error.hpp`, `sftp/stream.hpp`; `stream_posix.cpp` → `stream_posix.hpp` | public interfaces | Host-side `ssh -s <host> sftp` child over pipes; used by the host tests. |
+| Win32 platform | `win32_util.hpp` → `error.hpp`; `clipboard.hpp` → `config.hpp`, `error.hpp` and `clipboard.cpp` → `clipboard.hpp`, `win32_util.hpp`; `hotkey.*`, `inject.*`, `single_instance.*`, `stream_win32.*`, `tray.*`, `selftest.*`, `main_win32.cpp` | public interfaces + app core + `third_party/clip` | The Windows implementation and the process entry point. `main_win32.cpp` includes core app headers; nothing in core includes a platform header. |
+
+### Call direction at run time
+
+The include graph is always inward — platform → core → public interfaces — and
+there is no edge in the other direction. At run time the direction is:
+
+```
+main_win32.cpp
+  └─ Lifecycle (health)          lifecycle.hpp / lifecycle.cpp
+  └─ UploadPipeline::Run         upload_pipeline.hpp / upload_pipeline.cpp
+       └─ sftp::DirOps           dir_ops.hpp / dir_ops.cpp
+            └─ sftp::Client      client.hpp / client.cpp  (the only wire-protocol owner)
+                 └─ sftp::ByteStream   stream.hpp  (function-pointer table)
+                      └─ ChildStream    stream_win32.hpp / stream_win32.cpp
+                           └─ ssh -s <host> sftp  (sshd sftp-server)
+```
+
+`main_win32.cpp` is the composition root and the only translation unit that
+touches every other layer: it loads the config (`config.cpp`), owns the
+`Lifecycle` and the `UploadPipeline`, spawns the `ChildStream`, and wires
+clipboard, hotkey, injection and tray. A hotkey message reaches
+`UploadPipeline::Run`, which drives the upload through `DirOps` into the one
+`Client`; `Client` never calls back up into the app.
+
+There is exactly one deliberate inversion. `UploadPipeline::Run` is given
+`ClipboardOps` and `InjectOps` — function-pointer tables with an opaque context,
+the same shape as `ByteStream`. During a paste the core therefore calls *into*
+the platform (capture, set clipboard text, inject the chord) through those
+injected pointers. That is why the core can stay free of `<windows.h>`, and it
+is what lets the pipeline be tested on the host with fake tables.
+
+The platform seam is `include/picopaste/sftp/stream.hpp`: a platform-neutral
+`ByteStream` (write / read / close, each blocking and all-or-nothing).
+`stream_posix.hpp` and `stream_win32.hpp` are two independent implementations of
+that one interface, and `sftp::Client` only ever sees the three function
+pointers — it cannot tell which platform it is running on.
+
+One module is not on the run-time path. `hook_install.*` (`RemoteSettings`) is
+compiled and covered by tests, and it depends only on the public client and
+stream, but **nothing in `main_win32.cpp` includes it**: it is a library module
+for managing a remote settings file, not a command wired into the current
+binary. The diagram and the table show it for what it is, not as a step of the
+paste path.
+
+## Configuration
+
+The config file is read from `--config <path>`, or from
+`<directory of the running executable>\picopaste.ini` when `--config` is absent.
+A missing file is **not** an error: the built-in defaults are used and the
+program notes that it did so. Values that are too long are reported, never
+silently truncated.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `host` | *(empty)* | SSH `Host` alias from `~/.ssh/config`; the client never edits that file. |
+| `remote_dir` | `/tmp/picopaste` | Remote upload directory, created by the client over SFTP (`MkdirAll`). A leading `~/` is resolved with `REALPATH`. |
+| `hotkey` | `alt+shift+v` | Global hotkey, e.g. `alt+shift+v`. Parsed locally; it may not collide with the paste chords `ctrl+shift+v` or `ctrl+v`. |
+| `delay_ms` | `150` | Milliseconds between publishing the path and sending the keystroke. |
+| `upload_timeout_ms` | `30000` | How long one upload may stay in flight before it is treated as failed. `0` disables the deadline. |
+| `restore_clipboard` | `true` | Put the image back on the clipboard after the paste. |
+| `max_image_bytes` | `20971520` | Refuse images larger than this (20 MiB) instead of holding them. |
+| `job_memory_limit_mb` | `32` | Hard Job Object commit ceiling on this process and its `ssh.exe` children. |
+| `log_max_bytes` | `8388608` | Rotate the log at 8 MiB. |
+| `log_keep_files` | `2` | Log generations to keep. |
+| `log_level` | `info` | Log level. |
+| `notify_enabled` | `true` | Parsed and round-tripped; there is no notification consumer wired up yet. |
+| `ssh_command` | `ssh` | The `ssh` program to spawn; overridable to point at a wrapper. |
+
+### Hotkey acquisition
+
+`RegisterHotKey` with `MOD_NOREPEAT` is the first choice. If, and only if, it
+fails with `ERROR_HOTKEY_ALREADY_REGISTERED` — another process already owns the
+chord — the tool installs a `WH_KEYBOARD_LL` hook, which sees the keystroke
+before the system dispatches it and can take the chord over. Any other failure
+is reported unchanged; the fallback never swallows a different error. Which path
+is live is never hidden: it is named in the self-check, the startup log and the
+tray tooltip.
+
+### Self-check
+
+```
+picopaste.exe --selftest [--config <path>]
+```
+
+prints one `PASS` / `FAIL` / `SKIP` line per capability, each with a concrete
+number (byte counts, the enforced memory limit, a resolved remote path), and
+exits non-zero if any mandatory capability failed. This is the vehicle for
+verifying a build on a real machine.
+
+## Build and license
+
+### Windows (MSVC)
+
+```bat
+git clone --branch windows https://github.com/DeguiLiu/newosp.git %USERPROFILE%\newosp-windows
+cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON ^
+  -DPICOPASTE_NEWOSP_DIR=%USERPROFILE%\newosp-windows
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+CI also builds and tests the platform-neutral layers (`include/picopaste`,
+`src/core/*`, and the POSIX byte-stream) on Linux, including end-to-end
+integration tests against a real local `sftp-server` and a sanitizer matrix:
 
 ```sh
 git clone --branch windows https://github.com/DeguiLiu/newosp.git ~/newosp-windows
@@ -114,51 +459,13 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-### Windows（MSVC）
+**Dependency note**: newosp's `windows` branch is required. On `main`,
+`osp/platform.hpp` mistakes the `RT_VERSION` macro defined by `<windows.h>` for
+an RT-Thread marker and then includes a non-existent `<rtthread.h>`; the note at
+the top of the root `CMakeLists.txt` has the details.
 
-完整步骤见 [docs/build/windows-compile-test.md](docs/build/windows-compile-test.md)。
+### License
 
-**依赖注意**：必须使用 newosp 的 `windows` 分支。`main` 上的 `osp/platform.hpp` 会把 `<windows.h>` 定义的 `RT_VERSION` 误判为 RT-Thread 标记，进而包含不存在的 `<rtthread.h>`。详见根 `CMakeLists.txt` 顶部注释。
-
-## 当前状态
-
-诚实列出，避免"看起来完成"：
-
-| 项 | 状态 |
-|---|---|
-| SFTP v3 客户端、目录操作、保留策略 | 完成，对本机真实 sftp-server 有集成测试 |
-| 远端 `settings.json` 钩子安装（含备份与还原） | 完成，有集成测试 |
-| Windows 平台层（剪贴板 / 注入 / 单实例 / 托盘 / 热键） | 代码完成，**仅交叉编译语法检查过** |
-| 能力自检 `picopaste.exe --selftest` | 完成，可在真实 Windows 上报告各项能力与内存上限 |
-| 交互模式（托盘 / 热键 / 粘贴主循环） | **已接线**：`GetMessageW` 消息循环、worker 线程、常驻通道与失联重建全部由 C++ 承担。Windows 运行时行为**未经真机验证** |
-| MSVC 真实构建 | CI 已接入，并已抓到三批本机看不到的真实缺陷（C4996、`small` 宏冲突、vendored 警告归属）；修复在推进 |
-
-`picopaste --selftest` 可在终端逐个能力打印 PASS / FAIL / SKIP 与具体数值，用于在真机上核对。
-
-## 目录结构
-
-```
-include/picopaste/     对外接口：错误码、配置、SFTP 客户端
-src/core/sftp/         SFTP v3 编解码与客户端（平台无关）
-src/core/app/          配置、生命周期状态机、远端钩子安装
-src/core/log/          定容日志与轮转
-src/platform/posix/    主机侧字节流（`ssh -s host sftp` 子进程管道）
-src/platform/win32/    Windows 层与入口点
-tests/                 主机测试，含对真实 sftp-server 的集成测试
-tools/                 构建门禁（去脚本、POSIX 泄漏）
-third_party/           vendored 依赖，附来源与许可
-docs/                  设计与构建文档
-```
-
-## 门禁
-
-两道机械门禁随 `ctest` 一起跑，Linux 与 Windows 一致：
-
-- `gate_no_scripts`：源码中不得出现脚本宿主调用。
-- `gate_posix_leak`：Windows 可达路径不得引入 POSIX 头或符号（`src/platform/posix/` 豁免）。
-
-两道都已用注入违规的方式验证过会真实失败。它们各自的局限写在脚本注释里——不要据此推断"不存在问题"。
-
-## 许可
-
-见 `third_party/` 下各依赖的许可文件。
+picopaste is released under the **MIT License**. See [LICENSE](LICENSE) —
+Copyright (c) 2026 liudegui. Vendored components under `third_party/` carry
+their own licences and provenance, recorded alongside each dependency.
