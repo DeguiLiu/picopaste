@@ -1,8 +1,12 @@
 // picopaste -- tray icon implementation.
 #include "tray.hpp"
 
+#include <imm.h>
 #include <shellapi.h>
 
+#include "single_instance.hpp"
+#include "stream_win32.hpp"
+#include "tray_icons.h"
 #include "win32_util.hpp"
 
 namespace picopaste::win32 {
@@ -10,30 +14,87 @@ namespace {
 
 constexpr UINT kTrayCallback = WM_APP + 1;
 constexpr UINT kMenuQuit = 1;
+constexpr UINT kMenuRestart = 2;
 constexpr wchar_t kWindowClass[] = L"picopaste-tray";
 
+// How long a relaunched instance is given to prove it got past its own start-up.
+// The child cannot take the single-instance mutex while this process still
+// holds it, so a healthy child is still running when the probe expires; a child
+// that has already exited by then refused to start.
+constexpr DWORD kRelaunchProbeMs = 1000;
+
 // Three colour-coded icons: blue for healthy, amber for warning, red for error.
-// These are the shared system icons, addressed by their resource IDs via
-// MAKEINTRESOURCEW. The IDs are spelled numerically and cast through ULONG_PTR
-// because mingw and MSVC disagree on whether the IDI_* macros are integers or
-// MAKEINTRESOURCE pointers. DestroyIcon must NOT be called on these.
-HICON MakeStateIcon(TrayState state) noexcept {
-  ULONG_PTR resource = 32516;  // IDI_ASTERISK: blue "i"
+// They are this executable's own resources (see picopaste.rc; the ids live in
+// tray_icons.h), so the tray does not depend on which stock system icons a given
+// Windows version happens to ship. LoadIconW returns a shared handle, which must
+// NOT be passed to DestroyIcon.
+HICON MakeStateIcon(HINSTANCE instance, TrayState state) noexcept {
+  int resource = PICOPASTE_ICON_OK;
   switch (state) {
     case TrayState::kHealthy:
-      resource = 32516;  // IDI_ASTERISK
+      resource = PICOPASTE_ICON_OK;
       break;
     case TrayState::kWarning:
-      resource = 32515;  // IDI_EXCLAMATION: amber triangle
+      resource = PICOPASTE_ICON_WARN;
       break;
     case TrayState::kError:
-      resource = 32513;  // IDI_HAND: red cross
+      resource = PICOPASTE_ICON_ERR;
       break;
     default:
-      resource = 32512;  // IDI_APPLICATION
+      resource = PICOPASTE_ICON_OK;
       break;
   }
-  return LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(resource));
+  return LoadIconW(instance, MAKEINTRESOURCEW(resource));
+}
+
+// Relaunch this executable with the command line it was started with.
+//
+// Returns true only when a replacement process is up. The child is expected to
+// still be running at the end of the probe: it is waiting for this process to
+// release the single-instance mutex, which cannot happen until this process
+// exits. The case worth catching is the opposite one -- a child that exits at
+// once, because its start-up refused. Reporting that as a failed relaunch is
+// what keeps "Restart" from turning into a silent exit.
+bool RelaunchSelf() noexcept {
+  wchar_t image[kOwnerImageChars] = {};
+  const DWORD image_chars = GetModuleFileNameW(nullptr, image, static_cast<DWORD>(kOwnerImageChars));
+  if (image_chars == 0 || image_chars >= kOwnerImageChars) {
+    return false;
+  }
+
+  // CreateProcessW may write to the command-line buffer, so it must be a copy of
+  // this process's own line rather than GetCommandLineW()'s pointer. A line that
+  // does not fit is refused rather than truncated: dropping an option silently is
+  // the failure mode this project exists to remove.
+  wchar_t command[kMaxCommandLineChars] = {};
+  if (false == CopyWide(GetCommandLineW(), command, kMaxCommandLineChars)) {
+    return false;
+  }
+
+  // A child inherits a snapshot of this environment at creation, so the wait
+  // request only has to outlive the CreateProcessW call. The flag is what stops
+  // the child from finding our mutex and exiting as a duplicate.
+  (void)SetEnvironmentVariableW(kAwaitInstanceEnvName, L"1");
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION child{};
+  // Break away from the inherited memory job: a process already in a job cannot
+  // join an unrelated second one, so without this the child fails in
+  // SetupJobObjects and exits. The job grants the escape explicitly
+  // (JOB_OBJECT_LIMIT_BREAKAWAY_OK) and only on request, so ssh.exe -- which
+  // never asks -- stays inside the memory ceiling.
+  const BOOL started = CreateProcessW(image, command, nullptr, nullptr, FALSE,
+                                      CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &startup, &child);
+  (void)SetEnvironmentVariableW(kAwaitInstanceEnvName, nullptr);
+  if (started == 0) {
+    return false;
+  }
+
+  const DWORD state = WaitForSingleObject(child.hProcess, kRelaunchProbeMs);
+  CloseHandle(child.hThread);
+  CloseHandle(child.hProcess);
+  return state == WAIT_TIMEOUT;
 }
 
 }  // namespace
@@ -42,9 +103,21 @@ Status Tray::Create(HINSTANCE instance, const wchar_t* tooltip) noexcept {
   if (hwnd_ != nullptr) {
     return Status::success();
   }
-  icons_[0] = MakeStateIcon(TrayState::kHealthy);
-  icons_[1] = MakeStateIcon(TrayState::kWarning);
-  icons_[2] = MakeStateIcon(TrayState::kError);
+
+  // Keep the input-method framework out of this process.
+  //
+  // picopaste has no text-input UI, but creating a window is enough for an IME to
+  // attach a context to this thread — and once attached, the IME's own code runs
+  // on this thread's message path. That path is what crashed the process
+  // repeatedly: an access violation inside the IME's frames (Sogou/TSF on this
+  // machine), a minute or two after an upload, with nothing logged. With the IME
+  // kept out, the same uploads run clean. -1 covers every thread in the process.
+  constexpr DWORD kAllThreads = static_cast<DWORD>(-1);
+  (void)ImmDisableIME(kAllThreads);
+
+  icons_[0] = MakeStateIcon(instance, TrayState::kHealthy);
+  icons_[1] = MakeStateIcon(instance, TrayState::kWarning);
+  icons_[2] = MakeStateIcon(instance, TrayState::kError);
   if (icons_[0] == nullptr || icons_[1] == nullptr || icons_[2] == nullptr) {
     return Status::error(Error::kTempFileFailed);
   }
@@ -110,8 +183,8 @@ void Tray::Destroy() noexcept {
     DestroyWindow(hwnd_);
     hwnd_ = nullptr;
   }
-  // The icons are the shared system icons; DestroyIcon must not be called on
-  // them. Clearing the handles is enough.
+  // The icons are shared resource handles (LoadIconW caches them); DestroyIcon
+  // must not be called on them. Clearing the handles is enough.
   for (int i = 0; i < 3; ++i) {
     icons_[i] = nullptr;
   }
@@ -170,7 +243,9 @@ void Tray::ShowContextMenu() noexcept {
   if (menu == nullptr) {
     return;
   }
-  AppendMenuW(menu, MF_STRING, kMenuQuit, L"Quit picopaste");
+  AppendMenuW(menu, MF_STRING, kMenuRestart, L"Restart picopaste");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, kMenuQuit, L"Exit picopaste");
   POINT cursor{};
   (void)GetCursorPos(&cursor);
   SetForegroundWindow(hwnd_);
@@ -213,6 +288,14 @@ LRESULT Tray::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) noexcep
   if (msg == WM_COMMAND) {
     if (LOWORD(wparam) == kMenuQuit) {
       PostQuitMessage(0);
+    } else if (LOWORD(wparam) == kMenuRestart) {
+      // Leave only when a replacement is actually running: a relaunch that
+      // failed must not be indistinguishable from a successful restart.
+      if (RelaunchSelf()) {
+        PostQuitMessage(0);
+      } else {
+        Notify(L"picopaste", L"restart failed; still running", true);
+      }
     }
     return 0;
   }

@@ -72,7 +72,7 @@ set(_portable_headers "
   assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h
   locale.h math.h setjmp.h signal.h stdalign.h stdarg.h stdbool.h stddef.h
   stdint.h stdio.h stdlib.h string.h tgmath.h time.h uchar.h wchar.h wctype.h
-  windows.h windef.h winbase.h winuser.h winnt.h winerror.h winnls.h wincon.h
+  windows.h windef.h winbase.h winuser.h imm.h winnt.h winerror.h winnls.h wincon.h
   wingdi.h winsock2.h ws2tcpip.h shellapi.h shlwapi.h shlobj.h shlobj_core.h
   objbase.h objidl.h ole2.h oleidl.h combaseapi.h knownfolders.h propidl.h
   propkey.h propvarutil.h wincodec.h wtypes.h wtypesbase.h psapi.h synchapi.h

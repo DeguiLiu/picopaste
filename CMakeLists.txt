@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(picopaste LANGUAGES CXX VERSION 0.1.0)
 
+# The executable carries its own icons — the tray's three states and, through the
+# lowest-numbered ICON resource, the .exe icon itself. `LANGUAGES CXX` alone
+# leaves .rc files with no build rule, so the resource compiler is enabled
+# explicitly, and only on Windows: the Linux build has none.
+if(WIN32)
+  enable_language(RC)
+endif()
+
 # ---------------------------------------------------------------------------
 # Standards & build posture
 # ---------------------------------------------------------------------------

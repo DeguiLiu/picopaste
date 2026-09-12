@@ -1,0 +1,10 @@
+// picopaste.exe resources.
+//
+// The three state icons the tray cycles through. The ids live in tray_icons.h so
+// the .rc and tray.cpp cannot disagree. Order matters only in that the lowest id
+// is the icon the shell shows for the .exe itself.
+#include "tray_icons.h"
+
+PICOPASTE_ICON_OK ICON "resources/picopaste-ok.ico"
+PICOPASTE_ICON_WARN ICON "resources/picopaste-warn.ico"
+PICOPASTE_ICON_ERR ICON "resources/picopaste-err.ico"

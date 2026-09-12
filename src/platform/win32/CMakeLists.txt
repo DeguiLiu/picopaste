@@ -11,7 +11,13 @@ target_sources(picopaste PRIVATE
   tray.cpp           # Shell_NotifyIconW tray, TaskbarCreated re-add, balloon
   hotkey.cpp         # RegisterHotKey, message loop integration
   selftest.cpp       # per-capability self-check table, also exposed as a subcommand
+  picopaste.rc       # icon resources: the tray's three states + the .exe icon
 )
+
+# rc.exe looks for the .ico files named in picopaste.rc along its include path,
+# so the directory that holds resources/ has to be on it. Harmless for the C++
+# side: this directory holds no headers other than tray_icons.h.
+target_include_directories(picopaste PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # ---------------------------------------------------------------------------
 # Vendored dacap/clip (MIT). Source copy under third_party/clip with upstream
@@ -25,25 +31,53 @@ target_sources(picopaste PRIVATE
 # ---------------------------------------------------------------------------
 # The vendored sources are not ours to fix, and they are not warning-clean under
 # MSVC /W4: C4018 signed/unsigned comparison, C4267 size_t narrowing, C4456 and
-# C4458 shadowing. picopaste_apply_vendor_includes() marks the third_party
-# *include directory* external, which silences warnings from headers reached
-# through it -- but these files are compiled as sources of this target, so their
-# warnings land on us. Suppress warnings for these files alone; lowering the
-# warning level for the whole target would blind us to our own code.
+# C4458 shadowing. They must therefore be compiled with warnings off.
+#
+# A separate static library rather than set_source_files_properties(): a
+# source-file property is scoped to the directory that sets it, so setting one
+# here does NOT reach picopaste, whose target is declared in the root
+# CMakeLists. The previous form was silently inert -- /w appeared nowhere in the
+# generated project and the vendored warnings were promoted to errors by the
+# root target's /WX. A target is the correct unit of scope, and a whole-target
+# /w cannot silently miss: the vendored code is the only thing in this library.
+#
+# The include directory is marked SYSTEM so the headers this library exports to
+# picopaste (clip.h) stay warning-exempt for its consumers too.
+# ---------------------------------------------------------------------------
 set(PICOPASTE_CLIP_SOURCES
-  "${CMAKE_SOURCE_DIR}/third_party/clip/clip.cpp"
-  "${CMAKE_SOURCE_DIR}/third_party/clip/image.cpp"
-  "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win.cpp"
-  "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win_bmp.cpp"
-  "${CMAKE_SOURCE_DIR}/third_party/clip/clip_win_wic.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip/clip.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip/image.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip/clip_win.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip/clip_win_bmp.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip/clip_win_wic.cpp"
 )
-target_sources(picopaste PRIVATE ${PICOPASTE_CLIP_SOURCES})
+foreach(_clip_src IN LISTS PICOPASTE_CLIP_SOURCES)
+  if(NOT EXISTS "${_clip_src}")
+    message(FATAL_ERROR "vendored clip source missing: ${_clip_src}")
+  endif()
+endforeach()
 
+add_library(picopaste_clip STATIC ${PICOPASTE_CLIP_SOURCES})
+target_include_directories(picopaste_clip SYSTEM PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/clip")
+target_compile_definitions(picopaste_clip PUBLIC CLIP_ENABLE_IMAGE=1)
+# Static CRT, matching the root target: a /MD library linked into an /MT
+# executable produces LNK2005 duplicate-symbol errors at link time.
+set_property(TARGET picopaste_clip PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 if(MSVC)
   # /w turns off all warnings for these translation units only.
-  set_source_files_properties(${PICOPASTE_CLIP_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
+  target_compile_options(picopaste_clip PRIVATE /w)
+  # The library's default error handler throws; this project builds /EHsc-free.
+  target_compile_options(picopaste_clip PRIVATE /EHs-c-)
 else()
-  set_source_files_properties(${PICOPASTE_CLIP_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  target_compile_options(picopaste_clip PRIVATE -w)
 endif()
-target_include_directories(picopaste PRIVATE "${CMAKE_SOURCE_DIR}/third_party/clip")
-target_compile_definitions(picopaste PRIVATE CLIP_ENABLE_IMAGE=1)
+
+target_link_libraries(picopaste PRIVATE picopaste_clip)
+
+# ImmDisableIME, which keeps the input-method framework out of this process (see
+# the comment in Tray::Create). The IME's own code running on our message path is
+# what crashed the process repeatedly.
+if(WIN32)
+  target_link_libraries(picopaste PRIVATE imm32)
+endif()
