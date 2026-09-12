@@ -1,4 +1,31 @@
-// picopaste — SFTP v3 wire codec implementation.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file packet.cpp
+ * @brief SFTP v3 wire codec implementation.
+ */
 #include "packet.hpp"
 
 #include <cstring>
@@ -154,55 +181,86 @@ bool BufferReader::ReadString(const char*& out, std::uint32_t& out_len) noexcept
 // ATTRS
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Each attribute group is consumed only when its flag is set; a false return
+// means the buffer ended early. `has_*` is set only once the group is complete.
+
+bool ParseSizeAttr(BufferReader& r, AttrsInfo& out) noexcept {
+  if (!r.ReadU64(out.size)) {
+    return false;
+  }
+  out.has_size = true;
+  return true;
+}
+
+bool ParseUidGidAttr(BufferReader& r, AttrsInfo& out) noexcept {
+  if (!r.ReadU32(out.uid) || !r.ReadU32(out.gid)) {
+    return false;
+  }
+  out.has_uid_gid = true;
+  return true;
+}
+
+bool ParsePermsAttr(BufferReader& r, AttrsInfo& out) noexcept {
+  if (!r.ReadU32(out.perms)) {
+    return false;
+  }
+  out.has_perms = true;
+  return true;
+}
+
+bool ParseAcmodTimeAttr(BufferReader& r, AttrsInfo& out) noexcept {
+  if (!r.ReadU32(out.atime) || !r.ReadU32(out.mtime)) {
+    return false;
+  }
+  out.has_acmod_time = true;
+  return true;
+}
+
+// Extended attributes are length-prefixed name/value pairs; only their framing
+// is validated, the values themselves are discarded.
+bool ParseExtendedAttrs(BufferReader& r) noexcept {
+  std::uint32_t count = 0u;
+  if (!r.ReadU32(count)) {
+    return false;
+  }
+  for (std::uint32_t i = 0u; i < count; ++i) {
+    const char* s = nullptr;
+    std::uint32_t n = 0u;
+    if (!r.ReadString(s, n) || !r.ReadString(s, n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 bool ParseAttrs(BufferReader& r, AttrsInfo& out) noexcept {
   std::uint32_t flags = 0u;
   if (!r.ReadU32(flags)) {
     return false;
   }
-
+  bool ok = true;
   if ((flags & kAttrSize) != 0u) {
-    if (!r.ReadU64(out.size)) {
-      return false;
-    }
-    out.has_size = true;
+    ok = ParseSizeAttr(r, out);
   }
-  if ((flags & kAttrUidGid) != 0u) {
-    if (!r.ReadU32(out.uid) || !r.ReadU32(out.gid)) {
-      return false;
-    }
-    out.has_uid_gid = true;
+  if (ok && ((flags & kAttrUidGid) != 0u)) {
+    ok = ParseUidGidAttr(r, out);
   }
-  if ((flags & kAttrPerms) != 0u) {
-    if (!r.ReadU32(out.perms)) {
-      return false;
-    }
-    out.has_perms = true;
+  if (ok && ((flags & kAttrPerms) != 0u)) {
+    ok = ParsePermsAttr(r, out);
   }
-  if ((flags & kAttrAcmodTime) != 0u) {
-    if (!r.ReadU32(out.atime) || !r.ReadU32(out.mtime)) {
-      return false;
-    }
-    out.has_acmod_time = true;
+  if (ok && ((flags & kAttrAcmodTime) != 0u)) {
+    ok = ParseAcmodTimeAttr(r, out);
   }
-  if ((flags & kAttrExtended) != 0u) {
-    std::uint32_t count = 0u;
-    if (!r.ReadU32(count)) {
-      return false;
-    }
-    for (std::uint32_t i = 0u; i < count; ++i) {
-      const char* s = nullptr;
-      std::uint32_t n = 0u;
-      if (!r.ReadString(s, n) || !r.ReadString(s, n)) {
-        return false;
-      }
-    }
+  if (ok && ((flags & kAttrExtended) != 0u)) {
+    ok = ParseExtendedAttrs(r);
   }
 
   const std::uint32_t known = kAttrSize | kAttrUidGid | kAttrPerms | kAttrAcmodTime | kAttrExtended;
-  if ((flags & ~known) != 0u) {
-    return false;
-  }
-  return true;
+  return ok && ((flags & ~known) == 0u);
 }
 
 }  // namespace picopaste::sftp

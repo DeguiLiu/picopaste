@@ -1,22 +1,49 @@
-// picopaste -- Win32 clipboard capture to one temporary file.
-//
-// Layout of this file:
-//   1. little-endian readers and a DIB geometry parser
-//   2. DibSource: a minimal IWICBitmapSource that reads the locked DIB in place
-//   3. the WIC PNG encode path used for CF_DIBV5 / CF_DIB
-//   4. the clipboard capture entry points (PNG fast path + DIB fallback)
-//
-// On the DIB path the pixels are NEVER copied into our heap. A 4K screenshot is
-// ~33 MB uncompressed and would alone blow the memory budget; DibSource points
-// straight at the locked HGLOBAL and the encoder pulls scanlines through it.
-//
-// The design document named IWICImagingFactory::CreateBitmapFromMemory here.
-// That call could not be used: its documentation does not promise to wrap the
-// caller's buffer rather than copy it (the returned IWICBitmap is lockable and
-// writable, i.e. it owns storage), and it cannot express a bottom-up DIB -- the
-// usual shape for CF_DIB -- without a full-image vertical flip. DibSource gives
-// true zero-copy reads and handles bottom-up rows and indexed palettes by
-// mapping each destination scanline to its real source row.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file clipboard.cpp
+ * @brief Win32 clipboard capture to one temporary file.
+ *
+ * Layout of this file:
+ *   1. little-endian readers and a DIB geometry parser
+ *   2. DibSource: a minimal IWICBitmapSource that reads the locked DIB in place
+ *   3. the WIC PNG encode path used for CF_DIBV5 / CF_DIB
+ *   4. the clipboard capture entry points (PNG fast path + DIB fallback)
+ *
+ * On the DIB path the pixels are NEVER copied into our heap. A 4K screenshot is
+ * ~33 MB uncompressed and would alone blow the memory budget; DibSource points
+ * straight at the locked HGLOBAL and the encoder pulls scanlines through it.
+ *
+ * The design document named IWICImagingFactory::CreateBitmapFromMemory here.
+ * That call could not be used: its documentation does not promise to wrap the
+ * caller's buffer rather than copy it (the returned IWICBitmap is lockable and
+ * writable, i.e. it owns storage), and it cannot express a bottom-up DIB -- the
+ * usual shape for CF_DIB -- without a full-image vertical flip. DibSource gives
+ * true zero-copy reads and handles bottom-up rows and indexed palettes by
+ * mapping each destination scanline to its real source row.
+ */
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,14 +55,14 @@
 
 #include "clipboard.hpp"
 
+#include "win32_util.hpp"
+
+#include <cstring>
+
 #include <objbase.h>
 #include <objidl.h>
 #include <shlwapi.h>
 #include <wincodec.h>
-
-#include <cstring>
-
-#include "win32_util.hpp"
 
 namespace picopaste::win32 {
 namespace {
@@ -117,26 +144,51 @@ struct DibGeometry {
   Channel alpha{};
 };
 
-bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) noexcept {
+// Read and validate the BITMAPINFO header into `geo`. Outputs the header size,
+// the compression tag, and the palette entry count for the layout resolver.
+bool ParseDibHeader(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo, std::uint32_t* header_size,
+                    std::uint32_t* compression, std::uint32_t* clr_used) noexcept {
   if (dib == nullptr || geo == nullptr || dib_bytes < kBitmapInfoHeaderSize) {
     return false;
   }
-  const std::uint32_t header_size = ReadU32(dib);
-  if (header_size < kBitmapInfoHeaderSize || header_size > dib_bytes) {
+  *header_size = ReadU32(dib);
+  if (*header_size < kBitmapInfoHeaderSize || *header_size > dib_bytes) {
     return false;
   }
 
   const std::int32_t raw_height = ReadI32(dib + 8);
   geo->width = static_cast<UINT>(ReadI32(dib + 4));
   geo->bitcount = ReadU16(dib + 14);
-  const std::uint32_t compression = ReadU32(dib + 16);
-  const std::uint32_t clr_used = ReadU32(dib + 32);
+  *compression = ReadU32(dib + 16);
+  *clr_used = ReadU32(dib + 32);
   if (geo->width == 0u || raw_height == 0) {
     return false;
   }
   geo->top_down = raw_height < 0;
   geo->height = static_cast<UINT>(raw_height < 0 ? -raw_height : raw_height);
+  return true;
+}
 
+// Derive the shift/width of the red, green, blue and (optional) alpha channels.
+bool DescribeMasks(DibGeometry* geo, std::uint32_t red_mask, std::uint32_t green_mask, std::uint32_t blue_mask,
+                   std::uint32_t alpha_mask) noexcept {
+  if (DescribeChannel(red_mask, &geo->red) == false || DescribeChannel(green_mask, &geo->green) == false ||
+      DescribeChannel(blue_mask, &geo->blue) == false) {
+    return false;
+  }
+  if (alpha_mask != 0u) {
+    if (DescribeChannel(alpha_mask, &geo->alpha) == false) {
+      return false;
+    }
+    geo->has_alpha = true;
+  }
+  return true;
+}
+
+// Resolve the palette, colour masks and pixel offset for the header's layout.
+// Returns false for a layout we would decode incorrectly.
+bool ResolveDibLayout(const std::uint8_t* dib, std::uint32_t header_size, std::uint32_t compression,
+                      std::uint32_t clr_used, DibGeometry* geo, std::uint32_t* pixel_offset) noexcept {
   const bool bitfields = (compression == kBiBitfields);
 
   // Colour masks: present inside the header from BITMAPV4HEADER on, otherwise
@@ -172,7 +224,7 @@ bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) 
     geo->palette = dib + header_size;
   }
 
-  const std::uint32_t pixel_offset = header_size + trailing_mask_bytes + palette_bytes;
+  *pixel_offset = header_size + trailing_mask_bytes + palette_bytes;
 
   // Supported direct-colour layouts. BI_RGB 16/24/32 and BI_BITFIELDS 16/32.
   if (geo->indexed) {
@@ -192,7 +244,7 @@ bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) 
     }
   } else if (geo->bitcount == 16u && (compression == kBiRgb || bitfields)) {
     if (compression == kBiRgb) {
-      red_mask = 0x7C00u;   // X1R5G5B5
+      red_mask = 0x7C00u;  // X1R5G5B5
       green_mask = 0x03E0u;
       blue_mask = 0x001Fu;
     }
@@ -200,24 +252,27 @@ bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) 
     return false;
   }
 
-  if (geo->indexed == false) {
-    if (DescribeChannel(red_mask, &geo->red) == false ||
-        DescribeChannel(green_mask, &geo->green) == false ||
-        DescribeChannel(blue_mask, &geo->blue) == false) {
-      return false;
-    }
-    if (alpha_mask != 0u) {
-      if (DescribeChannel(alpha_mask, &geo->alpha) == false) {
-        return false;
-      }
-      geo->has_alpha = true;
-    }
+  if (geo->indexed == false && DescribeMasks(geo, red_mask, green_mask, blue_mask, alpha_mask) == false) {
+    return false;
+  }
+  return true;
+}
+
+bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) noexcept {
+  std::uint32_t header_size = 0;
+  std::uint32_t compression = 0;
+  std::uint32_t clr_used = 0;
+  if (ParseDibHeader(dib, dib_bytes, geo, &header_size, &compression, &clr_used) == false) {
+    return false;
   }
 
-  const std::uint64_t stride64 =
-      ((static_cast<std::uint64_t>(geo->width) * geo->bitcount + 31u) / 32u) * 4u;
-  const std::uint64_t needed =
-      static_cast<std::uint64_t>(pixel_offset) + stride64 * geo->height;
+  std::uint32_t pixel_offset = 0;
+  if (ResolveDibLayout(dib, header_size, compression, clr_used, geo, &pixel_offset) == false) {
+    return false;
+  }
+
+  const std::uint64_t stride64 = ((static_cast<std::uint64_t>(geo->width) * geo->bitcount + 31u) / 32u) * 4u;
+  const std::uint64_t needed = static_cast<std::uint64_t>(pixel_offset) + stride64 * geo->height;
   if (needed > dib_bytes) {
     return false;
   }
@@ -265,9 +320,7 @@ class DibSource final : public IWICBitmapSource {
     return E_NOINTERFACE;
   }
 
-  ULONG STDMETHODCALLTYPE AddRef() override {
-    return static_cast<ULONG>(InterlockedIncrement(&ref_count_));
-  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_count_)); }
 
   ULONG STDMETHODCALLTYPE Release() override {
     // Stack-allocated helper: this never deletes. It still ref-counts so the
@@ -307,8 +360,7 @@ class DibSource final : public IWICBitmapSource {
     return WINCODEC_ERR_PALETTEUNAVAILABLE;
   }
 
-  HRESULT STDMETHODCALLTYPE CopyPixels(const WICRect* rect, UINT stride, UINT buffer_size,
-                                       BYTE* buffer) override {
+  HRESULT STDMETHODCALLTYPE CopyPixels(const WICRect* rect, UINT stride, UINT buffer_size, BYTE* buffer) override {
     if (buffer == nullptr) {
       return E_INVALIDARG;
     }
@@ -319,8 +371,7 @@ class DibSource final : public IWICBitmapSource {
     if (area.Width <= 0 || area.Height <= 0) {
       return S_OK;
     }
-    if (area.X < 0 || area.Y < 0 ||
-        static_cast<UINT>(area.X + area.Width) > geo_.width ||
+    if (area.X < 0 || area.Y < 0 || static_cast<UINT>(area.X + area.Width) > geo_.width ||
         static_cast<UINT>(area.Y + area.Height) > geo_.height) {
       return E_INVALIDARG;
     }
@@ -425,8 +476,92 @@ class ComPtr final {
 };
 
 // ---------------------------------------------------------------------------
-// 3. Temp file helpers
+// 3. WIC PNG encode path and temp file helpers
 // ---------------------------------------------------------------------------
+
+// Initialise COM on this thread, create the WIC imaging factory and open
+// `out_path` as a writable stream. `com` must outlive the factory.
+Error OpenPngSink(ComApartment* com, ComPtr<IWICImagingFactory>* factory, ComPtr<IStream>* stream,
+                  const wchar_t* out_path) noexcept {
+  if (com->Init() == false) {
+    return Error::kPngEncodeFailed;
+  }
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+                                reinterpret_cast<void**>(factory->Put()));
+  if (FAILED(hr)) {
+    return Error::kPngEncodeFailed;
+  }
+  hr = SHCreateStreamOnFileEx(out_path, STGM_WRITE | STGM_CREATE, FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, stream->Put());
+  if (FAILED(hr)) {
+    return Error::kTempFileFailed;
+  }
+  return Error::kOk;
+}
+
+// Run the full PNG encode into `stream`, commit it, and report the byte count.
+// `error` distinguishes an encoder failure from a stream I/O failure.
+bool EncodeDibToStream(IWICImagingFactory* factory, IStream* stream, IWICBitmapSource* source, const DibGeometry& geo,
+                       std::uint64_t* produced, Error* error) noexcept {
+  ComPtr<IWICBitmapEncoder> encoder;
+  HRESULT hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.Put());
+  if (SUCCEEDED(hr)) {
+    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+  }
+  ComPtr<IWICBitmapFrameEncode> frame;
+  ComPtr<IPropertyBag2> frame_props;
+  if (SUCCEEDED(hr)) {
+    hr = encoder->CreateNewFrame(frame.Put(), frame_props.Put());
+  }
+  if (SUCCEEDED(hr)) {
+    hr = frame->Initialize(frame_props.Get());
+  }
+  if (SUCCEEDED(hr)) {
+    hr = frame->SetSize(geo.width, geo.height);
+  }
+
+  WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
+  if (SUCCEEDED(hr)) {
+    hr = frame->SetPixelFormat(&pixel_format);
+  }
+
+  ComPtr<IWICFormatConverter> converter;
+  IWICBitmapSource* write_source = source;
+  if (SUCCEEDED(hr) && IsEqualGUID(pixel_format, GUID_WICPixelFormat32bppBGRA) == 0) {
+    hr = factory->CreateFormatConverter(converter.Put());
+    if (SUCCEEDED(hr)) {
+      hr = converter->Initialize(source, pixel_format, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                 WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr)) {
+      write_source = converter.Get();
+    }
+  }
+  if (SUCCEEDED(hr)) {
+    hr = frame->WriteSource(write_source, nullptr);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = frame->Commit();
+  }
+  if (SUCCEEDED(hr)) {
+    hr = encoder->Commit();
+  }
+
+  if (FAILED(hr)) {
+    *error = Error::kPngEncodeFailed;
+    return false;
+  }
+  if (FAILED(stream->Commit(STGC_DEFAULT))) {
+    *error = Error::kTempFileFailed;
+    return false;
+  }
+  STATSTG stat{};
+  if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) {
+    *error = Error::kTempFileFailed;
+    return false;
+  }
+  *produced = stat.cbSize.QuadPart;
+  return true;
+}
 
 bool MakeTempPath(wchar_t* out, std::size_t out_chars) noexcept {
   wchar_t dir[MAX_PATH + 1] = {};
@@ -460,8 +595,7 @@ class TempFileGuard final {
 };
 
 bool WriteFileAll(const wchar_t* path, const void* data, std::size_t len) noexcept {
-  UniqueHandle file(CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_TEMPORARY, nullptr));
+  UniqueHandle file(CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr));
   if (file.valid() == false) {
     return false;
   }
@@ -486,7 +620,7 @@ bool WriteFileAll(const wchar_t* path, const void* data, std::size_t len) noexce
 // Retry over a bounded window well inside the "few hundred ms" budget; this is
 // a bounded operation wait, not an idle poll.
 bool OpenClipboardWithRetry(HWND owner) noexcept {
-  for (int attempt = 0; attempt < 10; ++attempt) {
+  for (std::int32_t attempt = 0; attempt < 10; ++attempt) {
     if (OpenClipboard(owner) != 0) {
       return true;
     }
@@ -500,8 +634,7 @@ struct ClipboardCloser final {
 };
 
 // Fill a CapturedImage from a finished temp file.
-void FillCaptured(CapturedImage* image, const wchar_t* wide_path, std::uint64_t bytes,
-                  const char* source) noexcept {
+void FillCaptured(CapturedImage* image, const wchar_t* wide_path, std::uint64_t bytes, const char* source) noexcept {
   image->bytes = bytes;
   (void)CopyWide(wide_path, image->wide_path, kCapturedWideChars);
   char utf8[kCapturedPathBytes] = {};
@@ -509,6 +642,51 @@ void FillCaptured(CapturedImage* image, const wchar_t* wide_path, std::uint64_t 
     image->path_utf8.assign(osp::TruncateToCapacity, utf8);
   }
   image->source.assign(osp::TruncateToCapacity, source);
+}
+
+// Fast path: a registered "PNG" format carries ready-to-upload bytes, so the
+// block is copied to the temp file without re-encoding.
+Result<CapturedImage> CaptureRegisteredPng(HANDLE data, const Config& cfg, const wchar_t* temp_path) noexcept {
+  const SIZE_T size = GlobalSize(data);
+  if (size == 0 || size > cfg.max_image_bytes) {
+    return Result<CapturedImage>::error(size == 0 ? Error::kClipboardLockFailed : Error::kImageTooLarge);
+  }
+  const void* locked = GlobalLock(data);
+  if (locked == nullptr) {
+    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
+  }
+  const bool wrote = WriteFileAll(temp_path, locked, size);
+  GlobalUnlock(data);
+  if (wrote == false) {
+    return Result<CapturedImage>::error(Error::kTempFileFailed);
+  }
+  CapturedImage image{};
+  FillCaptured(&image, temp_path, size, "PNG");
+  return Result<CapturedImage>::success(image);
+}
+
+// Fallback: unpack and encode the DIB. The DIB is read in place -- no heap copy
+// of the uncompressed pixels.
+Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path, bool has_dibv5) noexcept {
+  const UINT dib_format = has_dibv5 ? CF_DIBV5 : CF_DIB;
+  HANDLE data = GetClipboardData(dib_format);
+  if (data == nullptr) {
+    return Result<CapturedImage>::error(Error::kNoImageInClipboard);
+  }
+  const SIZE_T size = GlobalSize(data);
+  if (size == 0) {
+    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
+  }
+  const std::uint8_t* locked = static_cast<const std::uint8_t*>(GlobalLock(data));
+  if (locked == nullptr) {
+    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
+  }
+  Result<CapturedImage> encoded = EncodeDibToPngFile(locked, size, temp_path, cfg.max_image_bytes);
+  GlobalUnlock(data);
+  if (encoded.has_value()) {
+    encoded.value().source.assign(osp::TruncateToCapacity, has_dibv5 ? "DIBV5" : "DIB");
+  }
+  return encoded;
 }
 
 }  // namespace
@@ -527,100 +705,34 @@ ClipboardFormats InspectClipboardFormats() noexcept {
   return formats;
 }
 
-Result<CapturedImage> EncodeDibToPngFile(const std::uint8_t* dib, std::size_t dib_bytes,
-                                         const wchar_t* out_path,
+Result<CapturedImage> EncodeDibToPngFile(const std::uint8_t* dib, std::size_t dib_bytes, const wchar_t* out_path,
                                          std::uint32_t max_bytes) noexcept {
-  if (dib == nullptr || out_path == nullptr) {
-    return Result<CapturedImage>::error(Error::kPngEncodeFailed);
-  }
   DibGeometry geo{};
-  if (ParseDib(dib, dib_bytes, &geo) == false || geo.pixels == nullptr) {
+  if (dib == nullptr || out_path == nullptr || ParseDib(dib, dib_bytes, &geo) == false || geo.pixels == nullptr) {
     return Result<CapturedImage>::error(Error::kPngEncodeFailed);
   }
 
   TempFileGuard temp_guard(const_cast<wchar_t*>(out_path));
 
   ComApartment com{};
-  if (com.Init() == false) {
-    return Result<CapturedImage>::error(Error::kPngEncodeFailed);
-  }
-
   ComPtr<IWICImagingFactory> factory;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_IWICImagingFactory, reinterpret_cast<void**>(factory.Put()));
-  if (FAILED(hr)) {
-    return Result<CapturedImage>::error(Error::kPngEncodeFailed);
-  }
-
   ComPtr<IStream> stream;
-  hr = SHCreateStreamOnFileEx(out_path, STGM_WRITE | STGM_CREATE, FILE_ATTRIBUTE_NORMAL, TRUE,
-                              nullptr, stream.Put());
-  if (FAILED(hr)) {
-    DeleteFileW(out_path);
-    return Result<CapturedImage>::error(Error::kTempFileFailed);
+  const Error sink_error = OpenPngSink(&com, &factory, &stream, out_path);
+  if (sink_error != Error::kOk) {
+    return Result<CapturedImage>::error(sink_error);
   }
 
-  // Declared before the COM objects so its destruction (reverse order) happens
-  // after every encoder/frame/converter that may hold a reference to it. It is a
-  // stack object and non-owning: this is the zero-copy DIB reader.
+  // Non-owning, stack-allocated zero-copy reader: the encoder pulls scanlines
+  // straight out of the locked DIB. It outlives every encoder object, because
+  // those live only inside EncodeDibToStream.
   DibSource source;
   source.Init(geo);
 
-  ComPtr<IWICBitmapEncoder> encoder;
-  hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.Put());
-  if (SUCCEEDED(hr)) {
-    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+  std::uint64_t produced = 0;
+  Error encode_error = Error::kOk;
+  if (EncodeDibToStream(factory.Get(), stream.Get(), &source, geo, &produced, &encode_error) == false) {
+    return Result<CapturedImage>::error(encode_error);
   }
-  ComPtr<IWICBitmapFrameEncode> frame;
-  ComPtr<IPropertyBag2> frame_props;
-  if (SUCCEEDED(hr)) {
-    hr = encoder->CreateNewFrame(frame.Put(), frame_props.Put());
-  }
-  if (SUCCEEDED(hr)) {
-    hr = frame->Initialize(frame_props.Get());
-  }
-  if (SUCCEEDED(hr)) {
-    hr = frame->SetSize(geo.width, geo.height);
-  }
-
-  WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
-  if (SUCCEEDED(hr)) {
-    hr = frame->SetPixelFormat(&pixel_format);
-  }
-
-  ComPtr<IWICFormatConverter> converter;
-  IWICBitmapSource* write_source = &source;
-  if (SUCCEEDED(hr) && IsEqualGUID(pixel_format, GUID_WICPixelFormat32bppBGRA) == 0) {
-    hr = factory->CreateFormatConverter(converter.Put());
-    if (SUCCEEDED(hr)) {
-      hr = converter->Initialize(&source, pixel_format, WICBitmapDitherTypeNone, nullptr, 0.0,
-                                 WICBitmapPaletteTypeCustom);
-    }
-    if (SUCCEEDED(hr)) {
-      write_source = converter.Get();
-    }
-  }
-  if (SUCCEEDED(hr)) {
-    hr = frame->WriteSource(write_source, nullptr);
-  }
-  if (SUCCEEDED(hr)) {
-    hr = frame->Commit();
-  }
-  if (SUCCEEDED(hr)) {
-    hr = encoder->Commit();
-  }
-  if (FAILED(hr)) {
-    return Result<CapturedImage>::error(Error::kPngEncodeFailed);
-  }
-
-  if (FAILED(stream->Commit(STGC_DEFAULT))) {
-    return Result<CapturedImage>::error(Error::kTempFileFailed);
-  }
-  STATSTG stat{};
-  if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) {
-    return Result<CapturedImage>::error(Error::kTempFileFailed);
-  }
-  const std::uint64_t produced = stat.cbSize.QuadPart;
   if (produced > max_bytes) {
     return Result<CapturedImage>::error(Error::kImageTooLarge);
   }
@@ -653,53 +765,21 @@ Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept {
 
   // Fast path: a registered "PNG" format carries ready-to-upload bytes.
   if (formats.has_png) {
-    const UINT png_format = RegisterClipboardFormatW(L"PNG");
-    HANDLE data = GetClipboardData(png_format);
-    if (data != nullptr) {
-      const SIZE_T size = GlobalSize(data);
-      if (size == 0) {
-        return Result<CapturedImage>::error(Error::kClipboardLockFailed);
+    HANDLE png_data = GetClipboardData(RegisterClipboardFormatW(L"PNG"));
+    if (png_data != nullptr) {
+      Result<CapturedImage> png = CaptureRegisteredPng(png_data, cfg, temp_path);
+      if (png.has_value()) {
+        temp_guard.Keep();
       }
-      if (size > cfg.max_image_bytes) {
-        return Result<CapturedImage>::error(Error::kImageTooLarge);
-      }
-      const void* locked = GlobalLock(data);
-      if (locked == nullptr) {
-        return Result<CapturedImage>::error(Error::kClipboardLockFailed);
-      }
-      const bool wrote = WriteFileAll(temp_path, locked, size);
-      GlobalUnlock(data);
-      if (wrote == false) {
-        return Result<CapturedImage>::error(Error::kTempFileFailed);
-      }
-      temp_guard.Keep();
-      CapturedImage image{};
-      FillCaptured(&image, temp_path, size, "PNG");
-      return Result<CapturedImage>::success(image);
+      return png;
     }
   }
 
   // Fallback: unpack and encode the DIB. The DIB is read in place -- no heap
   // copy of the uncompressed pixels.
-  const UINT dib_format = formats.has_dibv5 ? CF_DIBV5 : CF_DIB;
-  HANDLE data = GetClipboardData(dib_format);
-  if (data == nullptr) {
-    return Result<CapturedImage>::error(Error::kNoImageInClipboard);
-  }
-  const SIZE_T size = GlobalSize(data);
-  if (size == 0) {
-    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
-  }
-  const std::uint8_t* locked = static_cast<const std::uint8_t*>(GlobalLock(data));
-  if (locked == nullptr) {
-    return Result<CapturedImage>::error(Error::kClipboardLockFailed);
-  }
-  Result<CapturedImage> encoded =
-      EncodeDibToPngFile(locked, size, temp_path, cfg.max_image_bytes);
-  GlobalUnlock(data);
+  Result<CapturedImage> encoded = CaptureDibFallback(cfg, temp_path, formats.has_dibv5);
   if (encoded.has_value()) {
     temp_guard.Keep();
-    encoded.value().source.assign(osp::TruncateToCapacity, formats.has_dibv5 ? "DIBV5" : "DIB");
   }
   return encoded;
 }

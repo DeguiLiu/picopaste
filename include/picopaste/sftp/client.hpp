@@ -1,21 +1,48 @@
-// picopaste — SFTP v3 client surface.
-//
-// This is the single owner of the SFTP channel: every wire-protocol operation
-// (INIT, REALPATH, MKDIR, OPEN/READ/WRITE/CLOSE, OPENDIR/READDIR, STAT, RENAME,
-// REMOVE) goes through one request-id counter and one frame codec, both private
-// to this class. No other layer speaks the wire protocol or holds an id.
-//
-// Implemented in src/core/sftp/client.cpp. Synchronous and single-threaded by
-// contract: callers serialize access (the upload worker is the only caller),
-// so no internal locking is needed.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file client.hpp
+ * @brief SFTP v3 client surface: the single owner of the channel.
+ *
+ * This is the single owner of the SFTP channel: every wire-protocol operation
+ * (INIT, REALPATH, MKDIR, OPEN/READ/WRITE/CLOSE, OPENDIR/READDIR, STAT, RENAME,
+ * REMOVE) goes through one request-id counter and one frame codec, both private
+ * to this class. No other layer speaks the wire protocol or holds an id.
+ *
+ * Implemented in src/core/sftp/client.cpp. Synchronous and single-threaded by
+ * contract: callers serialize access (the upload worker is the only caller),
+ * so no internal locking is needed.
+ */
 #pragma once
 
-#include <cstdint>
-
+#include "osp/vocabulary.hpp"
 #include "picopaste/error.hpp"
 #include "picopaste/sftp/protocol.hpp"
 #include "picopaste/sftp/stream.hpp"
-#include "osp/vocabulary.hpp"
+
+#include <cstdint>
 
 namespace picopaste::sftp {
 
@@ -77,10 +104,15 @@ struct UploadListing {
   bool dir_missing = false;  // OPENDIR answered NO_SUCH_FILE: nothing to do.
 };
 
-// Full-match test for our own upload filename. `name` need not be
-// NUL-terminated; `len` bytes are examined and the pattern must consume all of
-// them. Calendar fields are range-checked so a foreign `clip-...` file with an
-// impossible date is not mistaken for ours.
+/**
+ * @brief Full-match test for our own upload filename.
+ * @param name Candidate name; need not be NUL-terminated.
+ * @param len Bytes of `name` to examine; the pattern must consume all of them.
+ * @return True only for `clip-YYYYMMDD-HHMMSS-<hex>.png`.
+ *
+ * Calendar fields are range-checked so a foreign `clip-...` file with an
+ * impossible date is not mistaken for ours.
+ */
 bool MatchesUploadName(const char* name, std::uint32_t len) noexcept;
 
 class Client {
@@ -93,64 +125,129 @@ class Client {
   Client(Client&&) = delete;
   Client& operator=(Client&&) = delete;
 
-  // `stream` must outlive the client. Not owned.
+  /**
+   * @brief Construct over a byte stream.
+   * @param stream Channel to use; must outlive the client. Not owned.
+   */
   explicit Client(ByteStream stream) noexcept : stream_(stream) {}
 
-  // SSH_FXP_INIT / SSH_FXP_VERSION. Must be the first call.
-  // Fails with kSftpInitFailed when the peer does not answer v3 — which is
-  // also how a remote without the sftp subsystem surfaces here.
+  /**
+   * @brief SSH_FXP_INIT / SSH_FXP_VERSION handshake; must be the first call.
+   * @return kSftpInitFailed when the peer does not answer v3 — which is also
+   *         how a remote without the sftp subsystem surfaces here.
+   */
   Status Init() noexcept;
 
-  // Canonicalize `path` (use "." for the subsystem's initial directory, which
-  // OpenSSH sets to the user's home). Replaces the upstream HOME probe: same
-  // connection, no extra handshake, no shell, and no SSH banner to filter.
+  /**
+   * @brief Canonicalize a remote path.
+   * @param path Remote path; use "." for the subsystem's initial directory,
+   *        which OpenSSH sets to the user's home.
+   * @return The resolved path, or kRealpathFailed / kSftpProtocolError.
+   *
+   * Replaces the upstream HOME probe: same connection, no extra handshake, no
+   * shell, and no SSH banner to filter.
+   */
   Result<Path> Realpath(const char* path) noexcept;
 
-  // Create one directory level. `FxStatus::kFailure` maps to success when the
-  // path already exists — OpenSSH returns FAILURE (not OK) for an existing
-  // directory, verified locally. Missing parents still fail.
+  /**
+   * @brief Create one directory level.
+   * @param path Directory to create.
+   * @return kMkdirFailed for anything but success or an already-existing path.
+   *
+   * OpenSSH returns FAILURE (not OK) for an existing directory, verified
+   * locally; that status is mapped to success. Missing parents still fail.
+   */
   Status Mkdir(const char* path) noexcept;
 
-  // Create every missing level of `path` (mkdir -p semantics), one level at a
-  // time. Tolerates already-existing levels.
+  /**
+   * @brief Create every missing level of `path` (mkdir -p semantics).
+   * @param path Directory tree to create.
+   * @return kMkdirFailed if any level cannot be created.
+   *
+   * One level at a time; tolerates already-existing levels.
+   */
   Status MkdirAll(const char* path) noexcept;
 
-  // Stream `local_path` to `remote_path`: OPEN(WRITE|CREAT|TRUNC) -> WRITE
-  // chunks -> CLOSE -> STAT. Fails with kSizeMismatch if the remote byte count
-  // differs from the local one, in which case the caller must NOT publish the
-  // file (no RENAME has happened yet).
+  /**
+   * @brief Stream `local_path` to `remote_path`.
+   * @param remote_path Destination on the server.
+   * @param local_path Source file to read.
+   * @return kSizeMismatch if the remote byte count differs from the local one,
+   *         in which case the caller must NOT publish the file (no RENAME has
+   *         happened yet).
+   *
+   * OPEN(WRITE|CREAT|TRUNC) -> WRITE chunks -> CLOSE -> STAT.
+   */
   Status UploadFile(const char* remote_path, const char* local_path) noexcept;
 
-  // Size from SSH_FXP_STAT. Parses the ATTRS bitmask rather than assuming a
-  // fixed layout; kStatFailed if the server omitted kAttrSize.
+  /**
+   * @brief Read a file's size via SSH_FXP_STAT.
+   * @param path Remote file to stat.
+   * @return The size, or kStatFailed if the server omitted kAttrSize.
+   *
+   * Parses the ATTRS bitmask rather than assuming a fixed layout.
+   */
   Result<std::uint64_t> StatSize(const char* path) noexcept;
 
-  // SSH_FXP_RENAME. NOT overwrite-capable on OpenSSH: renaming onto an
-  // existing path fails with kFailure. Callers publish under fresh unique
-  // names precisely so this cannot happen.
+  /**
+   * @brief SSH_FXP_RENAME.
+   * @param from Existing path.
+   * @param to New path; must not already exist.
+   * @return kRenameFailed on any non-OK status.
+   *
+   * NOT overwrite-capable on OpenSSH: renaming onto an existing path fails
+   * with kFailure. Callers publish under fresh unique names precisely so this
+   * cannot happen.
+   */
   Status Rename(const char* from, const char* to) noexcept;
 
-  // SSH_FXP_REMOVE. A NO_SUCH_FILE reply is success: "already gone" is the
-  // desired end state for a cleanup, so a pass racing another cleanup does not
-  // report failure for a file that has already vanished.
+  /**
+   * @brief SSH_FXP_REMOVE.
+   * @param path Remote file to delete.
+   * @return kRemoveFailed on any non-tolerated status.
+   *
+   * A NO_SUCH_FILE reply is success: "already gone" is the desired end state
+   * for a cleanup, so a pass racing another cleanup does not report failure
+   * for a file that has already vanished.
+   */
   Status Remove(const char* path) noexcept;
 
-  // OPENDIR -> READDIR* -> CLOSE. Materialises a bounded listing of upload
-  // names. A missing directory yields a successful listing with dir_missing
-  // set, not an error. Hitting kMaxListedEntries sets truncated and stops.
+  /**
+   * @brief Materialise a bounded listing of our upload names.
+   * @param dir Remote directory to list.
+   * @return The listing; a missing directory yields success with dir_missing
+   *         set, not an error.
+   *
+   * OPENDIR -> READDIR* -> CLOSE. Hitting kMaxListedEntries sets truncated and
+   * stops.
+   */
   Result<UploadListing> ListDir(const char* dir) noexcept;
 
-  // Read a remote file into caller-owned memory. `buffer` must hold
-  // `capacity` bytes; `size` receives the byte count actually read. A missing
-  // file is not an error: `size` is 0 and `missing` is set. If the file is
-  // larger than `capacity` the read stops with kBufferTooSmall rather than
-  // silently truncating, and the handle is closed.
-  Status ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity,
-                  std::uint32_t& size, bool& missing) noexcept;
+  /**
+   * @brief Read a remote file into caller-owned memory.
+   * @param path Remote file to read.
+   * @param buffer Destination; must hold `capacity` bytes.
+   * @param capacity Size of `buffer`.
+   * @param size Receives the byte count actually read.
+   * @param missing Set when the file does not exist (not an error).
+   * @return kBufferTooSmall if the file is larger than `capacity`, in which
+   *         case nothing is truncated and the handle is closed.
+   *
+   * A missing file is not an error: `size` is 0 and `missing` is set.
+   */
+  Status ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity, std::uint32_t& size,
+                  bool& missing) noexcept;
 
-  // OPEN(WRITE|CREAT|TRUNC) -> WRITE* -> CLOSE over caller-owned bytes. The
-  // caller is responsible for backup/replace semantics; this writes exactly
-  // the bytes it is given. `length` of 0 creates an empty file.
+  /**
+   * @brief Write caller-owned bytes to a remote file.
+   * @param path Destination.
+   * @param bytes Source bytes.
+   * @param length Byte count; 0 creates an empty file.
+   * @return kWriteFailed if a chunk is not acknowledged.
+   *
+   * OPEN(WRITE|CREAT|TRUNC) -> WRITE* -> CLOSE. The caller is responsible for
+   * backup/replace semantics; this writes exactly the bytes it is given.
+   */
   Status WriteFile(const char* path, const std::uint8_t* bytes, std::uint32_t length) noexcept;
 
   // True once Init() has completed against a v3 peer.
@@ -163,8 +260,8 @@ class Client {
   // when the server answers NO_SUCH_FILE (a normal state for a first write or
   // a not-yet-created directory). Shared by every open-style request so the
   // HANDLE decoding exists once.
-  Status OpenHandle(Pkt request, const char* path, const void* extra, std::uint32_t extra_len,
-                    std::uint8_t* handle, std::uint32_t& handle_len, bool& missing) noexcept;
+  Status OpenHandle(Pkt request, const char* path, const void* extra, std::uint32_t extra_len, std::uint8_t* handle,
+                    std::uint32_t& handle_len, bool& missing) noexcept;
 
   // SSH_FXP_CLOSE. Same packet for file and directory handles.
   Status CloseHandle(const std::uint8_t* handle, std::uint32_t handle_len) noexcept;

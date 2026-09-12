@@ -1,17 +1,44 @@
-// picopaste — SFTP v3 client (see include/picopaste/sftp/client.hpp).
-//
-// The single owner of the channel: every request is emitted and every reply
-// parsed here, against one request-id counter and one frame codec. Synchronous,
-// single-threaded by contract. Scratch is per-instance (tx_/rx_): a 64 KB
-// outbound chunk plus a 64 KB inbound frame, reused for every request, never
-// heap-allocated. Uploading a file streams straight from the local file
-// descriptor into the outbound WRITE payload.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file client.cpp
+ * @brief SFTP v3 client implementation.
+ *
+ * The single owner of the channel: every request is emitted and every reply
+ * parsed here, against one request-id counter and one frame codec. Synchronous,
+ * single-threaded by contract. Scratch is per-instance (tx_/rx_): a 64 KB
+ * outbound chunk plus a 64 KB inbound frame, reused for every request, never
+ * heap-allocated. Uploading a file streams straight from the local file
+ * descriptor into the outbound WRITE payload.
+ */
 #include "picopaste/sftp/client.hpp"
+
+#include "packet.hpp"
 
 #include <cerrno>
 #include <cstring>
-
-#include "packet.hpp"
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -50,27 +77,39 @@ inline constexpr std::uint32_t kWriteDataOffset(std::uint32_t handle_len) noexce
 // ---------------------------------------------------------------------------
 
 #if defined(_WIN32)
-int LocalOpen(const char* path) noexcept { return ::_open(path, _O_RDONLY | _O_BINARY); }
-int LocalClose(int fd) noexcept { return ::_close(fd); }
-int LocalFstat(int fd, StatBuf* st) noexcept { return ::_fstat64(fd, st); }
-long long LocalRead(int fd, void* buf, std::size_t len) noexcept {
-  return static_cast<long long>(::_read(fd, buf, static_cast<unsigned int>(len)));
+std::int32_t LocalOpen(const char* path) noexcept {
+  return ::_open(path, _O_RDONLY | _O_BINARY);
+}
+std::int32_t LocalClose(std::int32_t fd) noexcept {
+  return ::_close(fd);
+}
+std::int32_t LocalFstat(std::int32_t fd, StatBuf* st) noexcept {
+  return ::_fstat64(fd, st);
+}
+std::int64_t LocalRead(std::int32_t fd, void* buf, std::size_t len) noexcept {
+  return static_cast<std::int64_t>(::_read(fd, buf, static_cast<unsigned int>(len)));
 }
 #else
-int LocalOpen(const char* path) noexcept { return ::open(path, O_RDONLY); }
-int LocalClose(int fd) noexcept { return ::close(fd); }
-int LocalFstat(int fd, StatBuf* st) noexcept { return ::fstat(fd, st); }
-long long LocalRead(int fd, void* buf, std::size_t len) noexcept {
-  return static_cast<long long>(::read(fd, buf, len));
+std::int32_t LocalOpen(const char* path) noexcept {
+  return ::open(path, O_RDONLY);
+}
+std::int32_t LocalClose(std::int32_t fd) noexcept {
+  return ::close(fd);
+}
+std::int32_t LocalFstat(std::int32_t fd, StatBuf* st) noexcept {
+  return ::fstat(fd, st);
+}
+std::int64_t LocalRead(std::int32_t fd, void* buf, std::size_t len) noexcept {
+  return static_cast<std::int64_t>(::read(fd, buf, len));
 }
 #endif
 
 // Reads until `len` bytes are read or EOF. Returns the number of bytes read
 // (may be short only at EOF), or -1 on a hard error.
-long long ReadFull(int fd, std::uint8_t* dst, std::size_t len) noexcept {
+std::int64_t ReadFull(std::int32_t fd, std::uint8_t* dst, std::size_t len) noexcept {
   std::size_t total = 0u;
   while (total < len) {
-    const long long n = LocalRead(fd, dst + total, len - total);
+    const std::int64_t n = LocalRead(fd, dst + total, len - total);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -82,7 +121,7 @@ long long ReadFull(int fd, std::uint8_t* dst, std::size_t len) noexcept {
     }
     total += static_cast<std::size_t>(n);
   }
-  return static_cast<long long>(total);
+  return static_cast<std::int64_t>(total);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,9 +204,13 @@ Error ReadStatus(ByteStream& s, std::uint8_t* rx, std::uint32_t rx_cap, std::uin
 // Upload-name pattern (declared in client.hpp; the listing filter).
 // ---------------------------------------------------------------------------
 
-bool IsDigit(char c) noexcept { return (c >= '0') && (c <= '9'); }
+bool IsDigit(char c) noexcept {
+  return (c >= '0') && (c <= '9');
+}
 
-bool IsLowerHex(char c) noexcept { return IsDigit(c) || ((c >= 'a') && (c <= 'f')); }
+bool IsLowerHex(char c) noexcept {
+  return IsDigit(c) || ((c >= 'a') && (c <= 'f'));
+}
 
 std::uint32_t Dec2(const char* p) noexcept {
   return (static_cast<std::uint32_t>(p[0] - '0') * 10u) + static_cast<std::uint32_t>(p[1] - '0');
@@ -491,7 +534,7 @@ Status Client::MkdirAll(const char* path) noexcept {
 // ---------------------------------------------------------------------------
 
 Status Client::UploadFile(const char* remote_path, const char* local_path) noexcept {
-  const int fd = LocalOpen(local_path);
+  const std::int32_t fd = LocalOpen(local_path);
   if (fd < 0) {
     return Status::error(Error::kOpenFailed);
   }
@@ -523,7 +566,7 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
   std::uint64_t offset = 0u;
   bool eof = false;
   while (!eof) {
-    const long long n = ReadFull(fd, tx_ + data_off, kWriteChunkBytes);
+    const std::int64_t n = ReadFull(fd, tx_ + data_off, kWriteChunkBytes);
     if (n < 0) {
       return done(Status::error(Error::kWriteFailed));
     }
@@ -572,8 +615,8 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
   return done(Status::success());
 }
 
-Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity,
-                        std::uint32_t& size, bool& missing) noexcept {
+Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity, std::uint32_t& size,
+                        bool& missing) noexcept {
   size = 0u;
   missing = false;
   if ((path == nullptr) || ((buffer == nullptr) && (capacity > 0u))) {
@@ -585,8 +628,7 @@ Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t ca
   std::uint8_t extras[8];
   PutBe32(extras, kFxRead);
   PutBe32(extras + 4u, 0u); /* empty ATTRS */
-  const Status opened =
-      OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
+  const Status opened = OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
   if (!opened) {
     return opened;
   }
@@ -603,9 +645,7 @@ Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t ca
     const std::uint32_t remaining = capacity - size;
     /* When the buffer is full, ask for one byte so an oversized file is
        detected instead of silently truncated. */
-    const std::uint32_t ask = (remaining == 0u)
-                                  ? 1u
-                                  : ((remaining < kReadChunkBytes) ? remaining : kReadChunkBytes);
+    const std::uint32_t ask = (remaining == 0u) ? 1u : ((remaining < kReadChunkBytes) ? remaining : kReadChunkBytes);
     const std::uint32_t read_id = next_id_++;
     BufferWriter w(tx_, sizeof(tx_));
     (void)w.WriteU32(read_id);
@@ -660,8 +700,7 @@ Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t ca
   return CloseHandle(handle, handle_len);
 }
 
-Status Client::WriteFile(const char* path, const std::uint8_t* bytes,
-                         std::uint32_t length) noexcept {
+Status Client::WriteFile(const char* path, const std::uint8_t* bytes, std::uint32_t length) noexcept {
   if ((path == nullptr) || ((bytes == nullptr) && (length > 0u))) {
     return Status::error(Error::kWriteFailed);
   }
@@ -673,8 +712,7 @@ Status Client::WriteFile(const char* path, const std::uint8_t* bytes,
   std::uint8_t handle[kMaxHandleBytes];
   std::uint32_t handle_len = 0u;
   bool missing = false;
-  const Status opened =
-      OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
+  const Status opened = OpenHandle(Pkt::kOpen, path, extras, sizeof(extras), handle, handle_len, missing);
   if (!opened) {
     return opened;
   }
@@ -826,8 +864,7 @@ Result<UploadListing> Client::ListDir(const char* dir) noexcept {
   std::uint8_t handle[kMaxHandleBytes];
   std::uint32_t handle_len = 0u;
   bool missing = false;
-  const Status opened = OpenHandle(Pkt::kOpendir, dir, /*extra=*/nullptr, 0u, handle, handle_len,
-                                   missing);
+  const Status opened = OpenHandle(Pkt::kOpendir, dir, /*extra=*/nullptr, 0u, handle, handle_len, missing);
   if (!opened) {
     return Result<UploadListing>::error(opened.get_error());
   }
@@ -897,8 +934,7 @@ Result<UploadListing> Client::ListDir(const char* dir) noexcept {
       const char* longname = nullptr;
       std::uint32_t longname_len = 0u;
       AttrsInfo attrs{};
-      if (!r.ReadString(fname, fname_len) || !r.ReadString(longname, longname_len) ||
-          !ParseAttrs(r, attrs)) {
+      if (!r.ReadString(fname, fname_len) || !r.ReadString(longname, longname_len) || !ParseAttrs(r, attrs)) {
         err = Error::kSftpProtocolError;
         break;
       }
@@ -939,37 +975,44 @@ Result<UploadListing> Client::ListDir(const char* dir) noexcept {
 // Upload-name pattern
 // ---------------------------------------------------------------------------
 
-bool MatchesUploadName(const char* name, std::uint32_t len) noexcept {
-  /* clip-YYYYMMDD-HHMMSS-<hex>.png */
-  constexpr std::uint32_t kMinLen = 5u + 8u + 1u + 6u + 1u + 1u + 4u;  /* 26 */
-  if ((name == nullptr) || (len < kMinLen) || (len > kMaxUploadNameBytes)) {
-    return false;
+namespace {
+
+bool AllDigits(const char* s, std::uint32_t first, std::uint32_t last) noexcept {
+  for (std::uint32_t i = first; i <= last; ++i) {
+    if (!IsDigit(s[i])) {
+      return false;
+    }
   }
+  return true;
+}
+
+// "clip-" plus the two timestamp separators and their digit fields.
+bool HasUploadPrefix(const char* name) noexcept {
   if (std::memcmp(name, "clip-", 5u) != 0) {
     return false;
   }
   if ((name[13] != '-') || (name[20] != '-')) {
     return false;
   }
-  for (std::uint32_t i = 5u; i <= 12u; ++i) {  /* YYYYMMDD */
-    if (!IsDigit(name[i])) {
-      return false;
-    }
-  }
-  for (std::uint32_t i = 14u; i <= 19u; ++i) {  /* HHMMSS */
-    if (!IsDigit(name[i])) {
-      return false;
-    }
-  }
+  return AllDigits(name, 5u, 12u) && AllDigits(name, 14u, 19u);
+}
+
+// Month/day/hour/minute/second must be in range, so a name that merely looks
+// like a timestamp is still rejected.
+bool HasUploadTimestamp(const char* name) noexcept {
   const std::uint32_t month = Dec2(name + 9u);
   const std::uint32_t day = Dec2(name + 11u);
   const std::uint32_t hour = Dec2(name + 14u);
   const std::uint32_t minute = Dec2(name + 16u);
   const std::uint32_t second = Dec2(name + 18u);
-  if ((month < 1u) || (month > 12u) || (day < 1u) || (day > 31u) || (hour > 23u) ||
-      (minute > 59u) || (second > 59u)) {
+  if ((month < 1u) || (month > 12u) || (day < 1u) || (day > 31u) || (hour > 23u) || (minute > 59u) || (second > 59u)) {
     return false;
   }
+  return true;
+}
+
+// ".png" followed by a non-empty lowercase-hex suffix.
+bool HasUploadTail(const char* name, std::uint32_t len) noexcept {
   const std::uint32_t suffix = len - 4u;
   if (std::memcmp(name + suffix, ".png", 4u) != 0) {
     return false;
@@ -982,6 +1025,20 @@ bool MatchesUploadName(const char* name, std::uint32_t len) noexcept {
     if (!IsLowerHex(name[i])) {
       return false;
     }
+  }
+  return true;
+}
+
+}  // namespace
+
+bool MatchesUploadName(const char* name, std::uint32_t len) noexcept {
+  /* clip-YYYYMMDD-HHMMSS-<hex>.png */
+  constexpr std::uint32_t kMinLen = 5u + 8u + 1u + 6u + 1u + 1u + 4u; /* 26 */
+  if ((name == nullptr) || (len < kMinLen) || (len > kMaxUploadNameBytes)) {
+    return false;
+  }
+  if (!HasUploadPrefix(name) || !HasUploadTimestamp(name) || !HasUploadTail(name, len)) {
+    return false;
   }
   return true;
 }

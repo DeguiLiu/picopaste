@@ -28,32 +28,33 @@
 
 // windows.h pulls in shellapi.h only when WIN32_LEAN_AND_MEAN is undefined, and
 // win32_util.hpp defines it, so CommandLineToArgvW needs this explicitly.
-#include <shellapi.h>
+#include "clip.h"  // vendored dacap/clip: the same set_text path inject.cpp uses
+#include "clipboard.hpp"
+#include "hotkey.hpp"
+#include "inject.hpp"
+#include "selftest.hpp"
+#include "single_instance.hpp"
+#include "stream_win32.hpp"
+#include "tray.hpp"
 
-#include <atomic>
+#include "../../core/app/lifecycle.hpp"        // picopaste::Lifecycle
+#include "../../core/app/upload_pipeline.hpp"  // picopaste::UploadPipeline
+#include "picopaste/config.hpp"
+
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
+
+#include <atomic>
 #include <new>
+#include <shellapi.h>
 #include <string>
 #include <thread>
 #include <type_traits>
-
-#include "clip.h"  // vendored dacap/clip: the same set_text path inject.cpp uses
-
-#include "../../core/app/lifecycle.hpp"       // picopaste::Lifecycle
-#include "../../core/app/upload_pipeline.hpp"  // picopaste::UploadPipeline
-#include "clipboard.hpp"
-#include "hotkey.hpp"
-#include "inject.hpp"
-#include "picopaste/config.hpp"
-#include "selftest.hpp"
-#include "single_instance.hpp"
-#include "stream_win32.hpp"
-#include "tray.hpp"
 
 namespace {
 
@@ -73,8 +74,41 @@ constexpr std::int32_t kExitOk = 0;
 constexpr std::int32_t kExitSelftestFailed = 1;
 
 // One hotkey id; the WM_HOTKEY this produces is dispatched directly by the
-// message loop (never by a window proc).
-constexpr int kHotkeyId = 1;
+// message loop (never by a window proc). The low-level hook re-posts the same
+// message, so the loop needs no second trigger path.
+constexpr std::int32_t kHotkeyId = 1;
+
+// Thread-timer id for the in-flight deadline probe. SetTimer's hwnd == NULL
+// form associates the timer with this thread and posts WM_TIMER with hwnd ==
+// NULL, so it never touches the tray window another worker owns. The id is only
+// a preference: the value SetTimer actually returns is what KillTimer takes.
+constexpr UINT_PTR kUploadTimerId = 1;
+
+// Tick span for that probe, derived from upload_timeout_ms.
+//
+// The worker is blocked inside a step while an upload is in flight, so it
+// cannot run its own loop; this main-thread timer is the only thing that can
+// notice a silent peer. It is armed on upload start and killed on upload end,
+// which keeps the promise that idle CPU is exactly zero. A quarter of the
+// deadline keeps detection proportional to it -- a 30 s deadline is probed
+// every 1 s, never detected at 60 s -- while the bounds keep a sub-second
+// deadline from being polled absurdly fast and a long one at most 1 Hz.
+constexpr std::uint32_t kUploadTickMinMs = 250u;
+constexpr std::uint32_t kUploadTickMaxMs = 1000u;
+constexpr std::uint32_t UploadTickMs(std::uint32_t timeout_ms) noexcept {
+  const std::uint32_t quarter = timeout_ms / 4u;
+  if (quarter < kUploadTickMinMs) {
+    return kUploadTickMinMs;
+  }
+  if (quarter > kUploadTickMaxMs) {
+    return kUploadTickMaxMs;
+  }
+  return quarter;
+}
+
+// The hotkey path chosen for this run, so the tray tooltip can name it. Only
+// the main thread writes and reads it.
+picopaste::win32::HotkeyBackend g_hotkey_backend = picopaste::win32::HotkeyBackend::kNone;
 
 // Longest config path accepted on the command line; a longer one is reported
 // rather than cut short.
@@ -92,6 +126,8 @@ constexpr UINT kWmWorkerStatus = WM_APP + 2;
 enum class WorkerNotice : std::uint8_t {
   kHealth = 0,  // wParam is the TrayState to render
   kStopped = 1,
+  kUploadStarted = 2,  // arms the main thread's deadline probe
+  kUploadEnded = 3,    // disarms it, whatever the outcome
 };
 
 // RAII: attach to the console that launched us, and detach again on scope exit.
@@ -139,9 +175,9 @@ class ArgvBlock final {
   // silently zero count -- which made every argument, and therefore --selftest
   // and --config, unreachable. Count first, then the array it describes.
   //
-  // CommandLineToArgvW's signature takes `int*`, so this member is an int by
-  // the platform contract and is narrowed back on the way out.
-  int argc_ = 0;
+  // CommandLineToArgvW's signature takes `int*`; std::int32_t IS int on this
+  // platform, so &argc_ is that int* by the platform contract.
+  std::int32_t argc_ = 0;
   wchar_t** argv_ = nullptr;
 };
 
@@ -165,7 +201,7 @@ void EmitFormatted(HANDLE handle, const char* format, ...) noexcept {
   char line[kLineChars] = {};
   va_list args;
   va_start(args, format);
-  const int written = std::vsnprintf(line, sizeof(line), format, args);
+  const std::int32_t written = std::vsnprintf(line, sizeof(line), format, args);
   va_end(args);
   if (written > 0) {
     Emit(handle, line);
@@ -175,9 +211,75 @@ void EmitFormatted(HANDLE handle, const char* format, ...) noexcept {
 // Narrow a wide path into `out`. Returns false when it does not fit, so an
 // over-long path is reported instead of being silently shortened.
 bool NarrowPath(const wchar_t* wide, char* out, std::size_t out_chars) noexcept {
-  const int written =
-      WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<int>(out_chars), nullptr, nullptr);
+  const std::int32_t written =
+      WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<std::int32_t>(out_chars), nullptr, nullptr);
   return written > 0;
+}
+
+// Default config path used when --config is absent:
+// <directory of the running executable>\picopaste.ini. A single-exe tool has
+// exactly one natural place for its config, and the executable's own directory
+// is stable without consulting the environment. The file need not exist:
+// LoadConfig answers a missing file with the built-in defaults and reports
+// created_defaults, which is the documented behaviour.
+//
+// Returns the number of characters written (excluding the terminator), or 0
+// when the executable path cannot be read or the result does not fit in `out`.
+std::size_t DerivedConfigPath(wchar_t* out, std::size_t out_chars) noexcept {
+  if (out_chars < 2u) {
+    return 0;
+  }
+  // Reserve one character for the terminator GetModuleFileNameW appends.
+  const DWORD written = GetModuleFileNameW(nullptr, out, static_cast<DWORD>(out_chars - 1u));
+  if ((written == 0u) || (static_cast<std::size_t>(written) >= (out_chars - 1u))) {
+    return 0;  // unavailable, or truncated so the directory is not trustworthy
+  }
+  // Keep everything up to and including the last separator, dropping the
+  // executable's file name so a sibling file can be appended.
+  std::size_t dir_end = 0;
+  for (std::size_t i = written; i > 0u; --i) {
+    if ((out[i - 1] == L'\\') || (out[i - 1] == L'/')) {
+      dir_end = i;
+      break;
+    }
+  }
+  if (dir_end == 0) {
+    return 0;  // no directory component: cannot form a sibling path
+  }
+  const wchar_t kName[] = L"picopaste.ini";
+  const std::size_t name_chars = sizeof(kName) / sizeof(kName[0]);  // includes the terminator
+  if ((dir_end + name_chars) > out_chars) {
+    return 0;  // would not fit
+  }
+  for (std::size_t i = 0; i < name_chars; ++i) {
+    out[dir_end + i] = kName[i];
+  }
+  return (dir_end + name_chars) - 1u;
+}
+
+// Resolve the config path to hand to LoadConfig, as UTF-8 in `out`.
+//
+// With --config the caller's path is used verbatim; without it the derived
+// default is used so LoadConfig still receives a real path and can answer a
+// missing file with the built-in defaults. A path that does not fit is
+// reported, never silently truncated.
+bool ResolveConfigPath(HANDLE err, const wchar_t* config_path, char* out, std::size_t out_chars) noexcept {
+  const bool from_user = (config_path != nullptr);
+  wchar_t derived[kConfigPathChars] = {};
+  const wchar_t* effective = config_path;
+  if (from_user == false) {
+    if (DerivedConfigPath(derived, sizeof(derived) / sizeof(derived[0])) == 0) {
+      Emit(err, "FAIL config-path: could not derive the default config path\n");
+      return false;
+    }
+    effective = derived;
+  }
+  if (NarrowPath(effective, out, out_chars) == false) {
+    EmitFormatted(err, "FAIL config-path: the %s path exceeds %u bytes\n", (from_user ? "--config" : "default config"),
+                  static_cast<unsigned>(out_chars));
+    return false;
+  }
+  return true;
 }
 
 struct Options {
@@ -372,8 +474,7 @@ class UploadWorker final {
 
   // Wire to the process-lifetime objects. Call once, on the main thread, before
   // Start().
-  void Configure(const Config* cfg, HANDLE containment_job, UploadPipeline* pipeline,
-                 Lifecycle* lifecycle) noexcept {
+  void Configure(const Config* cfg, HANDLE containment_job, UploadPipeline* pipeline, Lifecycle* lifecycle) noexcept {
     cfg_ = cfg;
     containment_job_ = containment_job;
     pipeline_ = pipeline;
@@ -429,6 +530,22 @@ class UploadWorker final {
   }
   bool InFlight() const noexcept { return (nullptr != pipeline_) && pipeline_->in_flight(); }
 
+  // Narrow thread-safe abort lever for the main thread's deadline probe. When
+  // an upload is overdue the worker is blocked inside a step (a read on the ssh
+  // pipe) and cannot run its own loop, so the main thread terminates the child
+  // directly: the pipe breaks, the blocked read returns, and Run unwinds into
+  // RunOnce's normal failure path. TerminateProcess only needs the process
+  // handle we already own and does not touch ChildStream's own state -- the
+  // worker stays the sole owner and closer of that object. The cached handle is
+  // an atomic because ChildStream's member is not, and the worker clears it
+  // before Close() so a late tick cannot target a retired channel.
+  void AbortChannel() noexcept {
+    const HANDLE process = abort_process_.load(std::memory_order_acquire);
+    if (nullptr != process) {
+      (void)TerminateProcess(process, 1);
+    }
+  }
+
  private:
   void Loop() noexcept {
     picopaste::win32::ComApartment com;
@@ -475,8 +592,11 @@ class UploadWorker final {
       return;  // EnsureChannel already posted the failure
     }
     const std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
-    const auto result =
-        pipeline_->Run(*client_.Get(), platform_.Clipboard(), platform_.Inject(), now);
+    // Tell the main thread an upload is about to start so it can arm the
+    // deadline probe, and again however Run returns so it is always disarmed.
+    PostUploadStarted();
+    const auto result = pipeline_->Run(*client_.Get(), platform_.Clipboard(), platform_.Inject(), now);
+    PostUploadEnded();
     if (result.has_value()) {
       PostHealth();
       return;
@@ -515,6 +635,7 @@ class UploadWorker final {
     if (spawned.has_value() == false) {
       return false;
     }
+    abort_process_.store(channel_.process_handle(), std::memory_order_release);
     client_.Create(channel_.stream());
     const Status inited = client_.Get()->Init();
     if (inited.has_value() == false) {
@@ -525,6 +646,10 @@ class UploadWorker final {
   }
 
   void DropChannel() noexcept {
+    // Clear the abort lever before closing: a tick that saw the live handle may
+    // still be about to call TerminateProcess, which on a just-closed handle
+    // fails harmlessly rather than reaching a recycled one.
+    abort_process_.store(nullptr, std::memory_order_release);
     client_.Destroy();
     channel_.Close();
   }
@@ -541,8 +666,8 @@ class UploadWorker final {
     if (picopaste::win32::Utf8ToWide(cfg_->host.c_str(), host, 256) == false) {
       return false;
     }
-    const wchar_t* parts[] = {
-        ssh, L" -o ClearAllForwardings=yes -o BatchMode=yes -o LogLevel=ERROR -s ", host, L" sftp"};
+    const wchar_t* parts[] = {ssh, L" -o ClearAllForwardings=yes -o BatchMode=yes -o LogLevel=ERROR -s ", host,
+                              L" sftp"};
     std::size_t used = 0u;
     for (const wchar_t* part : parts) {
       for (const wchar_t* p = part; L'\0' != *p; ++p) {
@@ -562,15 +687,23 @@ class UploadWorker final {
     return (LifecycleState::kDegraded == state) || (LifecycleState::kReconnecting == state);
   }
 
+  void PostUploadStarted() noexcept {
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(0u),
+                             static_cast<LPARAM>(WorkerNotice::kUploadStarted));
+  }
+
+  void PostUploadEnded() noexcept {
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(0u),
+                             static_cast<LPARAM>(WorkerNotice::kUploadEnded));
+  }
+
   void PostHealth() noexcept {
-    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus,
-                             static_cast<WPARAM>(MapTrayState(lifecycle_->Health())),
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(MapTrayState(lifecycle_->Health())),
                              static_cast<LPARAM>(WorkerNotice::kHealth));
   }
 
   void PostStopped() noexcept {
-    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus,
-                             static_cast<WPARAM>(picopaste::win32::TrayState::kError),
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(picopaste::win32::TrayState::kError),
                              static_cast<LPARAM>(WorkerNotice::kStopped));
   }
 
@@ -582,6 +715,9 @@ class UploadWorker final {
   HANDLE wake_ = nullptr;
   UploadPipeline* pipeline_ = nullptr;
   Lifecycle* lifecycle_ = nullptr;
+  // The ssh child's process handle, published for AbortChannel. Set on spawn,
+  // cleared before the channel closes; read by the main thread only.
+  std::atomic<HANDLE> abort_process_{nullptr};
   DWORD main_thread_ = 0;
   std::atomic<bool> quit_{false};
   std::thread thread_{};
@@ -593,18 +729,12 @@ class UploadWorker final {
 
 bool LoadInteractiveConfig(HANDLE out, HANDLE err, const wchar_t* config_path, Config& out_cfg) noexcept {
   char narrow[kConfigPathChars] = {};
-  const char* path = nullptr;
-  if (config_path != nullptr) {
-    if (NarrowPath(config_path, narrow, sizeof(narrow)) == false) {
-      EmitFormatted(err, "FAIL config-path: the --config path exceeds %u bytes\n",
-                    static_cast<unsigned>(kConfigPathChars));
-      return false;
-    }
-    path = narrow;
+  if (ResolveConfigPath(err, config_path, narrow, sizeof(narrow)) == false) {
+    return false;
   }
 
   bool created_defaults = false;
-  const auto loaded = picopaste::LoadConfig(path, &created_defaults);
+  const auto loaded = picopaste::LoadConfig(narrow, &created_defaults);
   if (loaded.has_value() == false) {
     EmitFormatted(err, "FAIL config-load: error %u\n", static_cast<unsigned>(loaded.get_error()));
     return false;
@@ -616,23 +746,48 @@ bool LoadInteractiveConfig(HANDLE out, HANDLE err, const wchar_t* config_path, C
   return true;
 }
 
+// Build the hover text, appending which hotkey path is live. A hook is a
+// different mechanism with a different failure mode, so it must not be
+// indistinguishable from a normal registration in the UI.
 const wchar_t* TipFor(picopaste::win32::TrayState state, bool stopped) noexcept {
   if (stopped) {
     return L"picopaste: stopped";
   }
+  const wchar_t* base = nullptr;
   switch (state) {
     case picopaste::win32::TrayState::kHealthy:
-      return L"picopaste: ready";
+      base = L"picopaste: ready";
+      break;
     case picopaste::win32::TrayState::kError:
-      return L"picopaste: channel lost, retrying";
+      base = L"picopaste: channel lost, retrying";
+      break;
     case picopaste::win32::TrayState::kWarning:
     default:
-      return L"picopaste: connecting";
+      base = L"picopaste: connecting";
+      break;
+  }
+  static wchar_t tip[160] = {};
+  const wchar_t* path = (g_hotkey_backend == picopaste::win32::HotkeyBackend::kHook)
+                            ? L"hotkey: low-level hook (chord was taken)"
+                            : L"hotkey: registered";
+  (void)std::swprintf(tip, sizeof(tip) / sizeof(tip[0]), L"%s (%s)", base, path);
+  return tip;
+}
+
+// Balloon text for a transition into a non-healthy state. The tray only changes
+// colour, which is easy to miss on a busy taskbar; the design's rule is that a
+// failure must be noticed, so the transition is announced once.
+const wchar_t* NoticeFor(picopaste::win32::TrayState state) noexcept {
+  switch (state) {
+    case picopaste::win32::TrayState::kError:
+      return L"channel lost - retrying in the background";
+    case picopaste::win32::TrayState::kWarning:
+    default:
+      return L"reconnecting";
   }
 }
 
-std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
-                            const wchar_t* config_path) noexcept {
+std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wchar_t* config_path) noexcept {
   Config config = picopaste::DefaultConfig();
   if (LoadInteractiveConfig(out, err, config_path, config) == false) {
     return kExitSelftestFailed;
@@ -659,8 +814,7 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
     if (Error::kSingleInstanceExists == setup.get_error()) {
       char owner_narrow[picopaste::win32::kOwnerImageChars * 3] = {};
       (void)picopaste::win32::WideToUtf8(owner_image, owner_narrow, sizeof(owner_narrow));
-      EmitFormatted(err,
-                    "picopaste: already running (pid %u, image %s); refusing a second instance.\n",
+      EmitFormatted(err, "picopaste: already running (pid %u, image %s); refusing a second instance.\n",
                     static_cast<unsigned>(owner_pid), owner_narrow);
     } else {
       EmitFormatted(err, "picopaste: could not create the single-instance mutex (error %u)\n",
@@ -681,22 +835,34 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
   if (setup && !binding) {
     setup = Status::error(binding.get_error());
   }
+  // RAII: whichever path installs is released on every return below, including
+  // the early worker-start failure. The class also unhooks before a Restart
+  // relaunch (see the message loop).
+  picopaste::win32::HotkeyRegistration hotkey;
   DWORD hotkey_error = 0;
   if (setup) {
-    setup = picopaste::win32::RegisterHotkey(nullptr, kHotkeyId, binding.value(), &hotkey_error);
+    const Status installed = hotkey.Install(nullptr, kHotkeyId, binding.value());
+    hotkey_error = hotkey.last_error();
+    if (!installed) {
+      setup = installed;
+    }
   }
   if (!setup) {
-    EmitFormatted(err, "picopaste: startup failed (error %u, hotkey %lu)\n",
-                  static_cast<unsigned>(setup.get_error()),
+    EmitFormatted(err, "picopaste: startup failed (error %u, hotkey %lu)\n", static_cast<unsigned>(setup.get_error()),
                   static_cast<unsigned long>(hotkey_error));
     return kExitSelftestFailed;
   }
+  g_hotkey_backend = hotkey.backend();
+  // Surface which path is live at startup as well as in the tooltip.
+  EmitFormatted(out, "picopaste: hotkey %s via %s\n", binding.value().display.c_str(),
+                picopaste::win32::HotkeyBackendName(hotkey.backend()));
 
   worker.Configure(&config, single.containment_job(), &pipeline, &lifecycle);
   const Status started = worker.Start();
   if (!started) {
     EmitFormatted(err, "picopaste: could not start the upload worker (error %u)\n",
                   static_cast<unsigned>(started.get_error()));
+    hotkey.Uninstall();
     single.Close();
     tray.Destroy();
     return kExitSelftestFailed;
@@ -706,6 +872,20 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
   // has a queue to land in even if it posts before the loop's first GetMessageW.
   MSG prime{};
   (void)PeekMessageW(&prime, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+  // The in-flight deadline probe. Zero means "not armed"; the value is the id
+  // SetTimer returned, which KillTimer needs because the hwnd == NULL form may
+  // replace the requested id with one of its own.
+  UINT_PTR upload_timer = 0;
+  // Last health the tray was told about, so a balloon fires on the transition
+  // into a bad state rather than on every health post the worker sends.
+  auto last_state = picopaste::win32::TrayState::kHealthy;
+  const auto disarm_timer = [&upload_timer]() noexcept {
+    if (0u != upload_timer) {
+      (void)KillTimer(nullptr, upload_timer);
+      upload_timer = 0u;
+    }
+  };
 
   std::int32_t exit_code = kExitOk;
   bool loop_error = false;
@@ -724,7 +904,9 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
       // WM_HOTKEY registered against the thread (hwnd == nullptr) arrives here,
       // not at the tray window. The message loop itself never blocks on I/O.
       if (worker.InFlight()) {
-        tray.Notify(L"picopaste", L"an upload is already in flight", false);
+        if (config.notify_enabled) {
+          tray.Notify(L"picopaste", L"an upload is already in flight", false);
+        }
       } else {
         worker.SetTarget(picopaste::win32::CaptureForegroundWindow());
         worker.Wake();
@@ -732,17 +914,67 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
       continue;
     }
     if (kWmWorkerStatus == msg.message) {
-      const bool stopped = (static_cast<WorkerNotice>(msg.lParam) == WorkerNotice::kStopped);
-      const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
-      tray.SetState(state, TipFor(state, stopped));
+      const auto notice = static_cast<WorkerNotice>(msg.lParam);
+      if (WorkerNotice::kUploadStarted == notice) {
+        // Arm the probe only while an upload is in flight. A disabled deadline
+        // (0) never latches, so arming then would be pure wake-ups; the idle
+        // promise is exactly zero CPU, not "near zero".
+        if ((0u != config.upload_timeout_ms) && (0u == upload_timer)) {
+          const std::uint32_t tick_ms = UploadTickMs(config.upload_timeout_ms);
+          upload_timer = SetTimer(nullptr, kUploadTimerId, static_cast<UINT>(tick_ms), nullptr);
+        }
+      } else if (WorkerNotice::kUploadEnded == notice) {
+        disarm_timer();
+      } else if (WorkerNotice::kStopped == notice) {
+        disarm_timer();
+        const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
+        tray.SetState(state, TipFor(state, true));
+      } else {
+        const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
+        // Announce the transition into a bad state once. Every health post also
+        // sets the tooltip, so repeating the balloon would turn a failure into
+        // noise; notify_enabled switches it off entirely.
+        if (config.notify_enabled && (state != last_state) && (picopaste::win32::TrayState::kHealthy != state)) {
+          tray.Notify(L"picopaste", NoticeFor(state), true);
+        }
+        last_state = state;
+        tray.SetState(state, TipFor(state, false));
+      }
       continue;
+    }
+    if ((WM_TIMER == msg.message) && (nullptr == msg.hwnd) && (0u != upload_timer) &&
+        (static_cast<UINT_PTR>(msg.wParam) == upload_timer)) {
+      // The worker is blocked inside a step and cannot run its own loop, so this
+      // is the only thread that can notice a silent peer. Latching the expiry is
+      // one atomic load plus one monotonic clock read; terminating the ssh child
+      // breaks its pipe, so the worker's blocked read returns and Run unwinds
+      // into RunOnce's normal failure path (drop, degrade, red tray). The timer
+      // stays armed until kUploadEnded so a missed first abort is retried.
+      if (pipeline.UploadOverdue()) {
+        worker.AbortChannel();
+      }
+      continue;
+    }
+    if ((msg.hwnd == tray.hwnd()) && (WM_COMMAND == msg.message)) {
+      // The tray's Restart item relaunches this process before the loop unwinds.
+      // Release the chord first so the replacement can claim it the moment it
+      // starts; on the hook path this also stops the old callback from
+      // swallowing the replacement's keystrokes.
+      hotkey.Uninstall();
     }
     (void)TranslateMessage(&msg);
     (void)DispatchMessageW(&msg);
   }
 
+  // Leaving the loop: the worker may be blocked inside Run on a silent peer, in
+  // which case Stop's join would wait forever. Use the same abort lever to break
+  // the channel, then disarm the probe so no wake-up outlives this queue.
+  if (worker.InFlight()) {
+    worker.AbortChannel();
+  }
+  disarm_timer();
   worker.Stop();
-  picopaste::win32::UnregisterHotkey(nullptr, kHotkeyId);
+  hotkey.Uninstall();
   tray.Destroy();
   single.Close();
   return loop_error ? kExitSelftestFailed : exit_code;
@@ -750,18 +982,12 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err,
 
 std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noexcept {
   char narrow[kConfigPathChars] = {};
-  const char* path = nullptr;
-  if (config_path != nullptr) {
-    if (NarrowPath(config_path, narrow, sizeof(narrow)) == false) {
-      EmitFormatted(err, "FAIL config-path: the --config path exceeds %u bytes\n",
-                    static_cast<unsigned>(kConfigPathChars));
-      return kExitSelftestFailed;
-    }
-    path = narrow;
+  if (ResolveConfigPath(err, config_path, narrow, sizeof(narrow)) == false) {
+    return kExitSelftestFailed;
   }
 
   bool created_defaults = false;
-  const auto loaded = picopaste::LoadConfig(path, &created_defaults);
+  const auto loaded = picopaste::LoadConfig(narrow, &created_defaults);
   if (loaded.has_value() == false) {
     // The error type has no stringifier yet, so report the numeric code rather
     // than a vague "failed".
@@ -791,6 +1017,10 @@ std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noe
 // The exception specification on this definition must match the one Win32
 // declares for wWinMain, which is not noexcept, so this entry point is the one
 // function here that cannot carry it.
+//
+// The bare `int` return and `int show` parameter are the CRT's fixed contract
+// for wWinMain, so they stay as the platform declares them even though the rest
+// of this file uses <cstdint> types.
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show) {
   (void)previous;
   (void)command_line;

@@ -1,36 +1,74 @@
-// picopaste — SFTP v3 wire codec.
-//
-// Fixed-capacity, zero-allocation encode/decode primitives plus the ATTRS
-// parser. Everything here is bounds-checked: a truncated or malformed packet
-// makes the reader report failure rather than reading out of bounds. The
-// ATTRS parser walks the SSH_FILEXFER_ATTRS bitmask instead of assuming a
-// fixed layout (verified against OpenSSH sftp-server: flags is not always 0xf).
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file packet.hpp
+ * @brief SFTP v3 wire codec.
+ *
+ * Fixed-capacity, zero-allocation encode/decode primitives plus the ATTRS
+ * parser. Everything here is bounds-checked: a truncated or malformed packet
+ * makes the reader report failure rather than reading out of bounds. The
+ * ATTRS parser walks the SSH_FILEXFER_ATTRS bitmask instead of assuming a
+ * fixed layout (verified against OpenSSH sftp-server: flags is not always 0xf).
+ */
 #pragma once
+
+#include "picopaste/sftp/protocol.hpp"
 
 #include <cstddef>
 #include <cstdint>
-
-#include "picopaste/sftp/protocol.hpp"
 
 namespace picopaste::sftp {
 
 // 4-byte length prefix + 1-byte type.
 inline constexpr std::uint32_t kFrameHeaderBytes = 5u;
 
-// A server response to any request this client issues is small: STATUS /
-// HANDLE / ATTRS. A NAME for REALPATH carries at most two strings. Anything
-// larger than this is rejected as a protocol error instead of being buffered.
-inline constexpr std::uint32_t kMaxInboundFrame = 16u * 1024u;
-
-// Largest payload we ever emit: one full WRITE chunk plus its header fields.
-inline constexpr std::uint32_t kMaxOutboundFrame = kWriteChunkBytes + 512u;
-
 // Longest SSH_FXP_HANDLE accepted from a server.
 inline constexpr std::uint32_t kMaxHandleBytes = 128u;
 
+/**
+ * @brief Read a big-endian u32.
+ * @param p At least 4 readable bytes; this does not bounds-check.
+ */
 std::uint32_t GetBe32(const std::uint8_t* p) noexcept;
+
+/**
+ * @brief Read a big-endian u64.
+ * @param p At least 8 readable bytes; this does not bounds-check.
+ */
 std::uint64_t GetBe64(const std::uint8_t* p) noexcept;
+
+/**
+ * @brief Write `v` as a big-endian u32.
+ * @param p At least 4 writable bytes; this does not bounds-check.
+ */
 void PutBe32(std::uint8_t* p, std::uint32_t v) noexcept;
+
+/**
+ * @brief Write `v` as a big-endian u64.
+ * @param p At least 8 writable bytes; this does not bounds-check.
+ */
 void PutBe64(std::uint8_t* p, std::uint64_t v) noexcept;
 
 // Writes big-endian fields into a caller-owned buffer. Once a write would
@@ -38,8 +76,7 @@ void PutBe64(std::uint8_t* p, std::uint64_t v) noexcept;
 // no-ops; callers check ok() before sending.
 class BufferWriter {
  public:
-  BufferWriter(std::uint8_t* data, std::size_t capacity) noexcept
-      : buf_(data), cap_(capacity), len_(0u), ok_(true) {}
+  BufferWriter(std::uint8_t* data, std::size_t capacity) noexcept : buf_(data), cap_(capacity), len_(0u), ok_(true) {}
 
   bool WriteU8(std::uint8_t v) noexcept;
   bool WriteU32(std::uint32_t v) noexcept;
@@ -69,8 +106,7 @@ class BufferWriter {
 // short buffer makes the call return false and leaves the cursor unchanged.
 class BufferReader {
  public:
-  BufferReader(const std::uint8_t* data, std::size_t len) noexcept
-      : buf_(data), len_(len), pos_(0u) {}
+  BufferReader(const std::uint8_t* data, std::size_t len) noexcept : buf_(data), len_(len), pos_(0u) {}
 
   bool ReadU8(std::uint8_t& out) noexcept;
   bool ReadU32(std::uint32_t& out) noexcept;

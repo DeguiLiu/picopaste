@@ -1,10 +1,37 @@
-// picopaste — bounded log file implementation.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file log_sink.cpp
+ * @brief Bounded log file implementation.
+ */
 
 #include "log_sink.hpp"
 
 #include <cstring>
-
 #include <ctime>
+
 #include <filesystem>
 #include <system_error>
 
@@ -12,20 +39,11 @@ namespace picopaste {
 namespace {
 
 const char* LevelTag(LogLevel level) noexcept {
-  switch (level) {
-    case LogLevel::kDebug:
-      return "DEBUG";
-    case LogLevel::kInfo:
-      return "INFO ";
-    case LogLevel::kWarn:
-      return "WARN ";
-    case LogLevel::kError:
-      return "ERROR";
-    case LogLevel::kFatal:
-      return "FATAL";
-    default:
-      return "?????";
-  }
+  // LogLevel is contiguous from kDebug; an out-of-range value can only come
+  // from a corrupted record and gets the placeholder.
+  static constexpr const char* kTags[] = {"DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"};
+  const std::uint32_t index = static_cast<std::uint32_t>(level);
+  return (index < (sizeof(kTags) / sizeof(kTags[0]))) ? kTags[index] : "?????";
 }
 
 // Format one line into `out`. Returns the number of bytes to write (excluding
@@ -43,10 +61,10 @@ std::uint32_t FormatLine(const LogRecord& record, char* out, std::size_t cap) no
     return 0;
   }
 #endif
-  const int written = std::snprintf(out, cap, "[%04d-%02d-%02d %02d:%02d:%02d.%03u] [%s] %s\n", local.tm_year + 1900,
-                                    local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec,
-                                    static_cast<unsigned>(record.wallclock_ms), LevelTag(record.level),
-                                    record.message);
+  const std::int32_t written =
+      std::snprintf(out, cap, "[%04d-%02d-%02d %02d:%02d:%02d.%03u] [%s] %s\n", local.tm_year + 1900, local.tm_mon + 1,
+                    local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec,
+                    static_cast<unsigned>(record.wallclock_ms), LevelTag(record.level), record.message);
   if (0 >= written) {
     return 0;
   }
@@ -56,7 +74,9 @@ std::uint32_t FormatLine(const LogRecord& record, char* out, std::size_t cap) no
 
 }  // namespace
 
-LogSink::~LogSink() noexcept { Close(); }
+LogSink::~LogSink() noexcept {
+  Close();
+}
 
 Status LogSink::Open(const char* path, std::uint32_t max_bytes, std::uint32_t keep_files) noexcept {
   Close();
@@ -69,6 +89,8 @@ Status LogSink::Open(const char* path, std::uint32_t max_bytes, std::uint32_t ke
   }
   std::memcpy(path_, path, len + 1U);
 
+  // Clamp to 1: a zero threshold would rotate on every record, so an unset
+  // value means "smallest usable bound" rather than "disable rotation".
   max_bytes_ = (0 == max_bytes) ? 1U : max_bytes;
   keep_files_ = keep_files;
   rotations_ = 0;
@@ -101,6 +123,8 @@ Status LogSink::Write(const LogRecord& record) noexcept {
     return Status::error(Error::kLogIoFailed);
   }
 
+  // A formatted line is timestamp (23) + tag (5) + message (<= kLogMessageBytes)
+  // plus separators; 320 leaves headroom without a second allocation.
   char line[320];
   const std::uint32_t len = FormatLine(record, line, sizeof(line));
   if (0 == len) {

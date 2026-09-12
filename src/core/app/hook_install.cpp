@@ -1,17 +1,45 @@
-// picopaste — remote settings.json hook management (see hook_install.hpp).
-//
-// All wire access goes through sftp::Client, the single owner of the SFTP
-// channel: Connect performs the SSH_FXP_INIT/VERSION handshake and read/write
-// of a remote file go through Client::ReadFile / Client::WriteFile. This module
-// holds no request-id counter and speaks no packet format of its own; it reads
-// a remote file into a caller-owned, bounded buffer, merges the JSON, and
-// writes the result back. Every buffer is fixed-capacity and bounded by
-// kMaxSettingsBytes.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file hook_install.cpp
+ * @brief Remote settings.json hook management (implementation).
+ *
+ * All wire access goes through sftp::Client, the single owner of the SFTP
+ * channel: Connect performs the SSH_FXP_INIT/VERSION handshake and read/write
+ * of a remote file go through Client::ReadFile / Client::WriteFile. This module
+ * holds no request-id counter and speaks no packet format of its own; it reads
+ * a remote file into a caller-owned, bounded buffer, merges the JSON, and
+ * writes the result back. Every buffer is fixed-capacity and bounded by
+ * kMaxSettingsBytes.
+ */
 #include "hook_install.hpp"
 
-#include <chrono>
 #include <cstdio>
 #include <cstring>
+
+#include <chrono>
 #include <string>
 
 /* PicoJSON is vendored verbatim and used without PICOJSON_USE_INT64: enabling
@@ -33,18 +61,19 @@
 namespace picopaste {
 namespace {
 
-Status Err(Error e) noexcept { return Status::error(e); }
+Status Err(Error e) noexcept {
+  return Status::error(e);
+}
 
 std::uint64_t NowMillis() noexcept {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
 Status MakeBackupPath(const char* settings_path, std::uint64_t stamp, sftp::Path& out) noexcept {
   char buf[sftp::kMaxPathBytes];
-  const int n = std::snprintf(buf, sizeof(buf), "%s.picopaste-backup-%llu", settings_path,
-                              static_cast<unsigned long long>(stamp));
+  const std::int32_t n = std::snprintf(buf, sizeof(buf), "%s.picopaste-backup-%llu", settings_path,
+                                       static_cast<unsigned long long>(stamp));
   if ((n < 0) || (static_cast<std::size_t>(n) >= sizeof(buf))) {
     return Err(Error::kConfigWriteFailed); /* would overflow the remote path cap */
   }
@@ -54,8 +83,7 @@ Status MakeBackupPath(const char* settings_path, std::uint64_t stamp, sftp::Path
 
 bool IsBlank(const std::vector<std::uint8_t>& bytes) noexcept {
   for (const std::uint8_t c : bytes) {
-    if ((c != 0x20u) && (c != 0x09u) && (c != 0x0Au) && (c != 0x0Du) && (c != 0x0Cu) &&
-        (c != 0x0Bu)) {
+    if ((c != 0x20u) && (c != 0x09u) && (c != 0x0Au) && (c != 0x0Du) && (c != 0x0Cu) && (c != 0x0Bu)) {
       return false;
     }
   }
@@ -109,13 +137,39 @@ bool ContainsMarker(const picojson::value& v, const char* marker) {
   return picojson::value(v).serialize().find(marker) != std::string::npos;
 }
 
+// Resolves the group array for `event`, creating the "hooks" object and the
+// event array when they are absent. Returns nullptr when either member exists
+// but has the wrong JSON type, so the caller refuses to rewrite a file it does
+// not understand.
+picojson::array* EventGroups(picojson::object& obj, const char* event) {
+  auto hooks_it = obj.find("hooks");
+  if (hooks_it == obj.end()) {
+    obj["hooks"] = picojson::value(picojson::object());
+    hooks_it = obj.find("hooks");
+  }
+  if (!hooks_it->second.is<picojson::object>()) {
+    return nullptr;
+  }
+  auto& hooks = hooks_it->second.get<picojson::object>();
+
+  auto event_it = hooks.find(event);
+  if (event_it == hooks.end()) {
+    hooks[event] = picojson::value(picojson::array());
+    event_it = hooks.find(event);
+  }
+  if (!event_it->second.is<picojson::array>()) {
+    return nullptr;
+  }
+  return &event_it->second.get<picojson::array>();
+}
+
 // Builds the merged document for an install. `changed` is false when our entry
 // is already present, in which case `out` is unspecified and nothing was
 // mutated. Structural surprises (hooks not an object, event not an array) are
 // reported as failures so the caller never rewrites a file it does not
 // understand.
-Status BuildInstall(const std::vector<std::uint8_t>& original, const HookEntry& entry,
-                    std::string& out, bool& changed) {
+Status BuildInstall(const std::vector<std::uint8_t>& original, const HookEntry& entry, std::string& out,
+                    bool& changed) {
   changed = false;
   if ((entry.event == nullptr) || (entry.event[0] == '\0') || (entry.command == nullptr) ||
       (std::strstr(entry.command, kHookMarker) == nullptr)) {
@@ -129,28 +183,11 @@ Status BuildInstall(const std::vector<std::uint8_t>& original, const HookEntry& 
     return Err(Error::kConfigParseFailed);
   }
 
-  auto& obj = root.get<picojson::object>();
-  auto hooks_it = obj.find("hooks");
-  if (hooks_it == obj.end()) {
-    obj["hooks"] = picojson::value(picojson::object());
-    hooks_it = obj.find("hooks");
-  }
-  if (!hooks_it->second.is<picojson::object>()) {
+  picojson::array* groups = EventGroups(root.get<picojson::object>(), entry.event);
+  if (groups == nullptr) {
     return Err(Error::kConfigParseFailed);
   }
-  auto& hooks = hooks_it->second.get<picojson::object>();
-
-  auto event_it = hooks.find(entry.event);
-  if (event_it == hooks.end()) {
-    hooks[entry.event] = picojson::value(picojson::array());
-    event_it = hooks.find(entry.event);
-  }
-  if (!event_it->second.is<picojson::array>()) {
-    return Err(Error::kConfigParseFailed);
-  }
-  auto& groups = event_it->second.get<picojson::array>();
-
-  if (ContainsMarker(picojson::value(groups), kHookMarker)) {
+  if (ContainsMarker(picojson::value(*groups), kHookMarker)) {
     return Status::success(); /* already installed: no-op, no backup, no write */
   }
 
@@ -163,7 +200,7 @@ Status BuildInstall(const std::vector<std::uint8_t>& original, const HookEntry& 
   picojson::object group;
   group["matcher"] = picojson::value(std::string(entry.matcher != nullptr ? entry.matcher : ""));
   group["hooks"] = picojson::value(inner);
-  groups.push_back(picojson::value(group));
+  groups->push_back(picojson::value(group));
 
   out = root.serialize(true);
   UnescapeSlashes(out);
@@ -175,8 +212,7 @@ Status BuildInstall(const std::vector<std::uint8_t>& original, const HookEntry& 
 // Builds the document with every hook whose command contains `marker` removed.
 // Empty groups left by removal are dropped; event arrays and the hooks object
 // themselves are kept so unrelated structure survives.
-Status BuildRemove(const std::vector<std::uint8_t>& original, const char* marker, std::string& out,
-                   bool& changed) {
+Status BuildRemove(const std::vector<std::uint8_t>& original, const char* marker, std::string& out, bool& changed) {
   changed = false;
   if ((marker == nullptr) || (marker[0] == '\0') || IsBlank(original)) {
     return Status::success();
@@ -250,8 +286,7 @@ struct RemoteSettings::Impl {
   // Reads a remote file into a caller-owned, bounded vector. A missing file is
   // success with `out` empty and `missing` set. An oversized file surfaces as
   // kBufferTooSmall — a size problem must never masquerade as a parse problem.
-  Status ReadRemote(const char* path, std::vector<std::uint8_t>& out, std::size_t cap,
-                    bool& missing) noexcept {
+  Status ReadRemote(const char* path, std::vector<std::uint8_t>& out, std::size_t cap, bool& missing) noexcept {
     out.clear();
     missing = false;
     if (cap > static_cast<std::size_t>(UINT32_MAX)) {
@@ -328,10 +363,11 @@ Result<sftp::Path> RemoteSettings::Realpath(const char* path) noexcept {
   return impl_->client_.Realpath(path);
 }
 
-Status RemoteSettings::MkdirAll(const char* path) noexcept { return impl_->client_.MkdirAll(path); }
+Status RemoteSettings::MkdirAll(const char* path) noexcept {
+  return impl_->client_.MkdirAll(path);
+}
 
-Status RemoteSettings::ReadFile(const char* path, std::vector<std::uint8_t>& out,
-                                bool* missing) noexcept {
+Status RemoteSettings::ReadFile(const char* path, std::vector<std::uint8_t>& out, bool* missing) noexcept {
   if ((path == nullptr) || (path[0] == '\0')) {
     return Err(Error::kOpenFailed);
   }
@@ -343,8 +379,7 @@ Status RemoteSettings::ReadFile(const char* path, std::vector<std::uint8_t>& out
   return s;
 }
 
-Status RemoteSettings::WriteFile(const char* path, const std::uint8_t* data,
-                                 std::size_t len) noexcept {
+Status RemoteSettings::WriteFile(const char* path, const std::uint8_t* data, std::size_t len) noexcept {
   if ((path == nullptr) || (path[0] == '\0') || ((data == nullptr) && (len > 0u))) {
     return Err(Error::kWriteFailed);
   }
@@ -358,8 +393,7 @@ Status RemoteSettings::WriteFile(const char* path, const std::uint8_t* data,
   }
 }
 
-Result<InstallOutcome> RemoteSettings::Install(const char* settings_path,
-                                               const HookEntry& entry) noexcept {
+Result<InstallOutcome> RemoteSettings::Install(const char* settings_path, const HookEntry& entry) noexcept {
   if ((settings_path == nullptr) || (settings_path[0] == '\0')) {
     return Result<InstallOutcome>::error(Error::kConfigWriteFailed);
   }
@@ -402,14 +436,12 @@ Result<InstallOutcome> RemoteSettings::Install(const char* settings_path,
     }
 
     const Status wrote =
-        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()),
-                           merged.size());
+        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
     if (!wrote) {
       return Result<InstallOutcome>::error(Error::kConfigWriteFailed);
     }
     const Status verified =
-        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()),
-                           merged.size());
+        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
     if (!verified) {
       return Result<InstallOutcome>::error(Error::kSizeMismatch);
     }
@@ -421,8 +453,7 @@ Result<InstallOutcome> RemoteSettings::Install(const char* settings_path,
 }
 
 Result<bool> RemoteSettings::Remove(const char* settings_path, const char* marker) noexcept {
-  if ((settings_path == nullptr) || (settings_path[0] == '\0') || (marker == nullptr) ||
-      (marker[0] == '\0')) {
+  if ((settings_path == nullptr) || (settings_path[0] == '\0') || (marker == nullptr) || (marker[0] == '\0')) {
     return Result<bool>::error(Error::kConfigWriteFailed);
   }
   try {
@@ -452,8 +483,7 @@ Result<bool> RemoteSettings::Remove(const char* settings_path, const char* marke
       if (!named) {
         return Result<bool>::error(named.get_error());
       }
-      const Status wrote_backup =
-          impl_->WriteRemote(backup.c_str(), original.data(), original.size());
+      const Status wrote_backup = impl_->WriteRemote(backup.c_str(), original.data(), original.size());
       if (!wrote_backup) {
         return Result<bool>::error(Error::kConfigWriteFailed);
       }
@@ -464,14 +494,12 @@ Result<bool> RemoteSettings::Remove(const char* settings_path, const char* marke
     }
 
     const Status wrote =
-        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()),
-                           merged.size());
+        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
     if (!wrote) {
       return Result<bool>::error(Error::kConfigWriteFailed);
     }
     const Status verified =
-        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()),
-                           merged.size());
+        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
     if (!verified) {
       return Result<bool>::error(Error::kSizeMismatch);
     }
@@ -503,8 +531,7 @@ Status RemoteSettings::Restore(const char* settings_path, const char* backup_pat
 
     std::vector<std::uint8_t> current;
     bool current_missing = false;
-    const Status read_current =
-        impl_->ReadRemote(settings_path, current, kMaxSettingsBytes, current_missing);
+    const Status read_current = impl_->ReadRemote(settings_path, current, kMaxSettingsBytes, current_missing);
     if (!read_current) {
       return Err(read_current.get_error());
     }

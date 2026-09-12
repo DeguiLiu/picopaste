@@ -1,4 +1,31 @@
-// picopaste -- per-capability self-check implementation.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file selftest.cpp
+ * @brief Per-capability self-check implementation.
+ */
 #include "selftest.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -8,26 +35,27 @@
 #define NOMINMAX
 #endif
 
-#include <windows.h>
-
-#include <psapi.h>
-
-#include <cstdio>
-#include <cstring>
-#include <cwchar>
-
-#include "picopaste/sftp/client.hpp"
 #include "clipboard.hpp"
 #include "hotkey.hpp"
 #include "single_instance.hpp"
 #include "stream_win32.hpp"
 #include "win32_util.hpp"
 
+#include "picopaste/sftp/client.hpp"
+
+#include <windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+
+#include <psapi.h>
+
 namespace picopaste::win32 {
 namespace {
 
-int g_passed = 0;
-int g_failed = 0;
+std::int32_t g_passed = 0;
+std::int32_t g_failed = 0;
 
 void PrintRaw(const char* text) noexcept {
   HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -67,8 +95,8 @@ bool QueryMemory(std::uint64_t* working_set, std::uint64_t* private_bytes) noexc
   if (kernel == nullptr) {
     return false;
   }
-  GetProcessMemoryInfoFn query = reinterpret_cast<GetProcessMemoryInfoFn>(
-      GetProcAddress(kernel, "K32GetProcessMemoryInfo"));
+  GetProcessMemoryInfoFn query =
+      reinterpret_cast<GetProcessMemoryInfoFn>(GetProcAddress(kernel, "K32GetProcessMemoryInfo"));
   if (query == nullptr) {
     return false;
   }
@@ -90,9 +118,8 @@ bool QueryMemory(std::uint64_t* working_set, std::uint64_t* private_bytes) noexc
 void CheckClipboard() noexcept {
   const ClipboardFormats formats = InspectClipboardFormats();
   char detail[256] = {};
-  (void)std::snprintf(detail, sizeof(detail), "PNG=%d DIBV5=%d DIB=%d any=%d",
-                      formats.has_png ? 1 : 0, formats.has_dibv5 ? 1 : 0, formats.has_dib ? 1 : 0,
-                      formats.has_any_image ? 1 : 0);
+  (void)std::snprintf(detail, sizeof(detail), "PNG=%d DIBV5=%d DIB=%d any=%d", formats.has_png ? 1 : 0,
+                      formats.has_dibv5 ? 1 : 0, formats.has_dib ? 1 : 0, formats.has_any_image ? 1 : 0);
   Report("clipboard-formats", true, detail);
 }
 
@@ -131,25 +158,22 @@ void CheckWicEncode() noexcept {
     return;
   }
 
-  const Result<CapturedImage> encoded =
-      EncodeDibToPngFile(dib, sizeof(dib), path, 4u * 1024u * 1024u);
+  const Result<CapturedImage> encoded = EncodeDibToPngFile(dib, sizeof(dib), path, 4u * 1024u * 1024u);
   bool ok = false;
   char detail[256] = {};
   if (encoded.has_value()) {
     // Verify the file really starts with the PNG signature.
-    UniqueHandle file(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
+    UniqueHandle file(
+        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     std::uint8_t signature[8] = {};
     DWORD got = 0;
-    const bool read = file.valid() &&
-                      ReadFile(file.get(), signature, 8, &got, nullptr) != 0 && got == 8;
+    const bool read = file.valid() && ReadFile(file.get(), signature, 8, &got, nullptr) != 0 && got == 8;
     const std::uint8_t expected[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     ok = read && std::memcmp(signature, expected, 8) == 0;
     (void)std::snprintf(detail, sizeof(detail), "png=%llu bytes sig=%s",
                         static_cast<unsigned long long>(encoded.value().bytes), ok ? "ok" : "bad");
   } else {
-    (void)std::snprintf(detail, sizeof(detail), "encode failed (error=%u)",
-                        static_cast<unsigned>(encoded.get_error()));
+    (void)std::snprintf(detail, sizeof(detail), "encode failed (error=%u)", static_cast<unsigned>(encoded.get_error()));
   }
   DeleteFileW(path);
   Report("wic-encode", ok, detail);
@@ -160,22 +184,30 @@ void CheckSendInput() noexcept {
   // A no-op key (F24) rather than the paste chord: this only proves the input
   // stream accepts our events from this integrity level.
   INPUT events[2] = {};
-  for (int i = 0; i < 2; ++i) {
+  for (std::int32_t i = 0; i < 2; ++i) {
     events[i].type = INPUT_KEYBOARD;
     events[i].ki.wVk = 0x87;  // VK_F24
     events[i].ki.dwFlags = (i == 1) ? KEYEVENTF_KEYUP : 0;
   }
   const UINT inserted = SendInput(2, events, sizeof(INPUT));
+  // GetLastError is only meaningful when SendInput inserted nothing, and it is
+  // the only thing that separates "this desktop will not accept our input" from
+  // a coding error. Without it the line reports a bare "0 of 2" that the reader
+  // cannot act on.
+  const DWORD send_error = (inserted == 2) ? 0 : GetLastError();
   char detail[256] = {};
-  (void)std::snprintf(detail, sizeof(detail), "inserted %u of 2 (uiAccess/elevation check)",
-                      static_cast<unsigned>(inserted));
+  if (inserted == 2) {
+    (void)std::snprintf(detail, sizeof(detail), "inserted 2 of 2 (uiAccess/elevation check)");
+  } else {
+    (void)std::snprintf(detail, sizeof(detail), "inserted %u of 2 (GetLastError=%lu)", static_cast<unsigned>(inserted),
+                        static_cast<unsigned long>(send_error));
+  }
   Report("sendinput", inserted == 2, detail);
 }
 
 // --- 4. RegisterHotKey ------------------------------------------------------
 void CheckHotkey(const Config* config) noexcept {
-  const char* text = (config != nullptr && config->hotkey.empty() == false) ? config->hotkey.c_str()
-                                                                            : "alt+shift+v";
+  const char* text = (config != nullptr && config->hotkey.empty() == false) ? config->hotkey.c_str() : "alt+shift+v";
   const Result<HotkeyBinding> parsed = ParseHotkey(text);
   if (parsed.has_value() == false) {
     char detail[256] = {};
@@ -185,15 +217,17 @@ void CheckHotkey(const Config* config) noexcept {
   }
   DWORD last_error = 0;
   const Status registered = RegisterHotkey(nullptr, 0xCC01, parsed.value(), &last_error);
+  // Read the backend before releasing: it is owned by the live registration.
+  const HotkeyBackend backend = ActiveHotkeyBackend();
   char detail[256] = {};
   if (registered.has_value()) {
     UnregisterHotkey(nullptr, 0xCC01);
-    (void)std::snprintf(detail, sizeof(detail), "%s registered and released",
-                        parsed.value().display.c_str());
+    (void)std::snprintf(detail, sizeof(detail), "%s registered via %s", parsed.value().display.c_str(),
+                        HotkeyBackendName(backend));
     Report("register-hotkey", true, detail);
   } else {
-    (void)std::snprintf(detail, sizeof(detail), "%s refused (GetLastError=%lu)",
-                        parsed.value().display.c_str(), static_cast<unsigned long>(last_error));
+    (void)std::snprintf(detail, sizeof(detail), "%s refused (GetLastError=%lu)", parsed.value().display.c_str(),
+                        static_cast<unsigned long>(last_error));
     Report("register-hotkey", false, detail);
   }
 }
@@ -209,7 +243,8 @@ void CheckSingleInstance() noexcept {
     return;
   }
   const bool existed = (GetLastError() == ERROR_ALREADY_EXISTS);
-  (void)std::snprintf(detail, sizeof(detail), "mutex %s", existed ? "already held by another instance" : "acquired (no other instance)");
+  (void)std::snprintf(detail, sizeof(detail), "mutex %s",
+                      existed ? "already held by another instance" : "acquired (no other instance)");
   Report("single-instance", true, detail);
 }
 
@@ -221,18 +256,16 @@ void CheckJobObjects(const Config* config) noexcept {
   // KILL_ON_JOB_CLOSE here, so closing the handle at the end cannot kill us.
   HANDLE memory_job = CreateJobObjectW(nullptr, nullptr);
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION memory_info{};
-  memory_info.BasicLimitInformation.LimitFlags =
-      JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+  memory_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
   memory_info.JobMemoryLimit = static_cast<SIZE_T>(limit_mb) * 1024u * 1024u;
   bool ok = false;
   std::uint64_t enforced_mb = 0;
   if (memory_job != nullptr &&
-      SetInformationJobObject(memory_job, JobObjectExtendedLimitInformation, &memory_info,
-                              sizeof(memory_info)) != 0 &&
+      SetInformationJobObject(memory_job, JobObjectExtendedLimitInformation, &memory_info, sizeof(memory_info)) != 0 &&
       AssignProcessToJobObject(memory_job, GetCurrentProcess()) != 0) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION queried{};
-    if (QueryInformationJobObject(memory_job, JobObjectExtendedLimitInformation, &queried,
-                                  sizeof(queried), nullptr) != 0) {
+    if (QueryInformationJobObject(memory_job, JobObjectExtendedLimitInformation, &queried, sizeof(queried), nullptr) !=
+        0) {
       enforced_mb = queried.JobMemoryLimit / (1024u * 1024u);
       ok = (enforced_mb == limit_mb);
     }
@@ -247,12 +280,11 @@ void CheckJobObjects(const Config* config) noexcept {
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION containment_info{};
   containment_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   bool kill_ok = false;
-  if (containment != nullptr &&
-      SetInformationJobObject(containment, JobObjectExtendedLimitInformation, &containment_info,
-                              sizeof(containment_info)) != 0) {
+  if (containment != nullptr && SetInformationJobObject(containment, JobObjectExtendedLimitInformation,
+                                                        &containment_info, sizeof(containment_info)) != 0) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION queried{};
-    kill_ok = QueryInformationJobObject(containment, JobObjectExtendedLimitInformation, &queried,
-                                        sizeof(queried), nullptr) != 0 &&
+    kill_ok = QueryInformationJobObject(containment, JobObjectExtendedLimitInformation, &queried, sizeof(queried),
+                                        nullptr) != 0 &&
               (queried.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0;
   }
   if (containment != nullptr) {
@@ -279,8 +311,7 @@ void CheckSftp(const Config* config) noexcept {
     return;
   }
   wchar_t command[kMaxCommandLineChars] = {};
-  (void)swprintf(command, kMaxCommandLineChars,
-                 L"%s -o ClearAllForwardings=yes -s %s sftp", ssh_wide, host_wide);
+  (void)swprintf(command, kMaxCommandLineChars, L"%s -o ClearAllForwardings=yes -s %s sftp", ssh_wide, host_wide);
 
   ChildStream child;
   const Status spawned = child.Spawn(ChildStreamOptions{command, nullptr, nullptr});
@@ -304,8 +335,7 @@ void CheckSftp(const Config* config) noexcept {
     (void)std::snprintf(detail, sizeof(detail), "INIT ok, REALPATH . = %s", home.value().c_str());
     Report("sftp-reachability", true, detail);
   } else {
-    (void)std::snprintf(detail, sizeof(detail), "REALPATH failed (error=%u)",
-                        static_cast<unsigned>(home.get_error()));
+    (void)std::snprintf(detail, sizeof(detail), "REALPATH failed (error=%u)", static_cast<unsigned>(home.get_error()));
     Report("sftp-reachability", false, detail);
   }
   child.Close();
@@ -324,8 +354,7 @@ void CheckMemory() noexcept {
   char detail[256] = {};
   (void)std::snprintf(detail, sizeof(detail), "private=%llu KB working=%llu KB handles=%lu",
                       static_cast<unsigned long long>(private_bytes / 1024u),
-                      static_cast<unsigned long long>(working_set / 1024u),
-                      static_cast<unsigned long>(handles));
+                      static_cast<unsigned long long>(working_set / 1024u), static_cast<unsigned long>(handles));
   Report("memory-baseline", true, detail);
 }
 

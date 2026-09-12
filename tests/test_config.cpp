@@ -47,6 +47,7 @@ TEST_CASE("DefaultConfig matches the documented defaults", "[config]") {
   CHECK(std::string(cfg.hotkey.c_str()) == "alt+shift+v");
   CHECK(std::string(cfg.ssh_command.c_str()) == "ssh");
   CHECK(cfg.delay_ms == 150U);
+  CHECK(cfg.upload_timeout_ms == 30000U);
   CHECK(cfg.log_max_bytes == 8U * 1024U * 1024U);
   CHECK(cfg.log_keep_files == 2U);
   CHECK(cfg.max_image_bytes == 20U * 1024U * 1024U);
@@ -76,6 +77,7 @@ TEST_CASE("Save then Load round-trips every field", "[config]") {
   cfg.hotkey = "ctrl+alt+p";
   cfg.ssh_command = "tssh";
   cfg.delay_ms = 222U;
+  cfg.upload_timeout_ms = 45000U;
   cfg.restore_clipboard = false;
   cfg.max_image_bytes = 123456U;
   cfg.job_memory_limit_mb = 48U;
@@ -96,6 +98,7 @@ TEST_CASE("Save then Load round-trips every field", "[config]") {
   CHECK(std::string(got.hotkey.c_str()) == "ctrl+alt+p");
   CHECK(std::string(got.ssh_command.c_str()) == "tssh");
   CHECK(got.delay_ms == 222U);
+  CHECK(got.upload_timeout_ms == 45000U);
   CHECK_FALSE(got.restore_clipboard);
   CHECK(got.max_image_bytes == 123456U);
   CHECK(got.job_memory_limit_mb == 48U);

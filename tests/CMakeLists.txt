@@ -59,8 +59,11 @@ catch_discover_tests(picopaste_tests PROPERTIES SKIP_RETURN_CODE 4)
 
 # ---------------------------------------------------------------------------
 # Mechanical gates for design promises that were previously only intentions.
-# Both are CMake scripts (not shell), so they run identically under the Linux
+# All are CMake scripts (not shell), so they run identically under the Linux
 # and Windows CI jobs via ctest. See tools/check_*.cmake for what they enforce.
+# The format gate SKIPs (passes with a message) when clang-format is absent, so
+# a runner without it does not fail the job; pass -DPICOPASTE_CLANG_FORMAT=<path>
+# to pin a specific binary.
 # ---------------------------------------------------------------------------
 add_test(NAME gate_no_scripts
   COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
@@ -68,3 +71,9 @@ add_test(NAME gate_no_scripts
 add_test(NAME gate_posix_leak
   COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
           -P "${CMAKE_SOURCE_DIR}/tools/check_posix_leak.cmake")
+set(PICOPASTE_CLANG_FORMAT "" CACHE FILEPATH
+  "clang-format binary for gate_clang_format (empty searches PATH)")
+add_test(NAME gate_clang_format
+  COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+          "-DPICOPASTE_CLANG_FORMAT=${PICOPASTE_CLANG_FORMAT}"
+          -P "${CMAKE_SOURCE_DIR}/tools/check_clang_format.cmake")

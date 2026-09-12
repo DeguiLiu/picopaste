@@ -91,7 +91,7 @@ TEST_CASE("supervision loop: a 3-minute-stable link resets the backoff the timer
   loop.Post(LifecycleEvent::kStart);
 
   // Six consecutive spawn failures ramp to the ceiling.
-  for (int i = 0; i < 6; ++i) {
+  for (std::int32_t i = 0; i < 6; ++i) {
     loop.Post(LifecycleEvent::kConnectFail);
   }
   REQUIRE(loop.State() == LifecycleState::kReconnecting);

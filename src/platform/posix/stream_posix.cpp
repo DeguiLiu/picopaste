@@ -1,4 +1,31 @@
-// picopaste — POSIX ByteStream over a child process pipe (implementation).
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file stream_posix.cpp
+ * @brief POSIX ByteStream over a child process pipe (implementation).
+ */
 #include "stream_posix.hpp"
 
 #include <cerrno>
@@ -17,11 +44,11 @@ namespace {
 
 /* Fixed pool: spawning a channel is a one-time action, not a hot path, and the
    test suite never holds more than a couple of streams at once. Avoids heap. */
-constexpr int kMaxStreams = 4;
+constexpr std::int32_t kMaxStreams = 4;
 
 struct PipeCtx {
-  int in_fd = -1;   /* parent writes the child's stdin */
-  int out_fd = -1;  /* parent reads the child's stdout */
+  std::int32_t in_fd = -1;  /* parent writes the child's stdin */
+  std::int32_t out_fd = -1; /* parent reads the child's stdout */
   pid_t pid = -1;
   bool used = false;
 };
@@ -29,7 +56,7 @@ struct PipeCtx {
 PipeCtx g_slots[kMaxStreams];
 
 PipeCtx* AcquireSlot() noexcept {
-  for (int i = 0; i < kMaxStreams; ++i) {
+  for (std::int32_t i = 0; i < kMaxStreams; ++i) {
     if (!g_slots[i].used) {
       g_slots[i].used = true;
       g_slots[i].in_fd = -1;
@@ -41,7 +68,7 @@ PipeCtx* AcquireSlot() noexcept {
   return nullptr;
 }
 
-void CloseFd(int& fd) noexcept {
+void CloseFd(std::int32_t& fd) noexcept {
   if (fd >= 0) {
     (void)::close(fd);
     fd = -1;
@@ -100,9 +127,8 @@ void PipeClose(void* ctx) noexcept {
   /* Closing stdin lets ssh see EOF and exit cleanly. */
   CloseFd(c->in_fd);
   if (c->pid > 0) {
-    int status = 0;
-    while ((::waitpid(c->pid, &status, 0) < 0) && (errno == EINTR)) {
-    }
+    std::int32_t status = 0;
+    while ((::waitpid(c->pid, &status, 0) < 0) && (errno == EINTR)) {}
     c->pid = -1;
   }
   CloseFd(c->out_fd);
@@ -116,8 +142,8 @@ Result<sftp::ByteStream> SpawnStream(const char* const* argv) noexcept {
     return Result<sftp::ByteStream>::error(Error::kChannelSpawnFailed);
   }
 
-  int in_pipe[2] = {-1, -1};
-  int out_pipe[2] = {-1, -1};
+  std::int32_t in_pipe[2] = {-1, -1};
+  std::int32_t out_pipe[2] = {-1, -1};
   if ((::pipe2(in_pipe, O_CLOEXEC) != 0) || (::pipe2(out_pipe, O_CLOEXEC) != 0)) {
     CloseFd(in_pipe[0]);
     CloseFd(in_pipe[1]);
@@ -155,9 +181,8 @@ Result<sftp::ByteStream> SpawnStream(const char* const* argv) noexcept {
   if (slot == nullptr) {
     CloseFd(in_pipe[1]);
     CloseFd(out_pipe[0]);
-    int status = 0;
-    while ((::waitpid(pid, &status, 0) < 0) && (errno == EINTR)) {
-    }
+    std::int32_t status = 0;
+    while ((::waitpid(pid, &status, 0) < 0) && (errno == EINTR)) {}
     return Result<sftp::ByteStream>::error(Error::kChannelSpawnFailed);
   }
   slot->in_fd = in_pipe[1];

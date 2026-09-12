@@ -1,19 +1,47 @@
-// picopaste — bounded log file with size-based rotation.
-//
-// The previous tool had no rotation and grew its log to 25 MB. Rotation lives
-// in-process by requirement: there is no external logrotate, script, or shell.
-//
-// Rotation happens inside Write(), on the writer thread that owns this object.
-// A signal handler must never call into it: stdio and rename() are not
-// async-signal-safe. Writers are single-threaded by contract.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file log_sink.hpp
+ * @brief Bounded log file with size-based rotation.
+ *
+ * The previous tool had no rotation and grew its log to 25 MB. Rotation lives
+ * in-process by requirement: there is no external logrotate, script, or shell.
+ *
+ * Rotation happens inside Write(), on the writer thread that owns this object.
+ * A signal handler must never call into it: stdio and rename() are not
+ * async-signal-safe. Writers are single-threaded by contract.
+ */
 
 #pragma once
 
-#include <cstdint>
-#include <cstdio>
+#include "log_ring.hpp"
 
 #include "picopaste/error.hpp"
-#include "log_ring.hpp"
+
+#include <cstdint>
+#include <cstdio>
 
 namespace picopaste {
 
@@ -24,17 +52,35 @@ class LogSink {
   LogSink(const LogSink&) = delete;
   LogSink& operator=(const LogSink&) = delete;
 
-  // Open (or create) `path` for append. `max_bytes` is the rotation threshold,
-  // `keep_files` the number of rotated generations to retain (path.1 .. path.N).
+  /**
+   * @brief Open (or create) `path` for append.
+   * @param path Log file to open.
+   * @param max_bytes Rotation threshold.
+   * @param keep_files Rotated generations to retain (path.1 .. path.N).
+   * @return kLogIoFailed when the path is invalid or cannot be opened.
+   */
   Status Open(const char* path, std::uint32_t max_bytes, std::uint32_t keep_files) noexcept;
 
-  // Flush and release the file. Idempotent.
+  /**
+   * @brief Flush and release the file. Idempotent.
+   */
   void Close() noexcept;
 
-  // Append one record. Flushes so the on-disk size tracks the accounting.
+  /**
+   * @brief Append one record.
+   * @param record Record to write.
+   * @return kLogIoFailed when the file is closed or the write/flush fails.
+   *
+   * Flushes so the on-disk size tracks the accounting.
+   */
   Status Write(const LogRecord& record) noexcept;
 
-  // Append up to `count` records. Returns how many were written.
+  /**
+   * @brief Append up to `count` records.
+   * @param records Array of records.
+   * @param count Number of records available.
+   * @return How many were written before the first failure.
+   */
   std::uint32_t WriteBatch(const LogRecord* records, std::uint32_t count) noexcept;
 
   bool IsOpen() const noexcept { return file_ != nullptr; }

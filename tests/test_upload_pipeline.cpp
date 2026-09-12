@@ -47,11 +47,11 @@ namespace {
 // single-flight test runs one trigger on a worker thread while the main thread
 // observes that no side effect happened.
 struct FakeOps {
-  std::atomic<int> capture_calls{0};
-  std::atomic<int> set_text_calls{0};
-  std::atomic<int> paste_calls{0};
-  std::atomic<int> restore_calls{0};
-  std::atomic<int> release_calls{0};
+  std::atomic<std::int32_t> capture_calls{0};
+  std::atomic<std::int32_t> set_text_calls{0};
+  std::atomic<std::int32_t> paste_calls{0};
+  std::atomic<std::int32_t> restore_calls{0};
+  std::atomic<std::int32_t> release_calls{0};
   std::atomic<std::uint32_t> last_delay{0};
 
   Error capture_error = Error::kOk;
@@ -451,4 +451,138 @@ TEST_CASE("no image on the clipboard writes nothing and sends no chord", "[pipel
   CHECK(ops.set_text_calls.load() == 0);
   CHECK(ops.paste_calls.load() == 0);
   CHECK('\0' == ops.clipboard_text[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded in-flight upload: the deadline
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an upload past its deadline fails, is counted and releases the flight", "[pipeline]") {
+  Config cfg = DefaultConfig();
+  cfg.upload_timeout_ms = 5000U;
+  cfg.delay_ms = 0;
+  cfg.remote_dir.assign(osp::TruncateToCapacity, "/tmp/picopaste-pipe-timeout");
+
+  const test::TempFile local = MakeLocalFile(1024u);
+  REQUIRE(local.valid());
+
+  FakeOps ops;
+  (void)std::snprintf(ops.local_path, sizeof(ops.local_path), "%s", local.path());
+  ops.bytes = 1024u;
+  ClipboardOps clip{};
+  InjectOps inject{};
+  ops.Wire(clip, inject);
+
+  UploadPipeline pipeline(cfg);
+  std::atomic<std::uint64_t> now_ms{1000000u};
+  pipeline.SetClock(
+      [&now_ms]() noexcept -> std::uint64_t { return now_ms.load(std::memory_order_relaxed); });
+
+  // Block inside capture until the gate opens: the shape of a step that never
+  // returns on its own, which is exactly what a silent peer produces (no EOF,
+  // no reply).
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = false;
+    ops.gate_entered = false;
+  }
+
+  // The deadline aborts before the first SFTP call, so an empty ByteStream is
+  // enough and this test never needs a reachable host.
+  auto client = std::make_unique<Client>(ByteStream{});
+
+  Result<UploadReport> result = Result<UploadReport>::error(Error::kOk);
+  std::thread worker([&pipeline, &client, &clip, &inject, &result] {
+    result = pipeline.Run(*client, clip, inject, 1900000010ull);
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_cv.wait(lock, [&ops] { return ops.gate_entered; });
+  }
+  CHECK(pipeline.in_flight());
+  // Before the deadline the check is quiet: a slow-but-live upload is not failed.
+  CHECK_FALSE(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 0u);
+
+  // Past the deadline the caller (the worker loop in production) latches it.
+  now_ms.store(1000000u + 5000u + 1u, std::memory_order_relaxed);
+  CHECK(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 1u);
+  // Idempotent while the run has not retired, and counted once.
+  CHECK(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 1u);
+
+  // In production the caller now drops the channel, which fails the blocked
+  // read. Here opening the gate completes the step so Run reaches its
+  // between-steps check. Either way Run must abort with the distinct code and
+  // must not proceed to the clipboard or the chord.
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = true;
+    ops.gate_cv.notify_all();
+  }
+  worker.join();
+
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == Error::kUploadTimeout);
+  CHECK_FALSE(pipeline.in_flight());
+  CHECK(ops.capture_calls.load() == 1);
+  CHECK(ops.set_text_calls.load() == 0);
+  CHECK(ops.paste_calls.load() == 0);
+  CHECK(ops.release_calls.load() == 1);  // the captured snapshot is released
+  CHECK('\0' == ops.clipboard_text[0]);
+}
+
+TEST_CASE("upload_timeout_ms = 0 keeps an upload unbounded", "[pipeline]") {
+  Config cfg = DefaultConfig();
+  cfg.upload_timeout_ms = 0U;
+  cfg.delay_ms = 0;
+  cfg.remote_dir.assign(osp::TruncateToCapacity, "/tmp/picopaste-pipe-notimeout");
+
+  const test::TempFile local = MakeLocalFile(64u);
+  REQUIRE(local.valid());
+
+  FakeOps ops;
+  (void)std::snprintf(ops.local_path, sizeof(ops.local_path), "%s", local.path());
+  ops.bytes = 64u;
+  ClipboardOps clip{};
+  InjectOps inject{};
+  ops.Wire(clip, inject);
+
+  UploadPipeline pipeline(cfg);
+  std::atomic<std::uint64_t> now_ms{0u};
+  pipeline.SetClock(
+      [&now_ms]() noexcept -> std::uint64_t { return now_ms.load(std::memory_order_relaxed); });
+
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = false;
+    ops.gate_entered = false;
+  }
+
+  auto client = std::make_unique<Client>(ByteStream{});
+  Result<UploadReport> result = Result<UploadReport>::error(Error::kOk);
+  std::thread worker([&pipeline, &client, &clip, &inject, &result] {
+    result = pipeline.Run(*client, clip, inject, 1900000011ull);
+  });
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_cv.wait(lock, [&ops] { return ops.gate_entered; });
+  }
+
+  // An hour of fake time must not trip a disabled deadline.
+  now_ms.store(3600000u, std::memory_order_relaxed);
+  CHECK_FALSE(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 0u);
+
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = true;
+    ops.gate_cv.notify_all();
+  }
+  worker.join();
+  // The disabled deadline never converts the run into kUploadTimeout.
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() != Error::kUploadTimeout);
 }

@@ -1,12 +1,39 @@
-// picopaste — lifecycle state machine implementation.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file lifecycle.cpp
+ * @brief Process lifecycle state machine (implementation).
+ */
 
 #include "lifecycle.hpp"
 
 namespace picopaste {
 namespace {
 
-constexpr const char* kStateNames[7] = {"Init",     "Connecting", "Ready", "Degraded",
-                                        "Reconnecting", "Stopping", "Stopped"};
+constexpr const char* kStateNames[7] = {"Init",         "Connecting", "Ready",  "Degraded",
+                                        "Reconnecting", "Stopping",   "Stopped"};
 
 }  // namespace
 
@@ -34,13 +61,21 @@ std::uint32_t BackoffDelayMs(std::uint32_t attempt, std::uint64_t stable_ms) noe
   return static_cast<std::uint32_t>(delay);
 }
 
+osp::TransitionResult Lifecycle::Degrade(Context& ctx) noexcept {
+  ctx.stable_ms = ctx.self->Now() - ctx.ready_since_ms;
+  if (ctx.stable_ms >= kStableResetMs) {
+    ctx.attempt = 0;  // the link earned a fresh ramp
+  }
+  ctx.retry_delay_ms = RetryDelay(ctx, ctx.stable_ms);
+  return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kDegraded));
+}
+
 Lifecycle::Lifecycle() noexcept : ctx_{}, machine_(ctx_), clock_() {
   ctx_.self = this;
   ctx_.machine = &machine_;
 
   const auto add = [this](LifecycleState state, const char* name,
-                          osp::TransitionResult (*handler)(Context&, const osp::Event&),
-                          void (*entry)(Context&)) {
+                          osp::TransitionResult (*handler)(Context&, const osp::Event&), void (*entry)(Context&)) {
     const osp::StateConfig<Context> config{name, -1, handler, entry, nullptr, nullptr};
     ctx_.state_index[static_cast<std::uint32_t>(state)] = machine_.AddState(config);
   };
@@ -57,7 +92,9 @@ Lifecycle::Lifecycle() noexcept : ctx_{}, machine_(ctx_), clock_() {
   clock_ = []() noexcept -> std::uint64_t { return osp::SteadyNowUs() / 1000ULL; };
 }
 
-void Lifecycle::SetClock(ClockFn clock) noexcept { clock_ = static_cast<ClockFn&&>(clock); }
+void Lifecycle::SetClock(ClockFn clock) noexcept {
+  clock_ = static_cast<ClockFn&&>(clock);
+}
 
 void Lifecycle::Start() noexcept {
   if (machine_.IsStarted()) {
@@ -84,7 +121,9 @@ LifecycleState Lifecycle::State() const noexcept {
   return LifecycleState::kInit;
 }
 
-const char* Lifecycle::StateName() const noexcept { return kStateNames[static_cast<std::uint32_t>(State())]; }
+const char* Lifecycle::StateName() const noexcept {
+  return kStateNames[static_cast<std::uint32_t>(State())];
+}
 
 TrayHealth Lifecycle::Health() const noexcept {
   switch (State()) {
@@ -139,12 +178,15 @@ osp::TransitionResult Lifecycle::HandleReady(Context& ctx, const osp::Event& eve
   switch (static_cast<LifecycleEvent>(event.id)) {
     case LifecycleEvent::kChannelLost:
       ++ctx.channel_lost_count;
-      ctx.stable_ms = ctx.self->Now() - ctx.ready_since_ms;
-      if (ctx.stable_ms >= kStableResetMs) {
-        ctx.attempt = 0;  // the link earned a fresh ramp
-      }
-      ctx.retry_delay_ms = RetryDelay(ctx, ctx.stable_ms);
-      return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kDegraded));
+      return Degrade(ctx);
+    case LifecycleEvent::kConnectFail:
+      // An upload failed while Ready. The worker loop has already dropped the
+      // channel before posting this, so the link is gone and the tray must not
+      // stay green; without this the bounded upload's kUploadTimeout would be
+      // dropped here as unhandled -- failure indistinguishable from success,
+      // which is the one thing this project refuses to ship.
+      ++ctx.connect_fail_count;
+      return Degrade(ctx);
     case LifecycleEvent::kStop:
       return MachineOf(ctx).RequestTransition(Index(ctx, LifecycleState::kStopping));
     default:

@@ -1,12 +1,39 @@
-// picopaste -- ByteStream over a CreateProcessW child with pipe redirection.
-//
-// This is the Windows counterpart of src/platform/posix/stream_posix.cpp: it
-// spawns `ssh -o ClearAllForwardings=yes -s <host> sftp` with its stdin/stdout
-// wired to anonymous pipes and exposes the pipes as a picopaste::sftp::ByteStream.
-//
-// The child is placed in the caller's containment Job Object (if one is given)
-// so it cannot outlive us. read/write are blocking and exact-length, per the
-// ByteStream contract.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file stream_win32.hpp
+ * @brief ByteStream over a CreateProcessW child with pipe redirection.
+ *
+ * This is the Windows counterpart of src/platform/posix/stream_posix.cpp: it
+ * spawns `ssh -o ClearAllForwardings=yes -s <host> sftp` with its stdin/stdout
+ * wired to anonymous pipes and exposes the pipes as a picopaste::sftp::ByteStream.
+ *
+ * The child is placed in the caller's containment Job Object (if one is given)
+ * so it cannot outlive us. read/write are blocking and exact-length, per the
+ * ByteStream contract.
+ */
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -23,14 +50,13 @@
 // See win32_util.hpp: osp/platform.hpp must precede <windows.h> so newosp does
 // not mistake windows.h's RT_VERSION macro for the RT-Thread marker.
 #include "osp/platform.hpp"
+#include "picopaste/error.hpp"
+#include "picopaste/sftp/stream.hpp"
 
 #include <windows.h>
 
 #include <cstddef>
 #include <cstdint>
-
-#include "picopaste/error.hpp"
-#include "picopaste/sftp/stream.hpp"
 
 namespace picopaste::win32 {
 
@@ -57,19 +83,21 @@ class ChildStream final {
   ChildStream(const ChildStream&) = delete;
   ChildStream& operator=(const ChildStream&) = delete;
 
-  // Spawn the child. Fails with kChannelSpawnFailed. On any failure no child or
-  // handle is left behind.
+  /**
+   * @brief Spawn the child.
+   * @return kChannelSpawnFailed on failure; no child or handle is left behind.
+   */
   Status Spawn(const ChildStreamOptions& options) noexcept;
 
-  // Terminate the child and close every handle. Idempotent; safe to call twice.
+  /** @brief Terminate the child and close every handle. Idempotent. */
   void Close() noexcept;
 
-  // A ByteStream backed by this object. Valid until Close() (or destruction).
+  /** @brief A ByteStream backed by this object, valid until Close() (or destruction). */
   sftp::ByteStream stream() noexcept;
 
   HANDLE process_handle() const noexcept { return process_; }
 
-  // Non-blocking: true while the child has not exited.
+  /** @brief Non-blocking: true while the child has not exited. */
   bool running() const noexcept;
 
  private:

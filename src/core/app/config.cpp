@@ -1,13 +1,42 @@
-// picopaste — runtime configuration implementation.
-//
-// Reads and writes the fixed-capacity `Config` through newosp's INI config
-// layer. The file is the only place configuration comes from; defaults live in
-// code so a fresh install needs no shipped template.
-//
-// Over-long values are rejected before assignment: `FixedString::assign` would
-// otherwise truncate silently, which the config contract forbids.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file config.cpp
+ * @brief Runtime configuration load and save.
+ *
+ * Reads and writes the fixed-capacity `Config` through newosp's INI config
+ * layer. The file is the only place configuration comes from; defaults live in
+ * code so a fresh install needs no shipped template.
+ *
+ * Over-long values are rejected before assignment: `FixedString::assign` would
+ * otherwise truncate silently, which the config contract forbids.
+ */
 
 #include "picopaste/config.hpp"
+
+#include "osp/config.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +45,6 @@
 
 #include <filesystem>
 #include <system_error>
-
-#include "osp/config.hpp"
 
 #if defined(_WIN32)
 #include <io.h>
@@ -157,6 +184,12 @@ bool FileHasOverlongValue(const char* path) noexcept {
   if (file == nullptr) {
     return false;
   }
+  // Known limit: only the first kRawFileBytes are scanned, so an over-long value
+  // sitting past that offset is not caught and the library will truncate it
+  // silently. Accepted deliberately: a real config is a few hundred bytes and
+  // kRawFileBytes is 64 KB, while reading the whole file would mean allocating,
+  // and this function is noexcept -- an allocation failure would terminate the
+  // process, which is a worse outcome than the hole it would close.
   char buffer[kRawFileBytes];
   const std::size_t size = std::fread(buffer, 1, sizeof(buffer) - 1U, file);
   (void)std::fclose(file);
@@ -192,6 +225,10 @@ bool SyncFile(std::FILE* file) noexcept {
 
 }  // namespace
 
+/**
+ * @brief Built-in configuration, used when no file exists and for every key a
+ * file omits.
+ */
 Config DefaultConfig() noexcept {
   Config cfg;
   cfg.host.clear();
@@ -200,6 +237,7 @@ Config DefaultConfig() noexcept {
   cfg.ssh_command = "ssh";
   cfg.log_level = "info";
   cfg.delay_ms = 150;
+  cfg.upload_timeout_ms = 30000;
   cfg.log_max_bytes = 8u * 1024u * 1024u;
   cfg.log_keep_files = 2;
   cfg.max_image_bytes = 20u * 1024u * 1024u;
@@ -209,6 +247,15 @@ Config DefaultConfig() noexcept {
   return cfg;
 }
 
+/**
+ * @brief Load configuration from `path`.
+ * @param path INI file to read; a null path is kConfigParseFailed.
+ * @param created_defaults set to true when the file was missing, so the caller
+ * can announce that defaults were created (may be null). A missing file is not
+ * an error.
+ * @return The parsed Config, or kConfigParseFailed for malformed or over-long
+ * content.
+ */
 Result<Config> LoadConfig(const char* path, bool* created_defaults) noexcept {
   if (created_defaults != nullptr) {
     *created_defaults = false;
@@ -220,13 +267,11 @@ Result<Config> LoadConfig(const char* path, bool* created_defaults) noexcept {
   IniConfig ini;
   const auto loaded = ini.LoadFile(path);
   if (!loaded.has_value()) {
-    if (loaded.get_error() == osp::ConfigError::kFileNotFound) {
-      if (created_defaults != nullptr) {
-        *created_defaults = true;
-      }
-      return Result<Config>::success(DefaultConfig());
+    const bool missing = (loaded.get_error() == osp::ConfigError::kFileNotFound);
+    if (missing && (created_defaults != nullptr)) {
+      *created_defaults = true;
     }
-    return Result<Config>::error(Error::kConfigParseFailed);
+    return missing ? Result<Config>::success(DefaultConfig()) : Result<Config>::error(Error::kConfigParseFailed);
   }
 
   // Do NOT delete as redundant with the capacity constants: newosp's
@@ -256,6 +301,7 @@ Result<Config> LoadConfig(const char* path, bool* created_defaults) noexcept {
   }
 
   cfg.delay_ms = LookupU32(ini, "delay_ms", cfg.delay_ms);
+  cfg.upload_timeout_ms = LookupU32(ini, "upload_timeout_ms", cfg.upload_timeout_ms);
   cfg.max_image_bytes = LookupU32(ini, "max_image_bytes", cfg.max_image_bytes);
   cfg.job_memory_limit_mb = LookupU32(ini, "job_memory_limit_mb", cfg.job_memory_limit_mb);
   cfg.log_max_bytes = LookupU32(ini, "log_max_bytes", cfg.log_max_bytes);
@@ -266,6 +312,13 @@ Result<Config> LoadConfig(const char* path, bool* created_defaults) noexcept {
   return Result<Config>::success(cfg);
 }
 
+/**
+ * @brief Write `cfg` to `path`.
+ *
+ * Writes a temp file in the same directory, flushes it to disk, then renames,
+ * so a crash mid-write cannot leave a torn config.
+ * @return kConfigWriteFailed on any I/O failure; the temp file is removed.
+ */
 Status SaveConfig(const char* path, const Config& cfg) noexcept {
   if (path == nullptr) {
     return Status::error(Error::kConfigWriteFailed);
@@ -273,7 +326,7 @@ Status SaveConfig(const char* path, const Config& cfg) noexcept {
 
   // Temp file in the same directory so rename is same-filesystem and atomic.
   char tmp[4096];
-  const int written = std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  const std::int32_t written = std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
   if ((0 > written) || (static_cast<std::size_t>(written) >= sizeof(tmp))) {
     return Status::error(Error::kConfigWriteFailed);
   }
@@ -288,6 +341,7 @@ Status SaveConfig(const char* path, const Config& cfg) noexcept {
   ok = ok && WriteStr(file, "remote_dir", cfg.remote_dir.c_str());
   ok = ok && WriteStr(file, "hotkey", cfg.hotkey.c_str());
   ok = ok && WriteU32(file, "delay_ms", cfg.delay_ms);
+  ok = ok && WriteU32(file, "upload_timeout_ms", cfg.upload_timeout_ms);
   ok = ok && WriteBool(file, "restore_clipboard", cfg.restore_clipboard);
   ok = ok && WriteU32(file, "max_image_bytes", cfg.max_image_bytes);
   ok = ok && WriteU32(file, "job_memory_limit_mb", cfg.job_memory_limit_mb);
@@ -306,15 +360,12 @@ Status SaveConfig(const char* path, const Config& cfg) noexcept {
     ok = false;
   }
 
-  if (!ok) {
-    std::error_code remove_ec;
-    std::filesystem::remove(tmp, remove_ec);
-    return Status::error(Error::kConfigWriteFailed);
+  if (ok) {
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp, path, rename_ec);
+    ok = !rename_ec;
   }
-
-  std::error_code rename_ec;
-  std::filesystem::rename(tmp, path, rename_ec);
-  if (rename_ec) {
+  if (!ok) {
     std::error_code remove_ec;
     std::filesystem::remove(tmp, remove_ec);
     return Status::error(Error::kConfigWriteFailed);

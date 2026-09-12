@@ -21,14 +21,15 @@
 // requires a long-lived instance, never a 256 KB worker stack frame).
 #pragma once
 
-#include <atomic>
-#include <cstdint>
-
+#include "../sftp/dir_ops.hpp"  // sftp::RetentionPolicy / DirOps
+#include "osp/vocabulary.hpp"
 #include "picopaste/config.hpp"
 #include "picopaste/error.hpp"
 #include "picopaste/sftp/client.hpp"
-#include "../sftp/dir_ops.hpp"  // sftp::RetentionPolicy / DirOps
-#include "osp/vocabulary.hpp"
+
+#include <cstdint>
+
+#include <atomic>
 
 namespace picopaste {
 
@@ -73,8 +74,8 @@ struct ClipboardOps {
   void (*release)(void* ctx, void* token) noexcept = nullptr;
 
   bool valid() const noexcept {
-    return (nullptr != ctx) && (nullptr != capture) && (nullptr != set_text) &&
-           (nullptr != restore) && (nullptr != release);
+    return (nullptr != ctx) && (nullptr != capture) && (nullptr != set_text) && (nullptr != restore) &&
+           (nullptr != release);
   }
 };
 
@@ -116,6 +117,11 @@ class UploadPipeline final {
   UploadPipeline(const UploadPipeline&) = delete;
   UploadPipeline& operator=(const UploadPipeline&) = delete;
 
+  // Injectable monotonic clock in milliseconds, the same shape Lifecycle uses.
+  // Tests replace it so the deadline can be driven without real time.
+  using ClockFn = osp::FixedFunction<std::uint64_t(), 16>;
+  void SetClock(ClockFn clock) noexcept;
+
   // Override the directory-retention policy. Call before the first Run.
   void SetRetention(const sftp::RetentionPolicy& policy) noexcept { retention_ = policy; }
 
@@ -126,13 +132,30 @@ class UploadPipeline final {
   // Returns kBusy when a run is already in flight. Any failure before the
   // clipboard is published guarantees that neither set_text nor paste was
   // called, so the user sees an unchanged clipboard and no keystroke.
-  Result<UploadReport> Run(sftp::Client& client, const ClipboardOps& clipboard,
-                           const InjectOps& inject, std::uint64_t now_unix) noexcept;
+  Result<UploadReport> Run(sftp::Client& client, const ClipboardOps& clipboard, const InjectOps& inject,
+                           std::uint64_t now_unix) noexcept;
 
   // Cheap, lock-free peek for the trigger path: lets the caller surface
   // "busy" without waiting. The authoritative check is the compare-and-swap
   // inside Run(); this is only an early-out for user feedback.
   bool in_flight() const noexcept { return in_flight_.load(std::memory_order_acquire); }
+
+  // Bounded in-flight upload. A silent peer leaves the upload blocked in a read
+  // with no EOF, so the single-flight flag would otherwise stay set forever and
+  // the tool would look healthy while ignoring every later hotkey. The caller
+  // must run this on a thread that is NOT the one blocked in Run -- on Windows
+  // the main message loop arms a timer only while an upload is in flight, since
+  // the worker's own loop is inside Run and cannot check anything. It compares
+  // the injected clock against the in-flight upload's deadline and, on the first
+  // call that finds it past, latches the expiry and counts it. The caller must
+  // then tear the channel down exactly as it does for a dead pipe
+  // (DropChannel + Lifecycle::Post(kChannelLost)); that teardown is what makes
+  // the blocked read fail, so Run can unwind. False when nothing is in flight,
+  // when upload_timeout_ms is 0 (deadline disabled), or before the deadline.
+  bool UploadOverdue() noexcept;
+
+  // Uploads aborted by upload_timeout_ms. Mirrors Lifecycle's failure counters.
+  std::uint32_t UploadTimeoutCount() const noexcept { return upload_timeout_count_.load(std::memory_order_relaxed); }
 
  private:
   Status CaptureLocal(const ClipboardOps& clip, CapturedClip& out) noexcept;
@@ -141,8 +164,15 @@ class UploadPipeline final {
                          sftp::Path& published, std::uint64_t now_unix) noexcept;
   Status Publish(const ClipboardOps& clip, const InjectOps& inject, const CapturedClip& capture,
                  const char* remote_path, bool& restored) noexcept;
-  void Prune(sftp::Client& client, const sftp::Path& dir, std::uint64_t now_unix,
-             UploadReport& report) noexcept;
+  void Prune(sftp::Client& client, const sftp::Path& dir, std::uint64_t now_unix, UploadReport& report) noexcept;
+
+  // True when the external deadline check has latched this flight. The
+  // generation is compared so a latch from the previous upload cannot end a new
+  // one; Run uses it to abort at a step boundary with kUploadTimeout.
+  bool DeadlinePassed(std::uint32_t generation) const noexcept {
+    return expired_generation_.load(std::memory_order_acquire) == generation;
+  }
+  std::uint64_t Now() const noexcept { return clock_(); }
 
   Config cfg_{};
   sftp::RetentionPolicy retention_{};
@@ -150,9 +180,19 @@ class UploadPipeline final {
   // Cross-thread flag: the message loop reads it while the upload worker runs.
   // A non-lock-free atomic would hide a lock/heap dependency, so refuse it at
   // compile time (the same rule newosp applies to its own cross-thread flags).
-  static_assert(std::atomic<bool>::is_always_lock_free,
-                "the in-flight flag must be lock-free to stay allocation-free");
+  static_assert(std::atomic<bool>::is_always_lock_free, "the in-flight flag must be lock-free to stay allocation-free");
   std::atomic<bool> in_flight_{false};
+
+  // Deadline bookkeeping, all touched by both the upload worker and whichever
+  // thread runs the periodic check. A flight's generation keys its own start
+  // time and expiry latch, so the previous upload's values are never attributed
+  // to a new one. `active_generation_` is 0 when no upload is in flight.
+  ClockFn clock_;
+  std::atomic<std::uint32_t> flight_generation_{0};
+  std::atomic<std::uint32_t> active_generation_{0};
+  std::atomic<std::uint32_t> expired_generation_{0};
+  std::atomic<std::uint64_t> flight_start_ms_{0};
+  std::atomic<std::uint32_t> upload_timeout_count_{0};
 };
 
 }  // namespace picopaste

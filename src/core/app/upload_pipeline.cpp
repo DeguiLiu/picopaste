@@ -2,6 +2,8 @@
 
 #include "upload_pipeline.hpp"
 
+#include "osp/platform.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -29,8 +31,7 @@ class FlightGuard final {
 // the token only exists once capture() has succeeded.
 class CaptureGuard final {
  public:
-  CaptureGuard(const ClipboardOps& clip, const CapturedClip& captured) noexcept
-      : clip_(&clip), captured_(&captured) {}
+  CaptureGuard(const ClipboardOps& clip, const CapturedClip& captured) noexcept : clip_(&clip), captured_(&captured) {}
   ~CaptureGuard() noexcept {
     if ((nullptr != captured_->restore_token) && (nullptr != clip_->release)) {
       clip_->release(clip_->ctx, captured_->restore_token);
@@ -49,12 +50,11 @@ class CaptureGuard final {
 // expanded by asking the SFTP subsystem for its own working directory
 // (REALPATH "." is the user's home on OpenSSH) — no shell, no HOME probe, no
 // banner to filter. An already-absolute path is used verbatim.
-Status ResolveRemoteDir(sftp::Client& client, const char* remote_dir, char* buf,
-                        std::size_t cap) noexcept {
+Status ResolveRemoteDir(sftp::Client& client, const char* remote_dir, char* buf, std::size_t cap) noexcept {
   if ((nullptr == remote_dir) || ('\0' == remote_dir[0])) {
     return Status::error(Error::kMkdirFailed);
   }
-  int written = -1;
+  std::int32_t written = -1;
   if (('~' == remote_dir[0]) && ('/' == remote_dir[1])) {
     const auto home = client.Realpath(".");
     if (!home) {
@@ -74,8 +74,7 @@ Status ResolveRemoteDir(sftp::Client& client, const char* remote_dir, char* buf,
 // suffix is a mix of the timestamp and a counter so two uploads in the same
 // second do not collide. gmtime's shared buffer is safe here because Run() is
 // single-flight by construction.
-void MakeObjectName(std::uint64_t now_unix, std::uint32_t suffix, char* out,
-                    std::size_t cap) noexcept {
+void MakeObjectName(std::uint64_t now_unix, std::uint32_t suffix, char* out, std::size_t cap) noexcept {
   const std::time_t when = static_cast<std::time_t>(now_unix);
   const std::tm* parts = std::gmtime(&when);
   std::int32_t year = 1970;
@@ -92,8 +91,8 @@ void MakeObjectName(std::uint64_t now_unix, std::uint32_t suffix, char* out,
     minute = parts->tm_min;
     second = parts->tm_sec;
   }
-  (void)std::snprintf(out, cap, "clip-%04d%02d%02d-%02d%02d%02d-%08x.png", year, month, day, hour,
-                      minute, second, suffix);
+  (void)std::snprintf(out, cap, "clip-%04d%02d%02d-%02d%02d%02d-%08x.png", year, month, day, hour, minute, second,
+                      suffix);
 }
 
 }  // namespace
@@ -101,6 +100,39 @@ void MakeObjectName(std::uint64_t now_unix, std::uint32_t suffix, char* out,
 UploadPipeline::UploadPipeline(const Config& cfg) noexcept : cfg_(cfg) {
   retention_.keep_newest = kDefaultKeepNewest;
   retention_.max_age_seconds = kDefaultMaxAgeSeconds;
+  clock_ = []() noexcept -> std::uint64_t { return osp::SteadyNowUs() / 1000ULL; };
+}
+
+void UploadPipeline::SetClock(ClockFn clock) noexcept {
+  clock_ = static_cast<ClockFn&&>(clock);
+}
+
+bool UploadPipeline::UploadOverdue() noexcept {
+  const std::uint32_t generation = active_generation_.load(std::memory_order_acquire);
+  if (0u == generation) {
+    return false;  // nothing in flight
+  }
+  if (DeadlinePassed(generation)) {
+    return true;  // already latched; the run has not retired yet
+  }
+  if (0u == cfg_.upload_timeout_ms) {
+    return false;  // deadline disabled
+  }
+  const std::uint64_t start_ms = flight_start_ms_.load(std::memory_order_relaxed);
+  if (0u == start_ms) {
+    return false;  // the flag was won but the flight has not armed yet
+  }
+  if ((Now() - start_ms) < static_cast<std::uint64_t>(cfg_.upload_timeout_ms)) {
+    return false;
+  }
+  // Re-read: the run may have retired between the load above and here, in which
+  // case this deadline belongs to no live flight and must not be counted.
+  if (active_generation_.load(std::memory_order_acquire) != generation) {
+    return false;
+  }
+  expired_generation_.store(generation, std::memory_order_release);
+  upload_timeout_count_.fetch_add(1u, std::memory_order_relaxed);
+  return true;
 }
 
 Status UploadPipeline::CaptureLocal(const ClipboardOps& clip, CapturedClip& out) noexcept {
@@ -136,19 +168,17 @@ Status UploadPipeline::EnsureRemoteDir(sftp::Client& client, sftp::Path& out) no
   return Status::success();
 }
 
-Status UploadPipeline::UploadAndVerify(sftp::Client& client, const CapturedClip& capture,
-                                       const sftp::Path& dir, sftp::Path& published,
-                                       std::uint64_t now_unix) noexcept {
-  const std::uint32_t suffix =
-      (static_cast<std::uint32_t>(now_unix) * 2654435761u) ^ (counter_ * 2246822519u);
+Status UploadPipeline::UploadAndVerify(sftp::Client& client, const CapturedClip& capture, const sftp::Path& dir,
+                                       sftp::Path& published, std::uint64_t now_unix) noexcept {
+  const std::uint32_t suffix = (static_cast<std::uint32_t>(now_unix) * 2654435761u) ^ (counter_ * 2246822519u);
   ++counter_;
   char name[96];
   MakeObjectName(now_unix, suffix, name, sizeof(name));
 
   char tmp_buf[sftp::kMaxPathBytes];
   char final_buf[sftp::kMaxPathBytes];
-  const int t = std::snprintf(tmp_buf, sizeof(tmp_buf), "%s/.tmp-%s", dir.c_str(), name);
-  const int f = std::snprintf(final_buf, sizeof(final_buf), "%s/%s", dir.c_str(), name);
+  const std::int32_t t = std::snprintf(tmp_buf, sizeof(tmp_buf), "%s/.tmp-%s", dir.c_str(), name);
+  const std::int32_t f = std::snprintf(final_buf, sizeof(final_buf), "%s/%s", dir.c_str(), name);
   if ((0 > t) || (static_cast<std::size_t>(t) >= sizeof(tmp_buf)) || (0 > f) ||
       (static_cast<std::size_t>(f) >= sizeof(final_buf))) {
     return Status::error(Error::kOpenFailed);  // remote path cap exceeded
@@ -163,8 +193,7 @@ Status UploadPipeline::UploadAndVerify(sftp::Client& client, const CapturedClip&
     if (remote) {
       // This is the re-read the design demands: compare what the server reports
       // with what we captured, not with what we hope we sent.
-      s = (remote.value() == capture.bytes) ? Status::success()
-                                            : Status::error(Error::kSizeMismatch);
+      s = (remote.value() == capture.bytes) ? Status::success() : Status::error(Error::kSizeMismatch);
     } else {
       s = Status::error(Error::kStatFailed);
     }
@@ -181,9 +210,8 @@ Status UploadPipeline::UploadAndVerify(sftp::Client& client, const CapturedClip&
   return Status::success();
 }
 
-Status UploadPipeline::Publish(const ClipboardOps& clip, const InjectOps& inject,
-                               const CapturedClip& capture, const char* remote_path,
-                               bool& restored) noexcept {
+Status UploadPipeline::Publish(const ClipboardOps& clip, const InjectOps& inject, const CapturedClip& capture,
+                               const char* remote_path, bool& restored) noexcept {
   restored = false;
   if (!inject.valid()) {
     return Status::error(Error::kSendInputRejected);
@@ -221,14 +249,21 @@ void UploadPipeline::Prune(sftp::Client& client, const sftp::Path& dir, std::uin
   report.pruned_files = cleaned.value().removed;
 }
 
-Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOps& clipboard,
-                                         const InjectOps& inject, std::uint64_t now_unix) noexcept {
+Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOps& clipboard, const InjectOps& inject,
+                                         std::uint64_t now_unix) noexcept {
   // Single-flight. The exchange returns the previous value: false -> we won the
   // slot; true -> another run owns it and this trigger is refused with kBusy.
   if (in_flight_.exchange(true, std::memory_order_acq_rel)) {
     return Result<UploadReport>::error(Error::kBusy);
   }
   const FlightGuard flight(in_flight_);
+
+  // Arm this flight's deadline once the flag is won, so a refused trigger
+  // cannot disturb the running one. The generation keys the start time and the
+  // expiry latch, so no state from the previous upload can end this one.
+  const std::uint32_t generation = flight_generation_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+  flight_start_ms_.store(Now(), std::memory_order_relaxed);
+  active_generation_.store(generation, std::memory_order_release);
 
   CapturedClip captured{};
   const CaptureGuard cleanup(clipboard, captured);
@@ -241,15 +276,35 @@ Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOp
   // after it. This is the ordering guarantee: nothing reaches the clipboard
   // unless capture, mkdir, upload, size verification and rename all succeeded.
   Status step = CaptureLocal(clipboard, captured);
+  if (step && DeadlinePassed(generation)) {
+    step = Status::error(Error::kUploadTimeout);
+  }
   if (step) {
     step = EnsureRemoteDir(client, dir);
+  }
+  if (step && DeadlinePassed(generation)) {
+    step = Status::error(Error::kUploadTimeout);
   }
   if (step) {
     step = UploadAndVerify(client, captured, dir, remote, now_unix);
   }
+  if (step && DeadlinePassed(generation)) {
+    step = Status::error(Error::kUploadTimeout);
+  }
   if (step) {
     step = Publish(clipboard, inject, captured, remote.c_str(), restored);
   }
+  if (step && DeadlinePassed(generation)) {
+    step = Status::error(Error::kUploadTimeout);
+  }
+
+  // The deadline is enforced at these boundaries: an upload that expired while
+  // a step was blocked must not continue into the next one, even if the step it
+  // was stuck in eventually completed. The last check keeps the returned code
+  // consistent with the latch even when expiry lands inside Publish. Retire the
+  // flight before returning so the next run starts with no state from this one;
+  // FlightGuard then releases the flag on this exit like every other.
+  active_generation_.store(0u, std::memory_order_release);
   if (!step) {
     return Result<UploadReport>::error(step.get_error());
   }

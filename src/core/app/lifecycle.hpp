@@ -1,23 +1,50 @@
-// picopaste — process lifecycle state machine.
-//
-// Built on newosp's osp/hsm.hpp (StateMachine), per design decision 7.
-// service_hsm.hpp is deliberately not used: HsmService drags in
-// fault_collector.hpp and bus.hpp, neither of which this process needs.
-//
-// Failure visibility is the point of this layer. A dropped channel moves
-// Ready -> Degraded immediately, so the tray can go red without waiting for a
-// user to notice that paste stopped working.
-//
-// The backoff policy is a pure function (BackoffDelayMs) so tests can drive
-// the 5 s -> 60 s ramp and the 3-minute stable reset without real time. The
-// machine's own clock is injectable for the same reason.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file lifecycle.hpp
+ * @brief Process lifecycle state machine.
+ *
+ * Built on newosp's osp/hsm.hpp (StateMachine), per design decision 7.
+ * service_hsm.hpp is deliberately not used: HsmService drags in
+ * fault_collector.hpp and bus.hpp, neither of which this process needs.
+ *
+ * Failure visibility is the point of this layer. A dropped channel moves
+ * Ready -> Degraded immediately, so the tray can go red without waiting for a
+ * user to notice that paste stopped working.
+ *
+ * The backoff policy is a pure function (BackoffDelayMs) so tests can drive
+ * the 5 s -> 60 s ramp and the 3-minute stable reset without real time. The
+ * machine's own clock is injectable for the same reason.
+ */
 
 #pragma once
 
-#include <cstdint>
-
 #include "osp/hsm.hpp"
 #include "osp/vocabulary.hpp"
+
+#include <cstdint>
 
 namespace picopaste {
 
@@ -26,9 +53,13 @@ inline constexpr std::uint32_t kBackoffBaseMs = 5000;
 inline constexpr std::uint32_t kBackoffMaxMs = 60000;
 inline constexpr std::uint64_t kStableResetMs = 180000;  // 3 minutes
 
-// Pure policy: delay before retry `attempt` (zero-based count of consecutive
-// failures), unless the link had been stable for `stable_ms`, in which case the
-// ramp resets to base.
+/**
+ * @brief Pure backoff policy: delay before retry `attempt`, unless the link had
+ * been stable for `stable_ms`, in which case the ramp resets to base.
+ * @param attempt zero-based count of consecutive failures.
+ * @param stable_ms how long the last Ready stayed up.
+ * @return The delay to wait before the next attempt, capped at kBackoffMaxMs.
+ */
 std::uint32_t BackoffDelayMs(std::uint32_t attempt, std::uint64_t stable_ms) noexcept;
 
 enum class LifecycleState : std::uint8_t {
@@ -64,22 +95,37 @@ class Lifecycle {
   Lifecycle(const Lifecycle&) = delete;
   Lifecycle& operator=(const Lifecycle&) = delete;
 
+  /**
+   * @brief Replace the default steady clock (tests drive time explicitly).
+   * @param clock must be non-null before Start.
+   */
   void SetClock(ClockFn clock) noexcept;
 
-  // Enter the machine (Init) and arm it. Post(kStart) then drives Connecting.
+  /**
+   * @brief Enter the machine (Init) and arm it.
+   *
+   * Post(kStart) then drives Connecting.
+   */
   void Start() noexcept;
 
-  // Feed one event. Returns false if the machine has not been started.
+  /**
+   * @brief Feed one event to the machine.
+   * @return false if the machine has not been started.
+   */
   bool Post(LifecycleEvent event) noexcept;
 
   void Stop() noexcept { (void)Post(LifecycleEvent::kStop); }
 
+  /** @brief Current state, or kInit before the machine is started. */
   LifecycleState State() const noexcept;
+
+  /** @brief Stable name for State(), e.g. "Ready". */
   const char* StateName() const noexcept;
 
   bool IsReady() const noexcept { return LifecycleState::kReady == State(); }
   bool IsStopped() const noexcept { return LifecycleState::kStopped == State(); }
 
+  /** @brief Tray colour for the current state. */
   TrayHealth Health() const noexcept;
 
   // Delay that the supervision loop should wait before the next attempt.
@@ -99,10 +145,10 @@ class Lifecycle {
     void* machine = nullptr;  // osp::StateMachine<Context, 7>*
     std::int32_t state_index[kStateCount] = {-1, -1, -1, -1, -1, -1, -1};
 
-    std::uint32_t attempt = 0;          // consecutive failed connect attempts
-    std::uint64_t ready_since_ms = 0;   // monotonic time Ready was entered
-    std::uint64_t stable_ms = 0;        // how long the last Ready stayed up
-    std::uint32_t retry_delay_ms = 0;   // delay to wait before next attempt
+    std::uint32_t attempt = 0;         // consecutive failed connect attempts
+    std::uint64_t ready_since_ms = 0;  // monotonic time Ready was entered
+    std::uint64_t stable_ms = 0;       // how long the last Ready stayed up
+    std::uint32_t retry_delay_ms = 0;  // delay to wait before next attempt
 
     std::uint32_t connect_ok_count = 0;
     std::uint32_t connect_fail_count = 0;
@@ -126,9 +172,11 @@ class Lifecycle {
   }
   static std::uint32_t RetryDelay(const Context& ctx, std::uint64_t stable_ms) noexcept;
 
-  static Machine& MachineOf(const Context& ctx) noexcept {
-    return *static_cast<Machine*>(ctx.machine);
-  }
+  // Ready -> Degraded, shared by a lost channel and a failed upload. Both mean
+  // the link the retry loop is about to rebuild is gone, so both must show red.
+  static osp::TransitionResult Degrade(Context& ctx) noexcept;
+
+  static Machine& MachineOf(const Context& ctx) noexcept { return *static_cast<Machine*>(ctx.machine); }
   std::uint64_t Now() const noexcept { return clock_(); }
 
   Context ctx_{};

@@ -147,7 +147,7 @@ TEST_CASE("The 3-minute stable mark resets the backoff", "[lifecycle]") {
   lc.Post(LifecycleEvent::kStart);
 
   // Six failures: attempt = 6, delay pinned at the ceiling.
-  for (int i = 0; i < 6; ++i) {
+  for (std::int32_t i = 0; i < 6; ++i) {
     lc.Post(LifecycleEvent::kConnectFail);
   }
   CHECK(lc.Attempt() == 6U);
@@ -171,6 +171,30 @@ TEST_CASE("The 3-minute stable mark resets the backoff", "[lifecycle]") {
   CHECK(lc.Attempt() == 0U);
   CHECK(lc.StableMs() == 180000U);
   CHECK(lc.RetryDelayMs() == 5000U);
+}
+
+TEST_CASE("A failed upload while Ready degrades and shows red", "[lifecycle]") {
+  // The worker loop drops the channel and posts kConnectFail for any upload
+  // failure, including a bounded upload's kUploadTimeout. If Ready ignored the
+  // event the tray would stay green after a real failure -- the silent-failure
+  // mode this project exists to remove.
+  Lifecycle lc;
+  DriveToReady(lc);
+  REQUIRE(lc.State() == LifecycleState::kReady);
+  CHECK(lc.Health() == TrayHealth::kGreen);
+
+  lc.Post(LifecycleEvent::kConnectFail);
+  CHECK(lc.State() == LifecycleState::kDegraded);
+  CHECK(lc.Health() == TrayHealth::kRed);
+  CHECK(lc.ConnectFailCount() == 1U);
+  CHECK(lc.RetryDelayMs() == picopaste::kBackoffBaseMs);  // the loop arms a fresh retry
+
+  // Recovery is the normal degraded path: kRetry -> Reconnecting -> kConnectOk.
+  lc.Post(LifecycleEvent::kRetry);
+  CHECK(lc.State() == LifecycleState::kReconnecting);
+  lc.Post(LifecycleEvent::kConnectOk);
+  CHECK(lc.State() == LifecycleState::kReady);
+  CHECK(lc.Health() == TrayHealth::kGreen);
 }
 
 TEST_CASE("Post before Start is refused", "[lifecycle]") {

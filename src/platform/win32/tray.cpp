@@ -1,13 +1,40 @@
-// picopaste -- tray icon implementation.
-#include "tray.hpp"
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
-#include <imm.h>
-#include <shellapi.h>
+/**
+ * @file tray.cpp
+ * @brief Tray icon implementation.
+ */
+#include "tray.hpp"
 
 #include "single_instance.hpp"
 #include "stream_win32.hpp"
 #include "tray_icons.h"
 #include "win32_util.hpp"
+
+#include <imm.h>
+#include <shellapi.h>
 
 namespace picopaste::win32 {
 namespace {
@@ -29,7 +56,7 @@ constexpr DWORD kRelaunchProbeMs = 1000;
 // Windows version happens to ship. LoadIconW returns a shared handle, which must
 // NOT be passed to DestroyIcon.
 HICON MakeStateIcon(HINSTANCE instance, TrayState state) noexcept {
-  int resource = PICOPASTE_ICON_OK;
+  std::int32_t resource = PICOPASTE_ICON_OK;
   switch (state) {
     case TrayState::kHealthy:
       resource = PICOPASTE_ICON_OK;
@@ -84,8 +111,8 @@ bool RelaunchSelf() noexcept {
   // SetupJobObjects and exits. The job grants the escape explicitly
   // (JOB_OBJECT_LIMIT_BREAKAWAY_OK) and only on request, so ssh.exe -- which
   // never asks -- stays inside the memory ceiling.
-  const BOOL started = CreateProcessW(image, command, nullptr, nullptr, FALSE,
-                                      CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &startup, &child);
+  const BOOL started = CreateProcessW(image, command, nullptr, nullptr, FALSE, CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                                      nullptr, &startup, &child);
   (void)SetEnvironmentVariableW(kAwaitInstanceEnvName, nullptr);
   if (started == 0) {
     return false;
@@ -135,8 +162,7 @@ Status Tray::Create(HINSTANCE instance, const wchar_t* tooltip) noexcept {
 
   // Hidden top-level window (no WS_VISIBLE). Broadcast messages reach it;
   // message-only windows would not receive TaskbarCreated.
-  hwnd_ = CreateWindowExW(0, kWindowClass, L"picopaste", WS_OVERLAPPED, 0, 0, 0, 0, nullptr,
-                          nullptr, instance, this);
+  hwnd_ = CreateWindowExW(0, kWindowClass, L"picopaste", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, this);
   if (hwnd_ == nullptr) {
     Destroy();
     return Status::error(Error::kTempFileFailed);
@@ -185,7 +211,7 @@ void Tray::Destroy() noexcept {
   }
   // The icons are shared resource handles (LoadIconW caches them); DestroyIcon
   // must not be called on them. Clearing the handles is enough.
-  for (int i = 0; i < 3; ++i) {
+  for (std::int32_t i = 0; i < 3; ++i) {
     icons_[i] = nullptr;
   }
 }

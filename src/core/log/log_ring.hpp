@@ -1,24 +1,51 @@
-// picopaste — fixed-capacity lock-free log queues, one per producer thread.
-//
-// The log writer is the single consumer. Four threads produce records, and an
-// SPSC ring tolerates exactly one producer, so each producer owns its own ring
-// (the same architecture newosp's async_log uses). The writer drains all rings
-// round-robin. No heap and no mutex on any path.
-//
-// Producers address their ring by a compile-time slot index (LogProducer), not
-// by a runtime thread-id lookup: that is allocation-free and makes the origin
-// of every record explicit at the call site.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file log_ring.hpp
+ * @brief Fixed-capacity lock-free log queues, one per producer thread.
+ *
+ * The log writer is the single consumer. Four threads produce records, and an
+ * SPSC ring tolerates exactly one producer, so each producer owns its own ring
+ * (the same architecture newosp's async_log uses). The writer drains all rings
+ * round-robin. No heap and no mutex on any path.
+ *
+ * Producers address their ring by a compile-time slot index (LogProducer), not
+ * by a runtime thread-id lookup: that is allocation-free and makes the origin
+ * of every record explicit at the call site.
+ */
 
 #pragma once
 
-#include <array>
-#include <cstdint>
-#include <type_traits>
-
-#include <atomic>
-
 #include "osp/platform.hpp"
 #include "osp/spsc_ringbuffer.hpp"
+
+#include <cstdint>
+
+#include <array>
+#include <atomic>
+#include <type_traits>
 
 namespace picopaste {
 
@@ -55,11 +82,21 @@ struct LogRecord {
 
 static_assert(std::is_trivially_copyable<LogRecord>::value, "LogRecord must stay trivially copyable");
 
-// Fill the timestamp fields from the platform clock (ms wall-clock resolution).
+/**
+ * @brief Fill a record's timestamp fields from the platform clock.
+ * @param record Record whose monotonic_us / wallclock_sec / wallclock_ms are set.
+ *
+ * Wall-clock resolution is milliseconds.
+ */
 void StampNow(LogRecord& record) noexcept;
 
-// Format `fmt` into a record and stamp it. Never allocates; the message is
-// truncated to kLogMessageBytes, which is a bounded, self-inflicted loss.
+/**
+ * @brief Format `fmt` into a record and stamp it.
+ * @param level Severity stored with the record.
+ * @param fmt printf-style format string.
+ * @return The formatted record. Never allocates; the message is truncated to
+ *         kLogMessageBytes, which is a bounded, self-inflicted loss.
+ */
 LogRecord MakeLogRecord(LogLevel level, const char* fmt, ...) noexcept OSP_PRINTF_FMT(2, 3);
 
 class LogRing {
@@ -73,8 +110,14 @@ class LogRing {
   LogRing(const LogRing&) = delete;
   LogRing& operator=(const LogRing&) = delete;
 
-  // Producer side: each slot is pushed by exactly one thread. Returns false
-  // when that producer's ring is full; the record is dropped and counted.
+  /**
+   * @brief Producer side: push one record onto this producer's ring.
+   * @param producer The pushing thread's compile-time slot.
+   * @param record Record to enqueue.
+   * @return False when the ring is full; the record is dropped and counted.
+   *
+   * Each slot must be pushed by exactly one thread.
+   */
   bool TryPush(LogProducer producer, const LogRecord& record) noexcept {
     const std::uint32_t slot = static_cast<std::uint32_t>(producer);
     if (slot >= kLogProducerCount) {
@@ -88,7 +131,13 @@ class LogRing {
     return false;
   }
 
-  // Consumer side (single reader only): drain all producer rings round-robin.
+  /**
+   * @brief Consumer side: pop the next record, draining all rings round-robin.
+   * @param out Receives the record when one is available.
+   * @return False when every ring is empty.
+   *
+   * Single reader only.
+   */
   bool TryPop(LogRecord& out) noexcept {
     for (std::uint32_t i = 0; i < kLogProducerCount; ++i) {
       const std::uint32_t slot = (pop_cursor_ + i) % kLogProducerCount;
@@ -100,7 +149,14 @@ class LogRing {
     return false;
   }
 
-  // Consumer side, one specific producer (used by tests and targeted drains).
+  /**
+   * @brief Consumer side: pop the next record from one specific producer.
+   * @param producer Ring to drain.
+   * @param out Receives the record when one is available.
+   * @return False when that ring is empty.
+   *
+   * Used by tests and targeted drains.
+   */
   bool TryPop(LogProducer producer, LogRecord& out) noexcept {
     const std::uint32_t slot = static_cast<std::uint32_t>(producer);
     if (slot >= kLogProducerCount) {

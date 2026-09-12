@@ -110,6 +110,18 @@ inline bool IsSimpleArg(const char* arg) noexcept
     return true;
 }
 
+// Appends one wchar_t at dst[used], keeping room for the terminator at
+// dst[used + 1]. Returns false when the buffer cannot hold it.
+inline bool AppendChar(wchar_t* dst, std::size_t cap, std::size_t& used, wchar_t c) noexcept
+{
+    if ((used + 1u) >= cap) {
+        return false;
+    }
+    dst[used] = c;
+    ++used;
+    return true;
+}
+
 // Joins argv (nullptr-terminated) into a CreateProcessW command line. Returns
 // false on a null argv, an argument that needs quoting, or buffer overflow.
 inline bool BuildCommandLine(const char* const* argv, wchar_t* dst, std::size_t cap) noexcept
@@ -119,26 +131,17 @@ inline bool BuildCommandLine(const char* const* argv, wchar_t* dst, std::size_t 
     }
     std::size_t used = 0u;
     for (std::size_t i = 0u; nullptr != argv[i]; ++i) {
-        if (!IsSimpleArg(argv[i])) {
-            return false;
-        }
         wchar_t token[win32::kMaxCommandLineChars] = {};
-        if (!win32::Utf8ToWide(argv[i], token, win32::kMaxCommandLineChars)) {
+        if (!IsSimpleArg(argv[i]) || !win32::Utf8ToWide(argv[i], token, win32::kMaxCommandLineChars)) {
             return false;
         }
-        if (0u != i) {
-            if ((used + 1u) >= cap) {
-                return false;
-            }
-            dst[used] = L' ';
-            ++used;
+        if ((0u != i) && !AppendChar(dst, cap, used, L' ')) {
+            return false;
         }
         for (std::size_t k = 0u; L'\0' != token[k]; ++k) {
-            if ((used + 1u) >= cap) {
+            if (!AppendChar(dst, cap, used, token[k])) {
                 return false;
             }
-            dst[used] = token[k];
-            ++used;
         }
         dst[used] = L'\0';
     }
@@ -242,7 +245,7 @@ inline bool WriteScratchFile(const std::uint8_t* data, std::size_t len, std::str
         bool ok = true;
         while (off < len) {
             const std::int32_t n =
-                static_cast<std::int32_t>(::_write(fd, data + off, static_cast<unsigned int>(len - off)));
+                static_cast<std::int32_t>(::_write(fd, data + off, static_cast<std::uint32_t>(len - off)));
             if (0 >= n) {
                 ok = false;
                 break;

@@ -1,20 +1,47 @@
-// picopaste — platform-abstracted process memory snapshot.
-//
-// The design requires the process's memory to be observable under a hard cap
-// (a Job Object on Windows). Only the counters the design names are exposed;
-// this is not a monitoring framework.
-//
-// Seam contract:
-//   MemorySnapshot SampleMemory() noexcept;
-//   - must not allocate, must not throw, and must never block for long;
-//   - fills what the platform exposes and sets valid=false on failure
-//     (for example when /proc is unavailable);
-//   - counters are zero when the platform cannot report them.
-//
-// Linux is implemented inline below (reads /proc/self/status and
-// /proc/self/fd). On Windows the symbol is only declared here; the win32
-// workstream provides the definition (GetProcessMemoryInfo +
-// GetProcessHandleCount + GetProcessMemoryInfo.PeakWorkingSetSize).
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file memsample.hpp
+ * @brief Platform-abstracted process memory snapshot.
+ *
+ * The design requires the process's memory to be observable under a hard cap
+ * (a Job Object on Windows). Only the counters the design names are exposed;
+ * this is not a monitoring framework.
+ *
+ * Seam contract:
+ *   MemorySnapshot SampleMemory() noexcept;
+ *   - must not allocate, must not throw, and must never block for long;
+ *   - fills what the platform exposes and sets valid=false on failure
+ *     (for example when /proc is unavailable);
+ *   - counters are zero when the platform cannot report them.
+ *
+ * Linux is implemented inline below (reads /proc/self/status and
+ * /proc/self/fd). On Windows the symbol is only declared here; the win32
+ * workstream provides the definition (GetProcessMemoryInfo +
+ * GetProcessHandleCount + GetProcessMemoryInfo.PeakWorkingSetSize).
+ */
 
 #pragma once
 
@@ -41,6 +68,11 @@ struct MemorySnapshot {
   bool valid = false;
 };
 
+/**
+ * @brief Sample this process's current memory counters.
+ * @return A snapshot; `valid` is false when the platform cannot report (for
+ *         example /proc is unavailable), and unreportable counters stay zero.
+ */
 MemorySnapshot SampleMemory() noexcept;
 
 }  // namespace picopaste

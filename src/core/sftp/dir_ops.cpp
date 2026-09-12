@@ -1,8 +1,35 @@
-// picopaste — upload-directory retention policy (see dir_ops.hpp).
-//
-// No wire code lives here: listing and removal are delegated to sftp::Client,
-// the single owner of the SFTP channel. What remains is the pure retention
-// decision and the driver that applies it.
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 liudegui
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * @file dir_ops.cpp
+ * @brief Upload-directory retention policy implementation.
+ *
+ * No wire code lives here: listing and removal are delegated to sftp::Client,
+ * the single owner of the SFTP channel. What remains is the pure retention
+ * decision and the driver that applies it.
+ */
 #include "dir_ops.hpp"
 
 #include <cstring>
@@ -17,7 +44,7 @@ bool NameGreater(const osp::FixedString<kMaxUploadNameBytes>& a,
   const std::uint32_t an = a.size();
   const std::uint32_t bn = b.size();
   const std::uint32_t n = (an < bn) ? an : bn;
-  const int cmp = std::memcmp(a.c_str(), b.c_str(), n);
+  const std::int32_t cmp = std::memcmp(a.c_str(), b.c_str(), n);
   if (cmp != 0) {
     return cmp > 0;
   }
@@ -31,6 +58,10 @@ bool NewerFirst(const DirEntry& a, const DirEntry& b) noexcept {
   return NameGreater(a.name, b.name);
 }
 
+// A name can be selected by both the age rule and the keep-newest rule. Each
+// index must appear once so a file is not removed twice: the second REMOVE
+// would answer NO_SUCH_FILE, which Remove tolerates, but the plan would
+// overstate the work and the pass would report a failure that never happened.
 void AddUnique(RetentionPlan& plan, std::uint32_t index) noexcept {
   for (std::uint32_t i = 0u; i < plan.remove_indices.size(); ++i) {
     if (plan.remove_indices[i] == index) {
@@ -82,8 +113,7 @@ RetentionPlan PlanRetention(const UploadListing& listing, std::uint64_t now_unix
   if (policy.max_age_seconds > 0u) {
     for (std::uint32_t i = 0u; i < n; ++i) {
       const DirEntry& e = listing.entries[i];
-      if (e.has_mtime && (now_unix >= e.mtime) &&
-          ((now_unix - e.mtime) > policy.max_age_seconds)) {
+      if (e.has_mtime && (now_unix >= e.mtime) && ((now_unix - e.mtime) > policy.max_age_seconds)) {
         AddUnique(plan, i);
       }
     }
@@ -106,8 +136,7 @@ RetentionPlan PlanRetention(const UploadListing& listing, std::uint64_t now_unix
       }
       order[j] = key;
     }
-    const std::uint32_t keep =
-        (policy.keep_newest < order.size()) ? policy.keep_newest : order.size();
+    const std::uint32_t keep = (policy.keep_newest < order.size()) ? policy.keep_newest : order.size();
     for (std::uint32_t k = keep; k < order.size(); ++k) {
       AddUnique(plan, order[k]);
     }
@@ -119,8 +148,7 @@ RetentionPlan PlanRetention(const UploadListing& listing, std::uint64_t now_unix
 // Cleanup = List + PlanRetention + Remove
 // ---------------------------------------------------------------------------
 
-Result<CleanupResult> DirOps::Cleanup(const char* dir, std::uint64_t now_unix,
-                                      const RetentionPolicy& policy) noexcept {
+Result<CleanupResult> DirOps::Cleanup(const char* dir, std::uint64_t now_unix, const RetentionPolicy& policy) noexcept {
   CleanupResult res{};
   const Result<UploadListing> listed = client_.ListDir(dir);
   if (!listed) {
