@@ -132,10 +132,17 @@ class ArgvBlock final {
   wchar_t* const* items() const noexcept { return argv_; }
 
  private:
+  // Declaration order is load-bearing: argv_ is initialized by calling
+  // CommandLineToArgvW(..., &argc_), and members initialize in declaration
+  // order. With argc_ declared after argv_ it would be zero-initialized
+  // *after* the call had written the real count, leaving a valid array with a
+  // silently zero count -- which made every argument, and therefore --selftest
+  // and --config, unreachable. Count first, then the array it describes.
+  //
   // CommandLineToArgvW's signature takes `int*`, so this member is an int by
   // the platform contract and is narrowed back on the way out.
-  wchar_t** argv_ = nullptr;
   int argc_ = 0;
+  wchar_t** argv_ = nullptr;
 };
 
 // Write one already-formatted string to a standard handle. A handle that is
