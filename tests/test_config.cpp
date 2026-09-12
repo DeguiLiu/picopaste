@@ -108,6 +108,62 @@ TEST_CASE("Save then Load round-trips every field", "[config]") {
   CHECK_FALSE(got.notify_enabled);
 }
 
+TEST_CASE("A sectionless file is rejected, not half-honoured", "[config]") {
+  // newosp's INI backend refuses any field written before a section header, so a
+  // file without [picopaste] fails to load as a whole. That still satisfies the
+  // config contract -- nothing the user wrote is silently dropped -- and it is
+  // pinned here so a backend change cannot quietly split the two: strings then
+  // honoured by the sectionless fallback while numbers and booleans revert to
+  // defaults with no signal.
+  TempDir dir("nosection");
+  const std::string path = dir.file("picopaste.ini");
+
+  WriteFile(path, "host = my-remote\ndelay_ms = 222\nnotify_enabled = false\n");
+  const auto result = picopaste::LoadConfig(path.c_str());
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == picopaste::Error::kConfigParseFailed);
+}
+
+TEST_CASE("An unparseable numeric value is reported, not defaulted", "[config]") {
+  TempDir dir("badnum");
+  const std::string path = dir.file("picopaste.ini");
+
+  WriteFile(path, "[picopaste]\ndelay_ms = banana\n");
+  const auto result = picopaste::LoadConfig(path.c_str());
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == picopaste::Error::kConfigParseFailed);
+}
+
+TEST_CASE("An unparseable boolean value is reported, not defaulted", "[config]") {
+  TempDir dir("badbool");
+  const std::string path = dir.file("picopaste.ini");
+
+  WriteFile(path, "[picopaste]\nnotify_enabled = banana\n");
+  const auto result = picopaste::LoadConfig(path.c_str());
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == picopaste::Error::kConfigParseFailed);
+}
+
+TEST_CASE("Zero and the recognised boolean literals are accepted", "[config]") {
+  TempDir dir("literals");
+  const std::string path = dir.file("picopaste.ini");
+
+  SECTION("delay_ms = 0 is a valid count") {
+    WriteFile(path, "[picopaste]\ndelay_ms = 0\n");
+    const auto result = picopaste::LoadConfig(path.c_str());
+    REQUIRE(result.has_value());
+    CHECK(result.value().delay_ms == 0U);
+  }
+
+  SECTION("yes / no parse as booleans") {
+    WriteFile(path, "[picopaste]\nrestore_clipboard = yes\nnotify_enabled = no\n");
+    const auto result = picopaste::LoadConfig(path.c_str());
+    REQUIRE(result.has_value());
+    CHECK(result.value().restore_clipboard);
+    CHECK_FALSE(result.value().notify_enabled);
+  }
+}
+
 TEST_CASE("An over-long value is rejected, not truncated", "[config]") {
   TempDir dir("toolong");
   const std::string path = dir.file("picopaste.ini");

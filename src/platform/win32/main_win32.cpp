@@ -587,6 +587,39 @@ class UploadWorker final {
     }
   }
 
+  // True when `error` says the SFTP channel, or the exchange already running on
+  // it, is suspect; the only safe recovery is to drop the child so the
+  // supervisory loop backs off and reconnects. The codes that return false are
+  // produced entirely by the local clipboard and injector (or by the single-
+  // flight guard); they say nothing about the link, so tearing it down would
+  // report a failure that did not happen. Every other value falls through as
+  // bad: an unrecognised code is far likelier to be a transport fault than a
+  // local one, and hiding a real break is the worse error. kBusy never reaches
+  // here; RunOnce returns for it before consulting this predicate.
+  static bool ChannelIsBad(Error error) noexcept {
+    switch (error) {
+      // Clipboard capture (clipboard.cpp / UploadPipeline::CaptureLocal): local.
+      case Error::kNoImageInClipboard:
+      case Error::kClipboardOpenFailed:
+      case Error::kClipboardLockFailed:
+      case Error::kImageTooLarge:
+      case Error::kPngEncodeFailed:
+      case Error::kTempFileFailed:
+      // Paste injection (inject.cpp / Win32Platform::SetText/Paste): local.
+      case Error::kClipboardSetFailed:
+      case Error::kFocusChanged:
+      case Error::kSendInputRejected:
+        return false;
+      default:
+        // kChannelNotConnected / kChannelWriteFailed / kChannelReadFailed /
+        // kSftpProtocolError / kRealpathFailed / kMkdirFailed / kOpenFailed /
+        // kWriteFailed / kCloseFailed / kStatFailed / kRenameFailed /
+        // kSizeMismatch / kBufferTooSmall -- all emitted by sftp::Client -- and
+        // kUploadTimeout, whose ssh child the deadline probe has just killed.
+        return true;
+    }
+  }
+
   void RunOnce() noexcept {
     if (EnsureChannel() == false) {
       return;  // EnsureChannel already posted the failure
@@ -604,8 +637,14 @@ class UploadWorker final {
     if (Error::kBusy == result.get_error()) {
       return;  // a queued trigger raced the running one; nothing happened
     }
-    // Any other failure may mean the channel is bad: drop it and let the
-    // supervisory loop back off and retry, with the tray showing the failure.
+    if (ChannelIsBad(result.get_error()) == false) {
+      // A local, user-caused outcome: the link is healthy, so leave it up and
+      // republish health rather than reporting a channel failure.
+      PostHealth();
+      return;
+    }
+    // The channel or its exchange is suspect: drop it and let the supervisory
+    // loop back off and retry, with the tray showing the failure.
     DropChannel();
     (void)lifecycle_->Post(LifecycleEvent::kConnectFail);
     PostHealth();
@@ -922,6 +961,23 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
         if ((0u != config.upload_timeout_ms) && (0u == upload_timer)) {
           const std::uint32_t tick_ms = UploadTickMs(config.upload_timeout_ms);
           upload_timer = SetTimer(nullptr, kUploadTimerId, static_cast<UINT>(tick_ms), nullptr);
+          if (0u == upload_timer) {
+            // A probe that will not arm is the one failure this loop must not
+            // swallow: without it a hung upload can never be torn down and the
+            // configured deadline becomes inert. Capture the error before any
+            // other call can clobber it, say so where a console can see it, and
+            // turn the tray red. The worker owns the lifecycle machine on its
+            // own thread, so the main thread renders this state directly rather
+            // than posting an event into it.
+            const DWORD timer_error = GetLastError();
+            EmitFormatted(err, "picopaste: could not arm the upload deadline probe (error %lu)\n",
+                          static_cast<unsigned long>(timer_error));
+            tray.SetState(picopaste::win32::TrayState::kError, L"picopaste: upload deadline unavailable");
+            if (config.notify_enabled) {
+              tray.Notify(L"picopaste", L"upload deadline unavailable - a hung upload may not be torn down", true);
+            }
+            last_state = picopaste::win32::TrayState::kError;
+          }
         }
       } else if (WorkerNotice::kUploadEnded == notice) {
         disarm_timer();

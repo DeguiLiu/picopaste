@@ -114,6 +114,16 @@ bool ParseRoot(const std::vector<std::uint8_t>& bytes, picojson::value& root) {
   return root.is<picojson::object>();
 }
 
+// A restore source must parse as the JSON object settings are expected to be;
+// anything else is refused before the current file is touched.
+Status ValidateBackupObject(const std::vector<std::uint8_t>& wanted) {
+  picojson::value check;
+  if (!ParseRoot(wanted, check)) {
+    return Err(Error::kConfigParseFailed);
+  }
+  return Status::success();
+}
+
 // PicoJSON escapes every forward slash as "\/" when serializing. That is valid
 // JSON but needlessly rewrites the user's unrelated string values, so the
 // escape is undone. The scan is escape-aware: it only removes a backslash that
@@ -335,6 +345,73 @@ struct RemoteSettings::Impl {
     return Status::success();
   }
 
+  // Copies `original` to a timestamped sibling and reads the copy back. Nothing
+  // is trusted as a backup until this byte-for-byte comparison succeeds.
+  Status BackupOriginal(const char* path, const std::vector<std::uint8_t>& original, sftp::Path& backup) noexcept {
+    const Status named = MakeBackupPath(path, NowMillis(), backup);
+    if (!named) {
+      return Err(named.get_error());
+    }
+    const Status wrote = WriteRemote(backup.c_str(), original.data(), original.size());
+    if (!wrote) {
+      return Err(Error::kConfigWriteFailed);
+    }
+    const Status verified = VerifyBytes(backup.c_str(), original.data(), original.size());
+    if (!verified) {
+      return Err(Error::kSizeMismatch);
+    }
+    return Status::success();
+  }
+
+  // Writes `payload` over `path` and verifies it by reading back. WriteFile
+  // opens with CREAT|TRUNC, so a failed write or a failed verify may already
+  // have destroyed the original; when `have_backup` is set the in-memory
+  // original (byte-identical to the verified backup) is written back. A
+  // rollback that itself fails is reported as kWriteFailed, distinct from the
+  // original write/verify error, so the caller can tell "wrong content" from
+  // "wrong content and the file could not be put back".
+  Status WriteVerified(const char* path, const std::vector<std::uint8_t>& original, bool have_backup,
+                       const std::uint8_t* payload, std::size_t len) noexcept {
+    Status result = WriteRemote(path, payload, len);
+    if (result) {
+      result = VerifyBytes(path, payload, len);
+    }
+    if (!result) {
+      if (have_backup) {
+        const Status rolled = WriteRemote(path, original.data(), original.size());
+        if (!rolled || !VerifyBytes(path, original.data(), original.size())) {
+          return Err(Error::kWriteFailed);
+        }
+      }
+      return Err(result.get_error());
+    }
+    return Status::success();
+  }
+
+  // The sequence every mutating entry point shares: preserve the original
+  // (when one is worth keeping), then write `payload` and prove it landed.
+  // `backup_out` receives the backup path when one was made.
+  Status BackupThenWrite(const char* path, const std::vector<std::uint8_t>& original, bool want_backup,
+                         const std::uint8_t* payload, std::size_t len, sftp::Path* backup_out) noexcept {
+    bool have_backup = false;
+    sftp::Path backup;
+    if (want_backup) {
+      const Status made = BackupOriginal(path, original, backup);
+      if (!made) {
+        return made;
+      }
+      have_backup = true;
+    }
+    const Status result = WriteVerified(path, original, have_backup, payload, len);
+    if (!result) {
+      return result;
+    }
+    if ((backup_out != nullptr) && have_backup) {
+      *backup_out = backup;
+    }
+    return Status::success();
+  }
+
   sftp::Client client_;
 };
 
@@ -400,52 +477,32 @@ Result<InstallOutcome> RemoteSettings::Install(const char* settings_path, const 
   try {
     std::vector<std::uint8_t> original;
     bool missing = false;
-    const Status read = impl_->ReadRemote(settings_path, original, kMaxSettingsBytes, missing);
-    if (!read) {
-      return Result<InstallOutcome>::error(read.get_error());
-    }
+    Status status = impl_->ReadRemote(settings_path, original, kMaxSettingsBytes, missing);
 
     std::string merged;
     bool changed = false;
-    const Status built = BuildInstall(original, entry, merged, changed);
-    if (!built) {
-      return Result<InstallOutcome>::error(built.get_error()); /* file untouched */
+    if (status) {
+      status = BuildInstall(original, entry, merged, changed); /* file untouched on failure */
+    }
+    if (!status) {
+      return Result<InstallOutcome>::error(status.get_error());
     }
 
     InstallOutcome outcome;
-    if (!changed) {
-      return Result<InstallOutcome>::success(outcome); /* idempotent no-op */
-    }
-
-    if (!missing && !IsBlank(original)) {
+    outcome.changed = changed;
+    if (changed) {
+      /* A blank or missing original has nothing worth preserving. */
+      const bool want_backup = !missing && !IsBlank(original);
       sftp::Path backup;
-      const Status named = MakeBackupPath(settings_path, NowMillis(), backup);
-      if (!named) {
-        return Result<InstallOutcome>::error(named.get_error());
+      const Status wrote = impl_->BackupThenWrite(settings_path, original, want_backup,
+                                                  reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size(),
+                                                  want_backup ? &backup : nullptr);
+      if (!wrote) {
+        return Result<InstallOutcome>::error(wrote.get_error());
       }
-      const Status wrote_backup = impl_->WriteRemote(backup.c_str(), original.data(), original.size());
-      if (!wrote_backup) {
-        return Result<InstallOutcome>::error(Error::kConfigWriteFailed);
-      }
-      const Status verified = impl_->VerifyBytes(backup.c_str(), original.data(), original.size());
-      if (!verified) {
-        return Result<InstallOutcome>::error(Error::kSizeMismatch);
-      }
-      outcome.backup_created = true;
+      outcome.backup_created = want_backup;
       outcome.backup_path = backup;
     }
-
-    const Status wrote =
-        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
-    if (!wrote) {
-      return Result<InstallOutcome>::error(Error::kConfigWriteFailed);
-    }
-    const Status verified =
-        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
-    if (!verified) {
-      return Result<InstallOutcome>::error(Error::kSizeMismatch);
-    }
-    outcome.changed = true;
     return Result<InstallOutcome>::success(outcome);
   } catch (...) {
     return Result<InstallOutcome>::error(Error::kConfigWriteFailed);
@@ -459,51 +516,29 @@ Result<bool> RemoteSettings::Remove(const char* settings_path, const char* marke
   try {
     std::vector<std::uint8_t> original;
     bool missing = false;
-    const Status read = impl_->ReadRemote(settings_path, original, kMaxSettingsBytes, missing);
-    if (!read) {
-      return Result<bool>::error(read.get_error());
-    }
-    if (missing) {
-      return Result<bool>::success(false);
-    }
+    Status status = impl_->ReadRemote(settings_path, original, kMaxSettingsBytes, missing);
 
     std::string merged;
     bool changed = false;
-    const Status built = BuildRemove(original, marker, merged, changed);
-    if (!built) {
-      return Result<bool>::error(built.get_error()); /* file untouched */
+    if (status && !missing) {
+      status = BuildRemove(original, marker, merged, changed); /* file untouched on failure */
     }
-    if (!changed) {
-      return Result<bool>::success(false);
-    }
-
-    if (!IsBlank(original)) {
-      sftp::Path backup;
-      const Status named = MakeBackupPath(settings_path, NowMillis(), backup);
-      if (!named) {
-        return Result<bool>::error(named.get_error());
-      }
-      const Status wrote_backup = impl_->WriteRemote(backup.c_str(), original.data(), original.size());
-      if (!wrote_backup) {
-        return Result<bool>::error(Error::kConfigWriteFailed);
-      }
-      const Status verified = impl_->VerifyBytes(backup.c_str(), original.data(), original.size());
-      if (!verified) {
-        return Result<bool>::error(Error::kSizeMismatch);
-      }
+    if (!status) {
+      return Result<bool>::error(status.get_error());
     }
 
-    const Status wrote =
-        impl_->WriteRemote(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
-    if (!wrote) {
-      return Result<bool>::error(Error::kConfigWriteFailed);
+    bool removed = false;
+    if (changed) {
+      const bool want_backup = !IsBlank(original);
+      const Status wrote =
+          impl_->BackupThenWrite(settings_path, original, want_backup,
+                                 reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size(), nullptr);
+      if (!wrote) {
+        return Result<bool>::error(wrote.get_error());
+      }
+      removed = true;
     }
-    const Status verified =
-        impl_->VerifyBytes(settings_path, reinterpret_cast<const std::uint8_t*>(merged.data()), merged.size());
-    if (!verified) {
-      return Result<bool>::error(Error::kSizeMismatch);
-    }
-    return Result<bool>::success(true);
+    return Result<bool>::success(removed);
   } catch (...) {
     return Result<bool>::error(Error::kConfigWriteFailed);
   }
@@ -517,47 +552,29 @@ Status RemoteSettings::Restore(const char* settings_path, const char* backup_pat
   try {
     std::vector<std::uint8_t> wanted;
     bool backup_missing = false;
-    const Status read = impl_->ReadRemote(backup_path, wanted, kMaxSettingsBytes, backup_missing);
-    if (!read || backup_missing) {
-      return Err(Error::kOpenFailed);
+    Status status = impl_->ReadRemote(backup_path, wanted, kMaxSettingsBytes, backup_missing);
+    if (!status || backup_missing) {
+      status = Err(Error::kOpenFailed);
     }
-    /* Never restore something that is not the JSON object we expect. */
-    {
-      picojson::value check;
-      if (!ParseRoot(wanted, check)) {
-        return Err(Error::kConfigParseFailed);
-      }
+    if (status) {
+      status = ValidateBackupObject(wanted);
     }
 
     std::vector<std::uint8_t> current;
     bool current_missing = false;
-    const Status read_current = impl_->ReadRemote(settings_path, current, kMaxSettingsBytes, current_missing);
-    if (!read_current) {
-      return Err(read_current.get_error());
+    if (status) {
+      status = impl_->ReadRemote(settings_path, current, kMaxSettingsBytes, current_missing);
     }
-    if (!current_missing && !IsBlank(current)) {
-      sftp::Path safety;
-      const Status named = MakeBackupPath(settings_path, NowMillis(), safety);
-      if (!named) {
-        return Err(named.get_error());
-      }
-      const Status wrote = impl_->WriteRemote(safety.c_str(), current.data(), current.size());
-      if (!wrote) {
-        return Err(Error::kConfigWriteFailed);
-      }
-      const Status verified = impl_->VerifyBytes(safety.c_str(), current.data(), current.size());
-      if (!verified) {
-        return Err(Error::kSizeMismatch);
-      }
+    if (!status) {
+      return status;
     }
 
-    const Status wrote = impl_->WriteRemote(settings_path, wanted.data(), wanted.size());
+    /* A blank or missing current file has nothing worth preserving. */
+    const bool want_backup = !current_missing && !IsBlank(current);
+    const Status wrote =
+        impl_->BackupThenWrite(settings_path, current, want_backup, wanted.data(), wanted.size(), nullptr);
     if (!wrote) {
-      return Err(Error::kConfigWriteFailed);
-    }
-    const Status verified = impl_->VerifyBytes(settings_path, wanted.data(), wanted.size());
-    if (!verified) {
-      return Err(Error::kSizeMismatch);
+      return wrote;
     }
     return Status::success();
   } catch (...) {

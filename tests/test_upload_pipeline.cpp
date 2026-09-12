@@ -57,6 +57,13 @@ struct FakeOps {
   Error capture_error = Error::kOk;
   Error set_text_error = Error::kOk;
   Error paste_error = Error::kOk;
+  Error restore_error = Error::kOk;
+
+  // Optional hook run on restore, before its result is returned. The prune-
+  // deadline test arms a blocking read here: restore runs on the worker thread
+  // strictly before Prune, so the next SFTP read is guaranteed to be Prune's.
+  void (*on_restore)(void* ctx) noexcept = nullptr;
+  void* on_restore_ctx = nullptr;
 
   // Local temp file the fake "capture" produced (written by the test).
   char local_path[kLocalPathBytes] = {};
@@ -120,7 +127,14 @@ struct FakeOps {
 
   static Error FakeRestore(void* ctx, void* token) noexcept {
     (void)token;
-    static_cast<FakeOps*>(ctx)->restore_calls.fetch_add(1, std::memory_order_relaxed);
+    FakeOps* self = static_cast<FakeOps*>(ctx);
+    self->restore_calls.fetch_add(1, std::memory_order_relaxed);
+    if (Error::kOk != self->restore_error) {
+      return self->restore_error;
+    }
+    if (nullptr != self->on_restore) {
+      self->on_restore(self->on_restore_ctx);
+    }
     return Error::kOk;
   }
 
@@ -137,9 +151,80 @@ struct FakeOps {
   }
 };
 
+// A ByteStream that forwards to a real channel but can hold the next read
+// until released. It exists to put the worker deterministically inside Prune's
+// SFTP listing, where an external watchdog must still be able to latch the
+// deadline; a real fast server gives no such window on its own.
+struct BlockingStream {
+  ByteStream inner{};
+  std::mutex m;
+  std::condition_variable cv;
+  std::atomic<bool> block_reads{false};
+  bool read_blocked = false;
+  bool unblock = false;
+
+  // Armed from the restore hook, i.e. on the worker thread strictly before
+  // Prune issues its first read.
+  static void Arm(void* ctx) noexcept { static_cast<BlockingStream*>(ctx)->block_reads.store(true); }
+
+  ByteStream Stream() noexcept {
+    ByteStream s{};
+    s.ctx = this;
+    s.read = &Read;
+    s.write = &Write;
+    s.close = &Close;
+    return s;
+  }
+
+  // Blocks until a read has parked, then returns with that read still held.
+  void WaitReadBlocked() {
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait(lock, [this] { return read_blocked; });
+  }
+
+  // Releases the parked read so the worker can finish Prune.
+  void Release() {
+    std::unique_lock<std::mutex> lock(m);
+    unblock = true;
+    cv.notify_all();
+  }
+
+  static bool Read(void* ctx, std::uint8_t* dst, std::size_t len) noexcept {
+    BlockingStream* self = static_cast<BlockingStream*>(ctx);
+    {
+      std::unique_lock<std::mutex> lock(self->m);
+      if (self->block_reads.load(std::memory_order_relaxed)) {
+        self->read_blocked = true;
+        self->cv.notify_all();
+        self->cv.wait(lock, [self] { return self->unblock; });
+      }
+    }
+    return self->inner.read(self->inner.ctx, dst, len);
+  }
+
+  static bool Write(void* ctx, const std::uint8_t* data, std::size_t len) noexcept {
+    BlockingStream* self = static_cast<BlockingStream*>(ctx);
+    return self->inner.write(self->inner.ctx, data, len);
+  }
+
+  static void Close(void* ctx) noexcept {
+    BlockingStream* self = static_cast<BlockingStream*>(ctx);
+    if (self->inner.valid()) {
+      self->inner.close(self->inner.ctx);
+    }
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Integration plumbing
 // ---------------------------------------------------------------------------
+
+// The fixed argv for the local SFTP subsystem, shared by both connect helpers.
+const char* const* LocalSftpArgv() noexcept {
+  static const char* const argv[] = {"ssh",  "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
+                                     "-o",   "LogLevel=ERROR", "-s", "localhost", "sftp", nullptr};
+  return argv;
+}
 
 struct Session {
   ByteStream b{};
@@ -156,22 +241,25 @@ struct Session {
 };
 
 std::unique_ptr<Session> ConnectSftp() {
-  const char* argv[] = {"ssh",
-                        "-o",
-                        "ClearAllForwardings=yes",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "LogLevel=ERROR",
-                        "-s",
-                        "localhost",
-                        "sftp",
-                        nullptr};
-  auto spawned = test::SpawnStream(argv);
+  auto spawned = test::SpawnStream(LocalSftpArgv());
   if (!spawned.has_value()) {
     return nullptr;
   }
   auto session = std::make_unique<Session>(spawned.value());
+  if (!session->client.Init()) {
+    return nullptr;
+  }
+  return session;
+}
+
+// Same, but the client speaks through `wrapper`, whose next read can be held.
+std::unique_ptr<Session> ConnectSftpWrapped(BlockingStream& wrapper) {
+  auto spawned = test::SpawnStream(LocalSftpArgv());
+  if (!spawned.has_value()) {
+    return nullptr;
+  }
+  wrapper.inner = spawned.value();
+  auto session = std::make_unique<Session>(wrapper.Stream());
   if (!session->client.Init()) {
     return nullptr;
   }
@@ -585,4 +673,170 @@ TEST_CASE("upload_timeout_ms = 0 keeps an upload unbounded", "[pipeline]") {
   // The disabled deadline never converts the run into kUploadTimeout.
   REQUIRE_FALSE(result.has_value());
   CHECK(result.get_error() != Error::kUploadTimeout);
+}
+
+TEST_CASE("a flight armed at clock zero still expires", "[pipeline]") {
+  Config cfg = DefaultConfig();
+  cfg.upload_timeout_ms = 5000U;
+  cfg.delay_ms = 0;
+  cfg.remote_dir.assign(osp::TruncateToCapacity, "/tmp/picopaste-pipe-timeout-zero");
+
+  const test::TempFile local = MakeLocalFile(1024u);
+  REQUIRE(local.valid());
+
+  FakeOps ops;
+  (void)std::snprintf(ops.local_path, sizeof(ops.local_path), "%s", local.path());
+  ops.bytes = 1024u;
+  ClipboardOps clip{};
+  InjectOps inject{};
+  ops.Wire(clip, inject);
+
+  UploadPipeline pipeline(cfg);
+  // Zero is a legal clock reading, not a "not armed" sentinel: the deadline
+  // must still fire once this clock passes upload_timeout_ms.
+  std::atomic<std::uint64_t> now_ms{0u};
+  pipeline.SetClock(
+      [&now_ms]() noexcept -> std::uint64_t { return now_ms.load(std::memory_order_relaxed); });
+
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = false;
+    ops.gate_entered = false;
+  }
+
+  auto client = std::make_unique<Client>(ByteStream{});
+  Result<UploadReport> result = Result<UploadReport>::error(Error::kOk);
+  std::thread worker([&pipeline, &client, &clip, &inject, &result] {
+    result = pipeline.Run(*client, clip, inject, 1900000012ull);
+  });
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_cv.wait(lock, [&ops] { return ops.gate_entered; });
+  }
+  CHECK(pipeline.in_flight());
+
+  now_ms.store(5000u + 1u, std::memory_order_relaxed);
+  CHECK(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 1u);
+
+  {
+    std::unique_lock<std::mutex> lock(ops.gate_mutex);
+    ops.gate_open = true;
+    ops.gate_cv.notify_all();
+  }
+  worker.join();
+
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == Error::kUploadTimeout);
+  CHECK(ops.set_text_calls.load() == 0);
+  CHECK(ops.paste_calls.load() == 0);
+}
+
+TEST_CASE("the deadline still covers the retention prune", "[pipeline][integration]") {
+  BlockingStream wrapper;
+  auto session = ConnectSftpWrapped(wrapper);
+  if (session == nullptr) {
+    SKIP("local sftp subsystem unavailable");
+  }
+  Client& client = session->client;
+
+  const auto home = client.Realpath(".");
+  REQUIRE(home.has_value());
+  const std::string rel = CacheDir("picopaste-pipe-prune-deadline");
+  const std::string abs = std::string(home.value().c_str()) + rel;
+
+  Config cfg = DefaultConfig();
+  cfg.remote_dir.assign(osp::TruncateToCapacity, (std::string("~") + rel).c_str());
+  cfg.restore_clipboard = true;
+  cfg.upload_timeout_ms = 5000U;
+  cfg.delay_ms = 0;
+
+  const test::TempFile local = MakeLocalFile(2048u);
+  REQUIRE(local.valid());
+
+  FakeOps ops;
+  (void)std::snprintf(ops.local_path, sizeof(ops.local_path), "%s", local.path());
+  ops.bytes = 2048u;
+  // Restore runs on the worker just before Prune, so arming here parks the
+  // first read of Prune's directory listing. Until it is released the worker is
+  // blocked in the last step, exactly as it would be against a silent peer.
+  ops.on_restore = &BlockingStream::Arm;
+  ops.on_restore_ctx = &wrapper;
+  ClipboardOps clip{};
+  InjectOps inject{};
+  ops.Wire(clip, inject);
+
+  UploadPipeline pipeline(cfg);
+  std::atomic<std::uint64_t> now_ms{1000000u};
+  pipeline.SetClock(
+      [&now_ms]() noexcept -> std::uint64_t { return now_ms.load(std::memory_order_relaxed); });
+
+  Result<UploadReport> result = Result<UploadReport>::error(Error::kOk);
+  std::thread worker([&pipeline, &client, &clip, &inject, &result] {
+    result = pipeline.Run(client, clip, inject, 1900000013ull);
+  });
+
+  wrapper.WaitReadBlocked();
+  // The upload worker is inside Prune. The external watchdog must still be able
+  // to latch the deadline here, or a silent peer during cleanup would freeze the
+  // tool with the clipboard already published.
+  CHECK(pipeline.in_flight());
+  now_ms.store(1000000u + 5000u + 1u, std::memory_order_relaxed);
+  CHECK(pipeline.UploadOverdue());
+  CHECK(pipeline.UploadTimeoutCount() == 1u);
+
+  wrapper.Release();
+  worker.join();
+
+  // An expiry that lands while Prune is blocked must be reported as a timeout,
+  // never as a delivered success.
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.get_error() == Error::kUploadTimeout);
+  CHECK_FALSE(pipeline.in_flight());
+  CHECK(ops.paste_calls.load() == 1);  // the paste happened before the block
+
+  // Drop whatever Prune left behind (the run ended in a timeout, so no report).
+  const auto listing = client.ListDir(abs.c_str());
+  REQUIRE(listing.has_value());
+  for (std::uint32_t i = 0u; i < listing.value().entries.size(); ++i) {
+    char path[sftp::kMaxPathBytes];
+    (void)std::snprintf(path, sizeof(path), "%s/%s", abs.c_str(), listing.value().entries[i].name.c_str());
+    (void)client.Remove(path);
+  }
+}
+
+TEST_CASE("a failed clipboard restore is not reported as restored", "[pipeline][integration]") {
+  auto session = ConnectSftp();
+  if (session == nullptr) {
+    SKIP("local sftp subsystem unavailable");
+  }
+  Client& client = session->client;
+
+  Config cfg = DefaultConfig();
+  cfg.remote_dir.assign(osp::TruncateToCapacity, (std::string("~") + CacheDir("picopaste-pipe-restore")).c_str());
+  cfg.restore_clipboard = true;
+  cfg.delay_ms = 0;
+
+  const test::TempFile local = MakeLocalFile(1024u);
+  REQUIRE(local.valid());
+
+  FakeOps ops;
+  (void)std::snprintf(ops.local_path, sizeof(ops.local_path), "%s", local.path());
+  ops.bytes = 1024u;
+  ops.restore_error = Error::kClipboardOpenFailed;
+  ClipboardOps clip{};
+  InjectOps inject{};
+  ops.Wire(clip, inject);
+
+  UploadPipeline pipeline(cfg);
+  const auto result = pipeline.Run(client, clip, inject, 1900000014ull);
+
+  // A restore failure is not a new error: the paste was still delivered.
+  REQUIRE(result.has_value());
+  CHECK(ops.restore_calls.load() == 1);
+  CHECK(ops.paste_calls.load() == 1);
+  // ...but it must not be reported as if the clipboard came back.
+  CHECK_FALSE(result.value().clipboard_restored);
+
+  REQUIRE(client.Remove(result.value().remote_path.c_str()));
 }

@@ -118,8 +118,10 @@ bool UploadPipeline::UploadOverdue() noexcept {
   if (0u == cfg_.upload_timeout_ms) {
     return false;  // deadline disabled
   }
+  // The generation is already visible; its release store also published the
+  // start time and the armed flag read below.
   const std::uint64_t start_ms = flight_start_ms_.load(std::memory_order_relaxed);
-  if (0u == start_ms) {
+  if (!flight_armed_.load(std::memory_order_relaxed)) {
     return false;  // the flag was won but the flight has not armed yet
   }
   if ((Now() - start_ms) < static_cast<std::uint64_t>(cfg_.upload_timeout_ms)) {
@@ -223,10 +225,10 @@ Status UploadPipeline::Publish(const ClipboardOps& clip, const InjectOps& inject
   const Error injected = inject.paste(inject.ctx, cfg_.delay_ms);
   // Restore even when the chord failed: after a focus change the freshly-set
   // path is the wrong thing to leave on the user's clipboard. A restore failure
-  // must not turn a delivered (or withheld) paste into a different error.
+  // must not turn a delivered (or withheld) paste into a different error, but it
+  // must not be reported as a restore either.
   if (cfg_.restore_clipboard && capture.captured && (nullptr != capture.restore_token)) {
-    (void)clip.restore(clip.ctx, capture.restore_token);
-    restored = true;
+    restored = (Error::kOk == clip.restore(clip.ctx, capture.restore_token));
   }
   if (Error::kOk != injected) {
     return Status::error(injected);
@@ -263,6 +265,7 @@ Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOp
   // expiry latch, so no state from the previous upload can end this one.
   const std::uint32_t generation = flight_generation_.fetch_add(1u, std::memory_order_relaxed) + 1u;
   flight_start_ms_.store(Now(), std::memory_order_relaxed);
+  flight_armed_.store(true, std::memory_order_relaxed);
   active_generation_.store(generation, std::memory_order_release);
 
   CapturedClip captured{};
@@ -304,8 +307,9 @@ Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOp
   // consistent with the latch even when expiry lands inside Publish. Retire the
   // flight before returning so the next run starts with no state from this one;
   // FlightGuard then releases the flag on this exit like every other.
-  active_generation_.store(0u, std::memory_order_release);
   if (!step) {
+    flight_armed_.store(false, std::memory_order_relaxed);
+    active_generation_.store(0u, std::memory_order_release);
     return Result<UploadReport>::error(step.get_error());
   }
 
@@ -313,7 +317,17 @@ Result<UploadReport> UploadPipeline::Run(sftp::Client& client, const ClipboardOp
   report.remote_path.assign(osp::TruncateToCapacity, remote.c_str());
   report.bytes = captured.bytes;
   report.clipboard_restored = restored;
+  // Prune is the last blocking step, so the deadline must cover it too: retire
+  // only once it returns, then read the latch. Retiring first is what makes the
+  // read authoritative -- once active_generation_ is 0 no new latch can land,
+  // so DeadlinePassed sees every expiry that beat retirement, including one that
+  // arrived while Prune was blocked against a silent peer.
   Prune(client, dir, now_unix, report);
+  flight_armed_.store(false, std::memory_order_relaxed);
+  active_generation_.store(0u, std::memory_order_release);
+  if (DeadlinePassed(generation)) {
+    return Result<UploadReport>::error(Error::kUploadTimeout);
+  }
   return Result<UploadReport>::success(report);
 }
 

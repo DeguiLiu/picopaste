@@ -59,13 +59,14 @@ using IniConfig = osp::Config<osp::IniBackend>;
 
 constexpr const char* kSection = "picopaste";
 
-// Locate `key`, tolerating a file written without a section header.
+// Locate `key` in the one section this file defines. There is deliberately no
+// fallback to the empty section: the INI backend rejects a file whose first
+// field has no section header outright (inicpp throws, and LoadFile maps that to
+// kConfigParseFailed), so such a file never reaches this function and a second
+// probe could not succeed.
 const char* Lookup(const IniConfig& cfg, const char* key) noexcept {
   if (cfg.HasKey(kSection, key)) {
     return cfg.GetString(kSection, key, "");
-  }
-  if (cfg.HasKey("", key)) {
-    return cfg.GetString("", key, "");
   }
   return nullptr;
 }
@@ -85,16 +86,49 @@ Status AssignString(osp::FixedString<N>& field, const IniConfig& cfg, const char
   return Status::success();
 }
 
-std::uint32_t LookupU32(const IniConfig& cfg, const char* key, std::uint32_t fallback) noexcept {
-  const std::int32_t value = cfg.GetInt(kSection, key, static_cast<std::int32_t>(fallback));
-  if (0 > value) {
-    return fallback;
+// Assign a non-negative count into `field`. A key that is present but does not
+// parse as a u32 is reported, never replaced by the default: the config contract
+// forbids silently dropping a value the user wrote. An absent key leaves the
+// field at its default.
+Status AssignU32(std::uint32_t& field, const IniConfig& cfg, const char* key) noexcept {
+  if (!cfg.HasKey(kSection, key)) {
+    return Status::success();
   }
-  return static_cast<std::uint32_t>(value);
+  // GetInt reports a parse failure and an out-of-range value the same way, by
+  // returning the default it was handed. A sentinel outside the valid u32 range
+  // makes "present but malformed" distinguishable from "absent".
+  constexpr std::int32_t kMalformed = -1;
+  const std::int32_t value = cfg.GetInt(kSection, key, kMalformed);
+  if (0 > value) {
+    return Status::error(Error::kConfigParseFailed);
+  }
+  field = static_cast<std::uint32_t>(value);
+  return Status::success();
 }
 
-bool LookupBool(const IniConfig& cfg, const char* key, bool fallback) noexcept {
-  return cfg.GetBool(kSection, key, fallback);
+// The boolean literals newosp's ParseBool accepts. GetBool maps every
+// unrecognised string to false, so presence alone cannot validate a boolean;
+// checking the raw text lets a present-but-unusable value be reported instead of
+// read as an intentional false.
+bool IsBoolLiteral(const char* value) noexcept {
+  return osp::detail::ExtCaseEqual(value, "true") || osp::detail::ExtCaseEqual(value, "1") ||
+         osp::detail::ExtCaseEqual(value, "yes") || osp::detail::ExtCaseEqual(value, "on") ||
+         osp::detail::ExtCaseEqual(value, "false") || osp::detail::ExtCaseEqual(value, "0") ||
+         osp::detail::ExtCaseEqual(value, "no") || osp::detail::ExtCaseEqual(value, "off");
+}
+
+// Assign a boolean into `field`, on the same terms as AssignU32: absent keeps the
+// default, present-but-unusable is an error.
+Status AssignBool(bool& field, const IniConfig& cfg, const char* key) noexcept {
+  if (!cfg.HasKey(kSection, key)) {
+    return Status::success();
+  }
+  const char* raw = cfg.GetString(kSection, key, "");
+  if (!IsBoolLiteral(raw)) {
+    return Status::error(Error::kConfigParseFailed);
+  }
+  field = cfg.GetBool(kSection, key, field);
+  return Status::success();
 }
 
 // --- Raw value-length guard -------------------------------------------------
@@ -282,32 +316,47 @@ Result<Config> LoadConfig(const char* path, bool* created_defaults) noexcept {
   }
 
   Config cfg = DefaultConfig();
-  Status strings = Status::success();
-  strings = AssignString(cfg.host, ini, "host");
-  if (strings.has_value()) {
-    strings = AssignString(cfg.remote_dir, ini, "remote_dir");
+  Status fields = Status::success();
+  fields = AssignString(cfg.host, ini, "host");
+  if (fields.has_value()) {
+    fields = AssignString(cfg.remote_dir, ini, "remote_dir");
   }
-  if (strings.has_value()) {
-    strings = AssignString(cfg.hotkey, ini, "hotkey");
+  if (fields.has_value()) {
+    fields = AssignString(cfg.hotkey, ini, "hotkey");
   }
-  if (strings.has_value()) {
-    strings = AssignString(cfg.ssh_command, ini, "ssh_command");
+  if (fields.has_value()) {
+    fields = AssignString(cfg.ssh_command, ini, "ssh_command");
   }
-  if (strings.has_value()) {
-    strings = AssignString(cfg.log_level, ini, "log_level");
+  if (fields.has_value()) {
+    fields = AssignString(cfg.log_level, ini, "log_level");
   }
-  if (!strings.has_value()) {
-    return Result<Config>::error(strings.get_error());
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.delay_ms, ini, "delay_ms");
   }
-
-  cfg.delay_ms = LookupU32(ini, "delay_ms", cfg.delay_ms);
-  cfg.upload_timeout_ms = LookupU32(ini, "upload_timeout_ms", cfg.upload_timeout_ms);
-  cfg.max_image_bytes = LookupU32(ini, "max_image_bytes", cfg.max_image_bytes);
-  cfg.job_memory_limit_mb = LookupU32(ini, "job_memory_limit_mb", cfg.job_memory_limit_mb);
-  cfg.log_max_bytes = LookupU32(ini, "log_max_bytes", cfg.log_max_bytes);
-  cfg.log_keep_files = LookupU32(ini, "log_keep_files", cfg.log_keep_files);
-  cfg.restore_clipboard = LookupBool(ini, "restore_clipboard", cfg.restore_clipboard);
-  cfg.notify_enabled = LookupBool(ini, "notify_enabled", cfg.notify_enabled);
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.upload_timeout_ms, ini, "upload_timeout_ms");
+  }
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.max_image_bytes, ini, "max_image_bytes");
+  }
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.job_memory_limit_mb, ini, "job_memory_limit_mb");
+  }
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.log_max_bytes, ini, "log_max_bytes");
+  }
+  if (fields.has_value()) {
+    fields = AssignU32(cfg.log_keep_files, ini, "log_keep_files");
+  }
+  if (fields.has_value()) {
+    fields = AssignBool(cfg.restore_clipboard, ini, "restore_clipboard");
+  }
+  if (fields.has_value()) {
+    fields = AssignBool(cfg.notify_enabled, ini, "notify_enabled");
+  }
+  if (!fields.has_value()) {
+    return Result<Config>::error(fields.get_error());
+  }
 
   return Result<Config>::success(cfg);
 }

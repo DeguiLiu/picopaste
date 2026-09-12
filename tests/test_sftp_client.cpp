@@ -10,10 +10,12 @@
 //      local sftp subsystem is unavailable.
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_support.hpp"
@@ -351,6 +353,36 @@ TEST_CASE("Remove treats NO_SUCH_FILE as success but rejects other errors", "[sf
     REQUIRE_FALSE(s);
     CHECK(s.get_error() == Error::kRemoveFailed);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dead child: every failure must be an honest return, never a fatal signal
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a write after the child exits fails honestly instead of killing the process",
+          "[sftp][client][stream]") {
+  auto spawned = test::SpawnStream(test::DeadChildArgv());
+  REQUIRE(spawned.has_value());
+  StreamGuard guard{spawned.value()};
+
+  /* The child exits immediately and closes the read end of our stdin pipe. Wait
+     until that happens so the write below is a genuine broken-pipe condition; a
+     still-live child would accept the byte into the pipe buffer, so poll rather
+     than assume a fixed delay. */
+  const std::uint8_t byte = 0x42u;
+  bool failed = false;
+  for (std::int32_t i = 0; (i < 200) && !failed; ++i) {
+    failed = !guard.b.write(guard.b.ctx, &byte, 1u);
+    if (!failed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  CHECK(failed);
+
+  /* The read side sees EOF from the dead writer; that too must surface as an
+     honest false, not a hang or a crash. */
+  std::uint8_t dst = 0u;
+  CHECK_FALSE(guard.b.read(guard.b.ctx, &dst, 1u));
 }
 
 // ---------------------------------------------------------------------------

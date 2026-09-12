@@ -187,11 +187,15 @@ class UploadPipeline final {
   // thread runs the periodic check. A flight's generation keys its own start
   // time and expiry latch, so the previous upload's values are never attributed
   // to a new one. `active_generation_` is 0 when no upload is in flight.
+  //
+  // `flight_armed_` is the separate "start time is live" flag: a monotonic
+  // clock is legally 0, so a 0 start time cannot double as the sentinel.
   ClockFn clock_;
   std::atomic<std::uint32_t> flight_generation_{0};
   std::atomic<std::uint32_t> active_generation_{0};
   std::atomic<std::uint32_t> expired_generation_{0};
   std::atomic<std::uint64_t> flight_start_ms_{0};
+  std::atomic<bool> flight_armed_{false};
   std::atomic<std::uint32_t> upload_timeout_count_{0};
 };
 

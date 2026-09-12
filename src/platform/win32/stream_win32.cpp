@@ -65,11 +65,45 @@ bool CreateChildPipes(SECURITY_ATTRIBUTES* security, HANDLE* stdin_read, HANDLE*
   return true;
 }
 
+// Create the child's pipe pairs, open NUL for its stderr, and mark the two
+// ends the parent keeps as non-inheritable. On failure every handle opened
+// here is closed, so the caller only has to report the error. Non-inheritable
+// parent ends are load-bearing: in the no-attribute-list fallback the child
+// would otherwise inherit stdin_write / stdout_read, the parent would never
+// observe EOF, and both pipes would stay open after Close().
+bool CreateChildChannel(SECURITY_ATTRIBUTES* security, HANDLE* stdin_read, HANDLE* stdin_write, HANDLE* stdout_read,
+                        HANDLE* stdout_write, HANDLE* nul_device) noexcept {
+  if (CreateChildPipes(security, stdin_read, stdin_write, stdout_read, stdout_write) == false) {
+    return false;
+  }
+  if ((SetHandleInformation(*stdin_write, HANDLE_FLAG_INHERIT, 0) == 0) ||
+      (SetHandleInformation(*stdout_read, HANDLE_FLAG_INHERIT, 0) == 0)) {
+    CloseIfValid(stdin_read);
+    CloseIfValid(stdin_write);
+    CloseIfValid(stdout_read);
+    CloseIfValid(stdout_write);
+    return false;
+  }
+  // ssh writes first-connection warnings and errors to stderr. Those must not
+  // reach the SFTP stdout pipe or they would corrupt the framing, so stderr
+  // goes to the NUL device; a missing NUL falls back to the stdout pipe.
+  *nul_device =
+      CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, security, OPEN_EXISTING, 0, nullptr);
+  return true;
+}
+
+// A null or over-long command line is refused here, giving Spawn a single
+// failure point that runs before any handle is opened.
+bool PrepareCommandLine(const ChildStreamOptions& options, wchar_t* out, std::size_t out_chars) noexcept {
+  return (nullptr != options.command_line) && CopyWide(options.command_line, out, out_chars);
+}
+
 }  // namespace
 
 Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
   Close();
-  if (options.command_line == nullptr) {
+  wchar_t command_line[kMaxCommandLineChars] = {};
+  if (PrepareCommandLine(options, command_line, kMaxCommandLineChars) == false) {
     return Status::error(Error::kChannelSpawnFailed);
   }
 
@@ -82,20 +116,10 @@ Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
   HANDLE stdin_write = nullptr;
   HANDLE stdout_read = nullptr;
   HANDLE stdout_write = nullptr;
-  if (CreateChildPipes(&security, &stdin_read, &stdin_write, &stdout_read, &stdout_write) == false) {
+  HANDLE nul_device = INVALID_HANDLE_VALUE;
+  if (CreateChildChannel(&security, &stdin_read, &stdin_write, &stdout_read, &stdout_write, &nul_device) == false) {
     return Status::error(Error::kChannelSpawnFailed);
   }
-
-  // The ends we keep must not be inherited; only the child's ends may be, and
-  // the handle list below pins exactly which ones cross the boundary.
-  (void)SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
-  (void)SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
-
-  // ssh writes first-connection warnings and errors to stderr. Those must not
-  // reach the SFTP stdout pipe or they would corrupt the framing, so stderr
-  // goes to the NUL device.
-  HANDLE nul_device =
-      CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr);
 
   STARTUPINFOEXW startup{};
   BOOL have_attribute_list = FALSE;
@@ -134,19 +158,6 @@ Status ChildStream::Spawn(const ChildStreamOptions& options) noexcept {
     // Fallback: the two retained pipe ends are already non-inheritable, so the
     // only inheritable handles are the child's pipe ends and NUL.
     startup.StartupInfo.cb = sizeof(STARTUPINFO);
-  }
-
-  wchar_t command_line[kMaxCommandLineChars] = {};
-  if (CopyWide(options.command_line, command_line, kMaxCommandLineChars) == false) {
-    if (have_attribute_list != FALSE) {
-      DeleteProcThreadAttributeList(attribute_list);
-    }
-    CloseIfValid(&stdin_read);
-    CloseIfValid(&stdin_write);
-    CloseIfValid(&stdout_read);
-    CloseIfValid(&stdout_write);
-    CloseIfValid(&nul_device);
-    return Status::error(Error::kChannelSpawnFailed);
   }
 
   PROCESS_INFORMATION process_info{};

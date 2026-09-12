@@ -186,6 +186,20 @@ inline Result<sftp::ByteStream> SpawnStream(const char* const* argv) noexcept
 #endif
 }
 
+// argv for a child that exits at once without reading or writing its pipes. It
+// exists so the stream tests can drive a genuine dead-child write (broken pipe)
+// without a remote peer. Selected here, next to SpawnStream, so the tests stay
+// platform-branch-free.
+inline const char* const* DeadChildArgv() noexcept
+{
+#if defined(_WIN32)
+    static const char* const argv[] = {"cmd.exe", "/c", "exit", "0", nullptr};
+#else
+    static const char* const argv[] = {"sh", "-c", "exit 0", nullptr};
+#endif
+    return argv;
+}
+
 // A local scratch file with a name unique to this process. It is created
 // exclusively (POSIX mkstemp / Windows O_EXCL), holds a caller-supplied payload
 // for the whole test, and is removed on destruction. RAII guard: copy and assign

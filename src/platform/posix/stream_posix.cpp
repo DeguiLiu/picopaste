@@ -75,6 +75,22 @@ void CloseFd(std::int32_t& fd) noexcept {
   }
 }
 
+/* A pipe-owning library must report a dead child's write as EPIPE, never die by
+   signal: with SIGPIPE's default disposition the ::write in PipeWrite is torn
+   down before it returns, so the caller can never observe kChannelWriteFailed.
+   Pipes have no MSG_NOSIGNAL equivalent, leaving only the process-global
+   disposition. That global scope is the accepted trade-off here -- silently
+   killing the whole process on a routine remote-channel failure is strictly
+   worse, and a caller that wants SIGPIPE back can reinstall it once the stream
+   is closed. Installed once, in the parent after fork; the child resets it to the
+   default before exec, so the exec'd tool (ssh) keeps normal SIGPIPE semantics
+   even on later spawns. The function-local static makes repeated spawns
+   idempotent. */
+void IgnoreSigPipeOnce() noexcept {
+  static const bool kInstalled = (std::signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+  (void)kInstalled;
+}
+
 bool PipeWrite(void* ctx, const std::uint8_t* data, std::size_t len) noexcept {
   PipeCtx* c = static_cast<PipeCtx*>(ctx);
   if ((c == nullptr) || !c->used || (c->in_fd < 0)) {
@@ -87,6 +103,8 @@ bool PipeWrite(void* ctx, const std::uint8_t* data, std::size_t len) noexcept {
       if (errno == EINTR) {
         continue;
       }
+      /* EPIPE (the child is gone) lands here now that SIGPIPE is ignored; it is
+         an ordinary write error and must surface as false, like any other. */
       return false;
     }
     if (n == 0) {
@@ -112,6 +130,8 @@ bool PipeRead(void* ctx, std::uint8_t* dst, std::size_t len) noexcept {
       return false;
     }
     if (n == 0) {
+      /* A dead child closes its stdout, so the parent sees EOF here; reporting
+         failure is the honest answer to "the peer is gone". */
       return false; /* EOF before the requested length */
     }
     off += static_cast<std::size_t>(n);
@@ -169,11 +189,16 @@ Result<sftp::ByteStream> SpawnStream(const char* const* argv) noexcept {
     (void)::close(in_pipe[1]);
     (void)::close(out_pipe[0]);
     (void)::close(out_pipe[1]);
+    /* Do not let a child of a later spawn inherit the parent's ignored SIGPIPE;
+       exec'd tools such as ssh expect the default disposition. */
+    (void)std::signal(SIGPIPE, SIG_DFL);
     (void)::execvp(argv[0], const_cast<char* const*>(argv));
     _exit(127);
   }
 
-  /* Parent: keep the write end of in_pipe and the read end of out_pipe. */
+  /* Parent: keep the write end of in_pipe and the read end of out_pipe. Install
+     the SIGPIPE ignore before this stream can ever be written. */
+  IgnoreSigPipeOnce();
   CloseFd(in_pipe[0]);
   CloseFd(out_pipe[1]);
 
