@@ -164,6 +164,11 @@ jobs:
     # cross-compile cannot: mingw defines __GNUC__ and ships pthread.h and
     # unistd.h, so it happily compiles headers that MSVC rejects.
     runs-on: windows-latest
+    # Needed only by the tag-gated publish step at the end of this job. Pull
+    # requests from forks get a read-only token regardless, so this grants
+    # nothing to untrusted code.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -196,3 +201,32 @@ jobs:
       # enforces it with the pinned binary.
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      # Published only on a `v*` tag, and only after Test has passed, so the
+      # attached binary is the exact one ctest just exercised -- rebuilding it
+      # in a separate job would ship something the smoke test never touched.
+      # `gh` ships on the runner, which avoids adding a third-party release
+      # action to the supply chain for one step.
+      - name: Publish the executable as a release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = "build/Release/picopaste.exe"
+          if (-not (Test-Path $exe)) { throw "the build produced no $exe" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # The version belongs in the asset name: two releases each attaching
+          # a bare `picopaste.exe` are indistinguishable once downloaded.
+          $asset = "dist/picopaste-$env:GITHUB_REF_NAME-windows-x64.exe"
+          Copy-Item $exe $asset
+          gh release view "$env:GITHUB_REF_NAME" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:GITHUB_REF_NAME" $asset --clobber
+          } else {
+            gh release create "$env:GITHUB_REF_NAME" $asset `
+              --title "picopaste $env:GITHUB_REF_NAME" `
+              --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "published $asset"
