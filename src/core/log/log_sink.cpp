@@ -130,11 +130,8 @@ Status LogSink::Write(const LogRecord& record) noexcept {
   if (0 == len) {
     return Status::error(Error::kLogIoFailed);
   }
-  if (len != std::fwrite(line, 1, len, file_)) {
-    return Status::error(Error::kLogIoFailed);
-  }
   // Flush so current_size_ is the real on-disk size, not an incoherent buffer.
-  if (0 != std::fflush(file_)) {
+  if ((len != std::fwrite(line, 1, len, file_)) || (0 != std::fflush(file_))) {
     return Status::error(Error::kLogIoFailed);
   }
   current_size_ += len;

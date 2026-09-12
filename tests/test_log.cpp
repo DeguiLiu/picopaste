@@ -79,7 +79,8 @@ TEST_CASE("LogRing is bounded and counts drops instead of blocking", "[log]") {
 TEST_CASE("LogRing keeps producers separate and drains round-robin", "[log]") {
   picopaste::LogRing ring;
   REQUIRE(ring.TryPush(picopaste::LogProducer::kMain, picopaste::MakeLogRecord(picopaste::LogLevel::kInfo, "main")));
-  REQUIRE(ring.TryPush(picopaste::LogProducer::kSftpReader, picopaste::MakeLogRecord(picopaste::LogLevel::kInfo, "sftp")));
+  REQUIRE(ring.TryPush(picopaste::LogProducer::kSftpReader,
+                       picopaste::MakeLogRecord(picopaste::LogLevel::kInfo, "sftp")));
 
   CHECK(ring.Size(picopaste::LogProducer::kMain) == 1U);
   CHECK(ring.Size(picopaste::LogProducer::kSftpReader) == 1U);

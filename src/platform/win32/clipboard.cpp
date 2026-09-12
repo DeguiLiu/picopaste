@@ -104,7 +104,7 @@ struct Channel {
 // a non-contiguous or zero mask, which means the DIB uses a layout we would
 // decode wrongly.
 bool DescribeChannel(std::uint32_t mask, Channel* out) noexcept {
-  if (mask == 0u) {
+  if (0u == mask) {
     return false;
   }
   std::uint32_t shift = 0;
@@ -148,7 +148,7 @@ struct DibGeometry {
 // the compression tag, and the palette entry count for the layout resolver.
 bool ParseDibHeader(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo, std::uint32_t* header_size,
                     std::uint32_t* compression, std::uint32_t* clr_used) noexcept {
-  if (dib == nullptr || geo == nullptr || dib_bytes < kBitmapInfoHeaderSize) {
+  if (nullptr == dib || nullptr == geo || dib_bytes < kBitmapInfoHeaderSize) {
     return false;
   }
   *header_size = ReadU32(dib);
@@ -282,7 +282,7 @@ bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) 
 }
 
 std::uint8_t ScaleChannel(std::uint32_t value, std::uint32_t bits) noexcept {
-  if (bits == 0u) {
+  if (0u == bits) {
     return 0u;
   }
   if (bits >= 8u) {
@@ -339,7 +339,7 @@ class DibSource final : public IWICBitmapSource {
   }
 
   HRESULT STDMETHODCALLTYPE GetPixelFormat(WICPixelFormatGUID* format) override {
-    if (format == nullptr) {
+    if (nullptr == format) {
       return E_INVALIDARG;
     }
     *format = GUID_WICPixelFormat32bppBGRA;
@@ -361,7 +361,7 @@ class DibSource final : public IWICBitmapSource {
   }
 
   HRESULT STDMETHODCALLTYPE CopyPixels(const WICRect* rect, UINT stride, UINT buffer_size, BYTE* buffer) override {
-    if (buffer == nullptr) {
+    if (nullptr == buffer) {
       return E_INVALIDARG;
     }
     WICRect area{0, 0, static_cast<INT>(geo_.width), static_cast<INT>(geo_.height)};
@@ -670,7 +670,7 @@ Result<CapturedImage> CaptureRegisteredPng(HANDLE data, const Config& cfg, const
 Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path, bool has_dibv5) noexcept {
   const UINT dib_format = has_dibv5 ? CF_DIBV5 : CF_DIB;
   HANDLE data = GetClipboardData(dib_format);
-  if (data == nullptr) {
+  if (nullptr == data) {
     return Result<CapturedImage>::error(Error::kNoImageInClipboard);
   }
   const SIZE_T size = GlobalSize(data);
@@ -708,7 +708,7 @@ ClipboardFormats InspectClipboardFormats() noexcept {
 Result<CapturedImage> EncodeDibToPngFile(const std::uint8_t* dib, std::size_t dib_bytes, const wchar_t* out_path,
                                          std::uint32_t max_bytes) noexcept {
   DibGeometry geo{};
-  if (dib == nullptr || out_path == nullptr || ParseDib(dib, dib_bytes, &geo) == false || geo.pixels == nullptr) {
+  if (nullptr == dib || nullptr == out_path || ParseDib(dib, dib_bytes, &geo) == false || nullptr == geo.pixels) {
     return Result<CapturedImage>::error(Error::kPngEncodeFailed);
   }
 

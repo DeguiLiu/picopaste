@@ -140,7 +140,7 @@ class ComApartment final {
 // UTF-8 -> UTF-16 into a fixed buffer (NUL terminated). Returns false when the
 // result would not fit, so callers report instead of truncating silently.
 inline bool Utf8ToWide(const char* in, wchar_t* out, std::size_t out_chars) noexcept {
-  if (in == nullptr || out == nullptr || out_chars == 0) {
+  if (nullptr == in || nullptr == out || 0 == out_chars) {
     return false;
   }
   std::int32_t written = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, static_cast<int>(out_chars));
@@ -150,7 +150,7 @@ inline bool Utf8ToWide(const char* in, wchar_t* out, std::size_t out_chars) noex
 // UTF-16 -> UTF-8 into a fixed buffer (NUL terminated). Returns false when the
 // result would not fit.
 inline bool WideToUtf8(const wchar_t* in, char* out, std::size_t out_bytes) noexcept {
-  if (in == nullptr || out == nullptr || out_bytes == 0) {
+  if (nullptr == in || nullptr == out || 0 == out_bytes) {
     return false;
   }
   std::int32_t written = WideCharToMultiByte(CP_UTF8, 0, in, -1, out, static_cast<int>(out_bytes), nullptr, nullptr);
@@ -159,7 +159,7 @@ inline bool WideToUtf8(const wchar_t* in, char* out, std::size_t out_bytes) noex
 
 // Copy a NUL-terminated source into a fixed wide buffer. False when too long.
 inline bool CopyWide(const wchar_t* src, wchar_t* dst, std::size_t dst_chars) noexcept {
-  if (src == nullptr || dst == nullptr || dst_chars == 0) {
+  if (nullptr == src || nullptr == dst || 0 == dst_chars) {
     return false;
   }
   std::size_t i = 0;

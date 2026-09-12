@@ -77,7 +77,7 @@ bool JoinPath(const char* dir, const char* name, char* out) noexcept {
   const std::size_t name_len = std::strlen(name);
   const bool needs_slash = (dir_len > 0u) && (dir[dir_len - 1u] != '/');
   const std::size_t total = dir_len + (needs_slash ? 1u : 0u) + name_len;
-  if ((total + 1u) > kMaxPathBytes) {
+  if (kMaxPathBytes < (total + 1u)) {
     return false;
   }
   (void)std::memcpy(out, dir, dir_len);

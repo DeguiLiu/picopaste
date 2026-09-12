@@ -61,12 +61,12 @@ TEST_CASE("BufferWriter never overflows and latches failure", "[sftp][packet]") 
   BufferWriter w(buf, sizeof(buf));
   CHECK(w.WriteU32(1u));
   CHECK(w.WriteU8(2u));
-  CHECK(w.size() == 5u);
+  CHECK(5u == w.size());
   CHECK_FALSE(w.WriteU8(3u));
   CHECK_FALSE(w.ok());
   /* Once latched, further calls stay failed and do not move the cursor. */
   CHECK_FALSE(w.WriteU32(4u));
-  CHECK(w.size() == 5u);
+  CHECK(5u == w.size());
 }
 
 TEST_CASE("BufferWriter refuses a silently truncated string", "[sftp][packet]") {

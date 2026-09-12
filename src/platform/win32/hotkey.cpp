@@ -102,15 +102,12 @@ LRESULT CALLBACK ChordHookProc(int code, WPARAM wparam, LPARAM lparam) {
   if (((key->flags & LLKHF_INJECTED) != 0) || (ModifiersDown() != g_active_chord.modifiers)) {
     return CallNextHookEx(nullptr, code, wparam, lparam);
   }
-  if (is_down) {
-    if (g_active_chord.key_down == false) {
+  if (is_down || is_up) {
+    if (is_down && (g_active_chord.key_down == false)) {
       g_active_chord.key_down = true;
       (void)PostThreadMessageW(GetCurrentThreadId(), kWmHotkey, g_active_chord.id, 0);
     }
     return 1;  // swallow, including auto-repeat, so the other owner is dead
-  }
-  if (is_up) {
-    return 1;
   }
   return CallNextHookEx(nullptr, code, wparam, lparam);
 }

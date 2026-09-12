@@ -201,6 +201,245 @@ Error ReadStatus(ByteStream& s, std::uint8_t* rx, std::uint32_t rx_cap, std::uin
 }
 
 // ---------------------------------------------------------------------------
+// Shared request helpers. A file-local free function cannot reach the private
+// Client members, so frame emission and the WRITE-chunk exchange live here and
+// the client methods call into them rather than duplicating the wire layout.
+// ---------------------------------------------------------------------------
+
+// Writes one frame (length prefix + type + payload) onto the channel.
+Error SendFrame(ByteStream& s, Pkt type, const void* payload, std::uint32_t len) noexcept {
+  if (!s.valid()) {
+    return Error::kChannelNotConnected;
+  }
+  std::uint8_t hdr[kFrameHeaderBytes];
+  PutBe32(hdr, len + 1u);
+  hdr[4] = static_cast<std::uint8_t>(type);
+  if (!s.write(s.ctx, hdr, sizeof(hdr))) {
+    return Error::kChannelWriteFailed;
+  }
+  if ((len > 0u) && !s.write(s.ctx, static_cast<const std::uint8_t*>(payload), len)) {
+    return Error::kChannelWriteFailed;
+  }
+  return Error::kOk;
+}
+
+// Builds the WRITE prefix in `tx` and sends the frame, then waits for the
+// per-WRITE OK ack. The chunk bytes must already sit in `tx` at the offset
+// kWriteDataOffset(handle_len), because the prefix is written around them.
+// `send_err` is the caller's operation-specific name for a failed frame write
+// (WriteFile surfaces a channel error; UploadFile folds it into kWriteFailed).
+Error SendWriteChunk(ByteStream& s, std::uint8_t* tx, std::size_t tx_cap, std::uint32_t id, const std::uint8_t* handle,
+                     std::uint32_t handle_len, std::uint64_t offset, std::uint32_t data_len, std::uint8_t* rx,
+                     std::uint32_t rx_cap, Error send_err) noexcept {
+  const std::uint32_t data_off = kWriteDataOffset(handle_len);
+  if ((data_off + data_len) > tx_cap) {
+    return Error::kWriteFailed;
+  }
+  BufferWriter w(tx, tx_cap);
+  (void)w.WriteU32(id);
+  (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+  (void)w.WriteU64(offset);
+  (void)w.WriteU32(data_len);
+  if (!w.ok() || (w.size() != data_off)) {
+    return Error::kWriteFailed;
+  }
+  if (Error::kOk != SendFrame(s, Pkt::kWrite, tx, static_cast<std::uint32_t>(data_off + data_len))) {
+    return send_err;
+  }
+  FxStatus code = FxStatus::kFailure;
+  const Error e = ReadStatus(s, rx, rx_cap, id, code);
+  if ((Error::kOk != e) || (FxStatus::kOk != code)) {
+    return Error::kWriteFailed;
+  }
+  return Error::kOk;
+}
+
+// Reads a STAT reply, which is either ATTRS (the normal case) or STATUS. A
+// frame-level failure folds into kStatFailed so a truncated or oversized frame
+// surfaces the same way as a missing attribute; every other malformation is a
+// protocol error. The ATTRS-carrying counterpart to ReadStatus.
+Error ReadAttrReply(ByteStream& s, std::uint8_t* rx, std::uint32_t rx_cap, std::uint32_t expect_id,
+                    AttrsInfo& attrs) noexcept {
+  std::uint8_t type = 0u;
+  std::uint32_t len = 0u;
+  if (Error::kOk != ReadFrame(s, rx, rx_cap, type, len)) {
+    return Error::kStatFailed;
+  }
+  BufferReader r(rx, len);
+  FxStatus code = FxStatus::kFailure;
+  bool id_ok = (Error::kOk == ReadRequestId(r, expect_id));
+  if (id_ok && (static_cast<std::uint8_t>(Pkt::kStatus) == type)) {
+    id_ok = (Error::kOk == ParseStatusRest(r, code));
+    if (!id_ok) {
+      return Error::kSftpProtocolError;
+    }
+    return Error::kStatFailed;
+  }
+  if (!id_ok || (static_cast<std::uint8_t>(Pkt::kAttrs) != type)) {
+    return Error::kSftpProtocolError;
+  }
+  return ParseAttrs(r, attrs) ? Error::kOk : Error::kStatFailed;
+}
+
+// Streams the local descriptor into WRITE frames until EOF and accumulates the
+// byte count in `offset`. Each chunk is read straight into the frame's data
+// region, so the prefix written by SendWriteChunk wraps bytes already present.
+Error StreamWrites(ByteStream& s, std::uint8_t* tx, std::size_t tx_cap, std::uint8_t* rx, std::uint32_t rx_cap,
+                   std::uint32_t& next_id, std::int32_t fd, const std::uint8_t* handle, std::uint32_t handle_len,
+                   std::uint64_t& offset) noexcept {
+  const std::uint32_t data_off = kWriteDataOffset(handle_len);
+  offset = 0u;
+  for (;;) {
+    const std::int64_t n = ReadFull(fd, tx + data_off, kWriteChunkBytes);
+    if (n < 0) {
+      return Error::kWriteFailed;
+    }
+    if (0 == n) {
+      break;
+    }
+    const std::uint32_t chunk = static_cast<std::uint32_t>(n);
+    const std::uint32_t write_id = next_id;
+    ++next_id;
+    if ((data_off + chunk) > tx_cap) {
+      return Error::kWriteFailed;
+    }
+    const Error e =
+        SendWriteChunk(s, tx, tx_cap, write_id, handle, handle_len, offset, chunk, rx, rx_cap, Error::kWriteFailed);
+    if (Error::kOk != e) {
+      return e;
+    }
+    offset += chunk;
+    if (chunk < kWriteChunkBytes) {
+      break; /* short read means the descriptor hit EOF */
+    }
+  }
+  return Error::kOk;
+}
+
+// Reads a NAME reply and returns its first entry. A STATUS reply is folded
+// into `status_err` (the caller's operation-specific failure); any other
+// malformed reply is a protocol error. Used by the single-name requests.
+Error ReadNameReply(ByteStream& s, std::uint8_t* rx, std::uint32_t rx_cap, std::uint32_t expect_id, Error status_err,
+                    const char*& name, std::uint32_t& name_len, AttrsInfo& attrs) noexcept {
+  std::uint8_t type = 0u;
+  std::uint32_t len = 0u;
+  if (Error::kOk != ReadFrame(s, rx, rx_cap, type, len)) {
+    return status_err;
+  }
+  BufferReader r(rx, len);
+  if (Error::kOk != ReadRequestId(r, expect_id)) {
+    return Error::kSftpProtocolError;
+  }
+  std::uint32_t count = 0u;
+  const char* longname = nullptr;
+  std::uint32_t longname_len = 0u;
+  bool ok = true;
+  if (static_cast<std::uint8_t>(Pkt::kStatus) == type) {
+    FxStatus code = FxStatus::kFailure;
+    ok = (Error::kOk == ParseStatusRest(r, code));
+  } else if (static_cast<std::uint8_t>(Pkt::kName) == type) {
+    ok = r.ReadU32(count) && (0u < count) && r.ReadString(name, name_len) && r.ReadString(longname, longname_len) &&
+         ParseAttrs(r, attrs);
+  } else {
+    ok = false;
+  }
+  if (!ok) {
+    return Error::kSftpProtocolError;
+  }
+  if (static_cast<std::uint8_t>(Pkt::kStatus) == type) {
+    return status_err;
+  }
+  return Error::kOk;
+}
+
+// Sends STAT for `path` and reports whether it resolves. ATTRS and STATUS(OK)
+// both mean "exists"; a frame-level failure folds into kMkdirFailed, a
+// mismatched id is a protocol error, and any other STATUS means not found.
+// This is the MKDIR-existing trap's disambiguation probe.
+Error StatExists(ByteStream& s, std::uint8_t* tx, std::size_t tx_cap, std::uint8_t* rx, std::uint32_t rx_cap,
+                 std::uint32_t& next_id, const char* path, bool& exists) noexcept {
+  const std::uint32_t stat_id = next_id;
+  ++next_id;
+  BufferWriter sw(tx, tx_cap);
+  (void)sw.WriteU32(stat_id);
+  if (!sw.WriteCString(path, kMaxPathBytes) ||
+      (Error::kOk != SendFrame(s, Pkt::kStat, tx, static_cast<std::uint32_t>(sw.size())))) {
+    return Error::kMkdirFailed;
+  }
+  std::uint8_t type = 0u;
+  std::uint32_t len = 0u;
+  if (Error::kOk != ReadFrame(s, rx, rx_cap, type, len)) {
+    return Error::kMkdirFailed;
+  }
+  exists = false;
+  BufferReader sr(rx, len);
+  if (Error::kOk != ReadRequestId(sr, stat_id)) {
+    return Error::kSftpProtocolError;
+  }
+  if (static_cast<std::uint8_t>(Pkt::kAttrs) == type) {
+    exists = true;
+  } else if (static_cast<std::uint8_t>(Pkt::kStatus) == type) {
+    FxStatus code = FxStatus::kFailure;
+    if (Error::kOk != ParseStatusRest(sr, code)) {
+      return Error::kSftpProtocolError;
+    }
+    exists = (FxStatus::kOk == code);
+  }
+  return Error::kOk;
+}
+
+// Sends one READ for `ask` bytes at `offset` and waits for the reply. A DATA
+// reply points `data`/`data_len` into `rx`; a STATUS(EOF) reply sets `eof`; any
+// other STATUS is kOpenFailed. Malformed replies are protocol errors, and a
+// frame-level failure is returned raw because a broken channel must keep its
+// own meaning. Scratch is reused per call; the data pointer is not copied.
+Error ReadChunk(ByteStream& s, std::uint8_t* tx, std::size_t tx_cap, std::uint8_t* rx, std::uint32_t rx_cap,
+                std::uint32_t& next_id, const std::uint8_t* handle, std::uint32_t handle_len, std::uint64_t offset,
+                std::uint32_t ask, const char*& data, std::uint32_t& data_len, bool& eof) noexcept {
+  const std::uint32_t read_id = next_id;
+  ++next_id;
+  data = nullptr;
+  data_len = 0u;
+  eof = false;
+  BufferWriter w(tx, tx_cap);
+  (void)w.WriteU32(read_id);
+  (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
+  (void)w.WriteU64(offset);
+  (void)w.WriteU32(ask);
+  Error err = w.ok() ? Error::kOk : Error::kSftpProtocolError;
+  if (Error::kOk == err) {
+    err = (Error::kOk == SendFrame(s, Pkt::kRead, tx, static_cast<std::uint32_t>(w.size())))
+              ? Error::kOk
+              : Error::kChannelWriteFailed;
+  }
+  std::uint8_t type = 0u;
+  std::uint32_t len = 0u;
+  if (Error::kOk == err) {
+    err = ReadFrame(s, rx, rx_cap, type, len);
+  }
+  if (Error::kOk == err) {
+    BufferReader r(rx, len);
+    if (Error::kOk != ReadRequestId(r, read_id)) {
+      err = Error::kSftpProtocolError;
+    } else if (static_cast<std::uint8_t>(Pkt::kStatus) == type) {
+      FxStatus code = FxStatus::kFailure;
+      if (Error::kOk != ParseStatusRest(r, code)) {
+        err = Error::kSftpProtocolError;
+      } else if (FxStatus::kEof == code) {
+        eof = true;
+      } else {
+        err = Error::kOpenFailed;
+      }
+    } else if (static_cast<std::uint8_t>(Pkt::kData) != type) {
+      err = Error::kSftpProtocolError;
+    } else if (!r.ReadString(data, data_len)) {
+      err = Error::kSftpProtocolError;
+    }
+  }
+  return err;
+}
+
+// ---------------------------------------------------------------------------
 // Upload-name pattern (declared in client.hpp; the listing filter).
 // ---------------------------------------------------------------------------
 
@@ -223,17 +462,9 @@ std::uint32_t Dec2(const char* p) noexcept {
 // ---------------------------------------------------------------------------
 
 Status Client::SendPacket(Pkt type, const void* payload, std::uint32_t len) noexcept {
-  if (!stream_.valid()) {
-    return Status::error(Error::kChannelNotConnected);
-  }
-  std::uint8_t hdr[kFrameHeaderBytes];
-  PutBe32(hdr, len + 1u);
-  hdr[4] = static_cast<std::uint8_t>(type);
-  if (!stream_.write(stream_.ctx, hdr, sizeof(hdr))) {
-    return Status::error(Error::kChannelWriteFailed);
-  }
-  if ((len > 0u) && !stream_.write(stream_.ctx, static_cast<const std::uint8_t*>(payload), len)) {
-    return Status::error(Error::kChannelWriteFailed);
+  const Error e = SendFrame(stream_, type, payload, len);
+  if (Error::kOk != e) {
+    return Status::error(e);
   }
   return Status::success();
 }
@@ -252,50 +483,54 @@ Status Client::OpenHandle(Pkt request, const char* path, const void* extra, std:
   const std::uint32_t id = next_id_++;
   BufferWriter w(tx_, sizeof(tx_));
   (void)w.WriteU32(id);
-  if (!w.WriteCString(path, kMaxPathBytes)) {
-    return Status::error(Error::kOpenFailed);
+  bool wrote = w.WriteCString(path, kMaxPathBytes);
+  if (wrote && (extra_len > 0u)) {
+    wrote = w.WriteBytes(extra, extra_len);
   }
-  if ((extra_len > 0u) && !w.WriteBytes(extra, extra_len)) {
-    return Status::error(Error::kOpenFailed);
-  }
-  if (!w.ok()) {
-    return Status::error(Error::kOpenFailed);
-  }
-  if (!SendPacket(request, tx_, static_cast<std::uint32_t>(w.size()))) {
-    return Status::error(Error::kOpenFailed);
+  Error err = (wrote && w.ok()) ? Error::kOk : Error::kOpenFailed;
+  if (Error::kOk == err) {
+    err = SendPacket(request, tx_, static_cast<std::uint32_t>(w.size())) ? Error::kOk : Error::kOpenFailed;
   }
 
   std::uint8_t type = 0u;
   std::uint32_t len = 0u;
-  const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
-  if (e != Error::kOk) {
-    return Status::error((e == Error::kChannelReadFailed) ? Error::kOpenFailed : e);
-  }
-  BufferReader r(rx_, len);
-  if (ReadRequestId(r, id) != Error::kOk) {
-    return Status::error(Error::kSftpProtocolError);
-  }
-  if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-    FxStatus code = FxStatus::kFailure;
-    if (ParseStatusRest(r, code) != Error::kOk) {
-      return Status::error(Error::kSftpProtocolError);
+  if (Error::kOk == err) {
+    err = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
+    if (Error::kChannelReadFailed == err) {
+      err = Error::kOpenFailed;
     }
-    if (code == FxStatus::kNoSuchFile) {
-      missing = true;
-      return Status::success();
+  }
+  bool missing_reply = false;
+  if (Error::kOk == err) {
+    BufferReader r(rx_, len);
+    if (Error::kOk != ReadRequestId(r, id)) {
+      err = Error::kSftpProtocolError;
+    } else if (static_cast<std::uint8_t>(Pkt::kStatus) == type) {
+      FxStatus code = FxStatus::kFailure;
+      if (Error::kOk != ParseStatusRest(r, code)) {
+        err = Error::kSftpProtocolError;
+      } else if (FxStatus::kNoSuchFile == code) {
+        missing_reply = true;
+      } else {
+        err = Error::kOpenFailed;
+      }
+    } else if (static_cast<std::uint8_t>(Pkt::kHandle) == type) {
+      const char* h = nullptr;
+      std::uint32_t h_len = 0u;
+      if (!r.ReadString(h, h_len) || (0u == h_len) || (h_len > kMaxHandleBytes)) {
+        err = Error::kOpenFailed;
+      } else {
+        (void)std::memcpy(handle, h, h_len);
+        handle_len = h_len;
+      }
+    } else {
+      err = Error::kSftpProtocolError;
     }
-    return Status::error(Error::kOpenFailed);
   }
-  if (type != static_cast<std::uint8_t>(Pkt::kHandle)) {
-    return Status::error(Error::kSftpProtocolError);
+  if (Error::kOk != err) {
+    return Status::error(err);
   }
-  const char* h = nullptr;
-  std::uint32_t h_len = 0u;
-  if (!r.ReadString(h, h_len) || (h_len == 0u) || (h_len > kMaxHandleBytes)) {
-    return Status::error(Error::kOpenFailed);
-  }
-  (void)std::memcpy(handle, h, h_len);
-  handle_len = h_len;
+  missing = missing_reply;
   return Status::success();
 }
 
@@ -340,12 +575,9 @@ Status Client::Init() noexcept {
     /* EOF here is the normal shape of "no sftp subsystem on the remote". */
     return Status::error(Error::kSftpInitFailed);
   }
-  if (type != static_cast<std::uint8_t>(Pkt::kVersion)) {
-    return Status::error(Error::kSftpInitFailed);
-  }
   BufferReader r(rx_, len);
   std::uint32_t version = 0u;
-  if (!r.ReadU32(version) || (version != kProtocolVersion)) {
+  if ((static_cast<std::uint8_t>(Pkt::kVersion) != type) || !r.ReadU32(version) || (kProtocolVersion != version)) {
     return Status::error(Error::kSftpInitFailed);
   }
   initialized_ = true;
@@ -371,43 +603,13 @@ Result<Path> Client::Realpath(const char* path) noexcept {
     return Result<Path>::error(Error::kRealpathFailed);
   }
 
-  std::uint8_t type = 0u;
-  std::uint32_t len = 0u;
-  const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
-  if (e != Error::kOk) {
-    return Result<Path>::error(Error::kRealpathFailed);
-  }
-  BufferReader r(rx_, len);
-  const Error id_err = ReadRequestId(r, id);
-  if (id_err != Error::kOk) {
-    return Result<Path>::error(Error::kSftpProtocolError);
-  }
-  if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-    FxStatus code = FxStatus::kFailure;
-    if (ParseStatusRest(r, code) != Error::kOk) {
-      return Result<Path>::error(Error::kSftpProtocolError);
-    }
-    return Result<Path>::error(Error::kRealpathFailed);
-  }
-  if (type != static_cast<std::uint8_t>(Pkt::kName)) {
-    return Result<Path>::error(Error::kSftpProtocolError);
-  }
-
-  std::uint32_t count = 0u;
-  if (!r.ReadU32(count) || (count == 0u)) {
-    return Result<Path>::error(Error::kSftpProtocolError);
-  }
   const char* name = nullptr;
   std::uint32_t name_len = 0u;
-  const char* longname = nullptr;
-  std::uint32_t longname_len = 0u;
   AttrsInfo attrs{};
-  if (!r.ReadString(name, name_len) || !r.ReadString(longname, longname_len) || !ParseAttrs(r, attrs)) {
-    return Result<Path>::error(Error::kSftpProtocolError);
-  }
-  if (name_len > Path::capacity()) {
+  const Error e = ReadNameReply(stream_, rx_, sizeof(rx_), id, Error::kRealpathFailed, name, name_len, attrs);
+  if ((Error::kOk != e) || (name_len > Path::capacity())) {
     /* Refuse to truncate a remote path silently. */
-    return Result<Path>::error(Error::kRealpathFailed);
+    return Result<Path>::error((Error::kOk != e) ? e : Error::kRealpathFailed);
   }
   const Path resolved(osp::TruncateToCapacity, name, name_len);
   return Result<Path>::success(resolved);
@@ -435,53 +637,29 @@ Status Client::Mkdir(const char* path) noexcept {
   }
 
   FxStatus code = FxStatus::kFailure;
-  const Error e = ReadStatus(stream_, rx_, sizeof(rx_), id, code);
-  if (e != Error::kOk) {
-    return Status::error(e == Error::kChannelReadFailed ? Error::kMkdirFailed : e);
-  }
-  if (code == FxStatus::kOk) {
-    return Status::success();
-  }
-
-  /* OpenSSH answers FAILURE (not OK) when the directory already exists.
-     Disambiguate with STAT: if the path resolves, the mkdir was a no-op.
-     STAT succeeds as ATTRS (the normal case) or as STATUS on some servers. */
-  if (code == FxStatus::kFailure) {
-    const std::uint32_t stat_id = next_id_++;
-    BufferWriter sw(tx_, sizeof(tx_));
-    (void)sw.WriteU32(stat_id);
-    if (!sw.WriteCString(path, kMaxPathBytes)) {
-      return Status::error(Error::kMkdirFailed);
-    }
-    const Status stat_sent = SendPacket(Pkt::kStat, tx_, static_cast<std::uint32_t>(sw.size()));
-    if (!stat_sent) {
-      return Status::error(Error::kMkdirFailed);
-    }
-    std::uint8_t stat_type = 0u;
-    std::uint32_t stat_len = 0u;
-    const Error stat_err = ReadFrame(stream_, rx_, sizeof(rx_), stat_type, stat_len);
-    if (stat_err != Error::kOk) {
-      return Status::error(Error::kMkdirFailed);
-    }
-    BufferReader sr(rx_, stat_len);
-    if (ReadRequestId(sr, stat_id) != Error::kOk) {
-      return Status::error(Error::kSftpProtocolError);
-    }
-    if (stat_type == static_cast<std::uint8_t>(Pkt::kAttrs)) {
-      return Status::success();
-    }
-    if (stat_type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-      FxStatus stat_code = FxStatus::kFailure;
-      if (ParseStatusRest(sr, stat_code) != Error::kOk) {
-        return Status::error(Error::kSftpProtocolError);
+  Error e = ReadStatus(stream_, rx_, sizeof(rx_), id, code);
+  if (Error::kOk != e) {
+    e = (Error::kChannelReadFailed == e) ? Error::kMkdirFailed : e;
+  } else if (FxStatus::kOk != code) {
+    if (FxStatus::kFailure == code) {
+      /* OpenSSH answers FAILURE (not OK) when the directory already exists.
+         Disambiguate with STAT: if the path resolves, the mkdir was a no-op.
+         STAT succeeds as ATTRS (the normal case) or as STATUS on some servers. */
+      bool exists = false;
+      const Error se = StatExists(stream_, tx_, sizeof(tx_), rx_, sizeof(rx_), next_id_, path, exists);
+      if (Error::kOk != se) {
+        e = se;
+      } else if (!exists) {
+        e = Error::kMkdirFailed;
       }
-      if (stat_code == FxStatus::kOk) {
-        return Status::success();
-      }
+    } else {
+      e = Error::kMkdirFailed;
     }
-    return Status::error(Error::kMkdirFailed);
   }
-  return Status::error(Error::kMkdirFailed);
+  if (Error::kOk != e) {
+    return Status::error(e);
+  }
+  return Status::success();
 }
 
 Status Client::MkdirAll(const char* path) noexcept {
@@ -538,81 +716,49 @@ Status Client::UploadFile(const char* remote_path, const char* local_path) noexc
   if (fd < 0) {
     return Status::error(Error::kOpenFailed);
   }
-  /* Single cleanup point; every early exit routes through `done`. */
-  auto done = [fd](Status s) noexcept -> Status {
-    (void)LocalClose(fd);
-    return s;
-  };
-
+  Error err = Error::kOk;
   StatBuf st{};
   if (LocalFstat(fd, &st) != 0) {
-    return done(Status::error(Error::kOpenFailed));
+    err = Error::kOpenFailed;
   }
   const std::uint64_t local_size = static_cast<std::uint64_t>(st.st_size);
 
-  /* OPEN(WRITE|CREAT|TRUNC) */
-  std::uint8_t extras[8];
-  PutBe32(extras, kFxWrite | kFxCreat | kFxTrunc);
-  PutBe32(extras + 4u, 0u); /* empty ATTRS */
   std::uint8_t handle[kMaxHandleBytes];
   std::uint32_t handle_len = 0u;
   bool missing = false;
-  if (!OpenHandle(Pkt::kOpen, remote_path, extras, sizeof(extras), handle, handle_len, missing)) {
-    return done(Status::error(Error::kOpenFailed));
+  if (Error::kOk == err) {
+    /* OPEN(WRITE|CREAT|TRUNC) */
+    std::uint8_t extras[8];
+    PutBe32(extras, kFxWrite | kFxCreat | kFxTrunc);
+    PutBe32(extras + 4u, 0u); /* empty ATTRS */
+    if (!OpenHandle(Pkt::kOpen, remote_path, extras, sizeof(extras), handle, handle_len, missing)) {
+      err = Error::kOpenFailed;
+    }
   }
 
   /* WRITE chunks, streaming from the local fd directly into the frame. */
-  const std::uint32_t data_off = kWriteDataOffset(handle_len);
   std::uint64_t offset = 0u;
-  bool eof = false;
-  while (!eof) {
-    const std::int64_t n = ReadFull(fd, tx_ + data_off, kWriteChunkBytes);
-    if (n < 0) {
-      return done(Status::error(Error::kWriteFailed));
-    }
-    if (n == 0) {
-      break;
-    }
-    const std::uint32_t chunk = static_cast<std::uint32_t>(n);
-    const std::uint32_t write_id = next_id_++;
-
-    /* Prefix is laid out before the already-read data region. */
-    BufferWriter w(tx_, sizeof(tx_));
-    (void)w.WriteU32(write_id);
-    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
-    (void)w.WriteU64(offset);
-    (void)w.WriteU32(chunk);
-    if (!w.ok() || (w.size() != data_off)) {
-      return done(Status::error(Error::kWriteFailed));
-    }
-    const Status sent = SendPacket(Pkt::kWrite, tx_, data_off + chunk);
-    if (!sent) {
-      return done(Status::error(Error::kWriteFailed));
-    }
-    FxStatus code = FxStatus::kFailure;
-    const Error e = ReadStatus(stream_, rx_, sizeof(rx_), write_id, code);
-    if ((e != Error::kOk) || (code != FxStatus::kOk)) {
-      return done(Status::error(Error::kWriteFailed));
-    }
-    offset += chunk;
-    if (static_cast<std::uint32_t>(n) < kWriteChunkBytes) {
-      eof = true; /* short read means the descriptor hit EOF */
+  if (Error::kOk == err) {
+    err = StreamWrites(stream_, tx_, sizeof(tx_), rx_, sizeof(rx_), next_id_, fd, handle, handle_len, offset);
+  }
+  if ((Error::kOk == err) && !CloseHandle(handle, handle_len)) {
+    err = Error::kCloseFailed;
+  }
+  if (Error::kOk == err) {
+    /* STAT + local/remote size comparison. No RENAME happens here. */
+    const Result<std::uint64_t> remote_size = StatSize(remote_path);
+    if (!remote_size) {
+      err = Error::kStatFailed;
+    } else if ((remote_size.value() != local_size) || (offset != local_size)) {
+      err = Error::kSizeMismatch;
     }
   }
-
-  if (!CloseHandle(handle, handle_len)) {
-    return done(Status::error(Error::kCloseFailed));
+  /* Single cleanup point: every early exit joins here to close the fd. */
+  (void)LocalClose(fd);
+  if (Error::kOk != err) {
+    return Status::error(err);
   }
-
-  /* STAT + local/remote size comparison. No RENAME happens here. */
-  const Result<std::uint64_t> remote_size = StatSize(remote_path);
-  if (!remote_size) {
-    return done(Status::error(Error::kStatFailed));
-  }
-  if ((remote_size.value() != local_size) || (offset != local_size)) {
-    return done(Status::error(Error::kSizeMismatch));
-  }
-  return done(Status::success());
+  return Status::success();
 }
 
 Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t capacity, std::uint32_t& size,
@@ -635,69 +781,40 @@ Status Client::ReadFile(const char* path, std::uint8_t* buffer, std::uint32_t ca
   if (missing) {
     return Status::success();
   }
-  auto fail = [&](Error e) noexcept -> Status {
-    (void)CloseHandle(handle, handle_len);
-    return Status::error(e);
-  };
-
   std::uint64_t offset = 0u;
-  for (;;) {
+  Error err = Error::kOk;
+  while (Error::kOk == err) {
     const std::uint32_t remaining = capacity - size;
     /* When the buffer is full, ask for one byte so an oversized file is
        detected instead of silently truncated. */
     const std::uint32_t ask = (remaining == 0u) ? 1u : ((remaining < kReadChunkBytes) ? remaining : kReadChunkBytes);
-    const std::uint32_t read_id = next_id_++;
-    BufferWriter w(tx_, sizeof(tx_));
-    (void)w.WriteU32(read_id);
-    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
-    (void)w.WriteU64(offset);
-    (void)w.WriteU32(ask);
-    if (!w.ok()) {
-      return fail(Error::kSftpProtocolError);
-    }
-    if (!SendPacket(Pkt::kRead, tx_, static_cast<std::uint32_t>(w.size()))) {
-      return fail(Error::kChannelWriteFailed);
-    }
-
-    std::uint8_t type = 0u;
-    std::uint32_t len = 0u;
-    const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
-    if (e != Error::kOk) {
-      return fail(e);
-    }
-    BufferReader r(rx_, len);
-    if (ReadRequestId(r, read_id) != Error::kOk) {
-      return fail(Error::kSftpProtocolError);
-    }
-    if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-      FxStatus code = FxStatus::kFailure;
-      if (ParseStatusRest(r, code) != Error::kOk) {
-        return fail(Error::kSftpProtocolError);
-      }
-      if (code == FxStatus::kEof) {
-        break;
-      }
-      return fail(Error::kOpenFailed);
-    }
-    if (type != static_cast<std::uint8_t>(Pkt::kData)) {
-      return fail(Error::kSftpProtocolError);
-    }
     const char* data = nullptr;
     std::uint32_t data_len = 0u;
-    if (!r.ReadString(data, data_len)) {
-      return fail(Error::kSftpProtocolError);
+    bool eof = false;
+    err = ReadChunk(stream_, tx_, sizeof(tx_), rx_, sizeof(rx_), next_id_, handle, handle_len, offset, ask, data,
+                    data_len, eof);
+    if (Error::kOk != err) {
+      break;
     }
-    if (data_len == 0u) {
+    if (eof) {
+      break;
+    }
+    if (0u == data_len) {
       break; /* no progress: stop rather than spin */
     }
     if (data_len > (capacity - size)) {
-      return fail(Error::kBufferTooSmall); /* over capacity: refuse loudly */
+      err = Error::kBufferTooSmall; /* over capacity: refuse loudly */
+      break;
     }
     (void)std::memcpy(buffer + size, data, data_len);
     size += data_len;
     offset += data_len;
   }
-  return CloseHandle(handle, handle_len);
+  if (Error::kOk == err) {
+    return CloseHandle(handle, handle_len);
+  }
+  (void)CloseHandle(handle, handle_len);
+  return Status::error(err);
 }
 
 Status Client::WriteFile(const char* path, const std::uint8_t* bytes, std::uint32_t length) noexcept {
@@ -721,35 +838,28 @@ Status Client::WriteFile(const char* path, const std::uint8_t* bytes, std::uint3
     return Status::error(e);
   };
 
+  const std::uint32_t data_off = kWriteDataOffset(handle_len);
   std::uint64_t offset = 0u;
   std::uint32_t pos = 0u;
-  while (pos < length) {
+  Error err = Error::kOk;
+  while ((pos < length) && (Error::kOk == err)) {
     const std::uint32_t remaining = length - pos;
     const std::uint32_t chunk = (remaining < kWriteChunkBytes) ? remaining : kWriteChunkBytes;
-    const std::uint32_t write_id = next_id_++;
-    BufferWriter w(tx_, sizeof(tx_));
-    (void)w.WriteU32(write_id);
-    (void)w.WriteString(reinterpret_cast<const char*>(handle), handle_len);
-    (void)w.WriteU64(offset);
-    (void)w.WriteU32(chunk);
-    if (!w.ok()) {
-      return fail(Error::kWriteFailed);
-    }
-    const std::size_t data_off = w.size();
     if ((data_off + chunk) > sizeof(tx_)) {
-      return fail(Error::kWriteFailed);
+      err = Error::kWriteFailed;
+      break;
     }
     (void)std::memcpy(tx_ + data_off, bytes + pos, chunk);
-    if (!SendPacket(Pkt::kWrite, tx_, static_cast<std::uint32_t>(data_off + chunk))) {
-      return fail(Error::kChannelWriteFailed);
-    }
-    FxStatus code = FxStatus::kFailure;
-    const Error e = ReadStatus(stream_, rx_, sizeof(rx_), write_id, code);
-    if ((e != Error::kOk) || (code != FxStatus::kOk)) {
-      return fail(Error::kWriteFailed);
+    err = SendWriteChunk(stream_, tx_, sizeof(tx_), next_id_++, handle, handle_len, offset, chunk, rx_, sizeof(rx_),
+                         Error::kChannelWriteFailed);
+    if (Error::kOk != err) {
+      break;
     }
     pos += chunk;
     offset += chunk;
+  }
+  if (Error::kOk != err) {
+    return fail(err);
   }
   return CloseHandle(handle, handle_len);
 }
@@ -769,29 +879,10 @@ Result<std::uint64_t> Client::StatSize(const char* path) noexcept {
     return Result<std::uint64_t>::error(Error::kStatFailed);
   }
 
-  std::uint8_t type = 0u;
-  std::uint32_t len = 0u;
-  const Error e = ReadFrame(stream_, rx_, sizeof(rx_), type, len);
-  if (e != Error::kOk) {
-    return Result<std::uint64_t>::error(Error::kStatFailed);
-  }
-  BufferReader r(rx_, len);
-  if (ReadRequestId(r, id) != Error::kOk) {
-    return Result<std::uint64_t>::error(Error::kSftpProtocolError);
-  }
-  if (type == static_cast<std::uint8_t>(Pkt::kStatus)) {
-    FxStatus code = FxStatus::kFailure;
-    if (ParseStatusRest(r, code) != Error::kOk) {
-      return Result<std::uint64_t>::error(Error::kSftpProtocolError);
-    }
-    return Result<std::uint64_t>::error(Error::kStatFailed);
-  }
-  if (type != static_cast<std::uint8_t>(Pkt::kAttrs)) {
-    return Result<std::uint64_t>::error(Error::kSftpProtocolError);
-  }
   AttrsInfo attrs{};
-  if (!ParseAttrs(r, attrs) || !attrs.has_size) {
-    return Result<std::uint64_t>::error(Error::kStatFailed);
+  const Error e = ReadAttrReply(stream_, rx_, sizeof(rx_), id, attrs);
+  if ((Error::kOk != e) || !attrs.has_size) {
+    return Result<std::uint64_t>::error((Error::kOk != e) ? e : Error::kStatFailed);
   }
   return Result<std::uint64_t>::success(attrs.size);
 }
@@ -840,15 +931,12 @@ Status Client::Remove(const char* path) noexcept {
   }
   FxStatus code = FxStatus::kFailure;
   const Error e = ReadStatus(stream_, rx_, sizeof(rx_), id, code);
-  if (e != Error::kOk) {
-    return Status::error(Error::kRemoveFailed);
-  }
   /* A cleanup that races another cleanup must not report failure: "already
      gone" is the desired end state. */
-  if ((code == FxStatus::kOk) || (code == FxStatus::kNoSuchFile)) {
-    return Status::success();
+  if ((Error::kOk != e) || ((FxStatus::kOk != code) && (FxStatus::kNoSuchFile != code))) {
+    return Status::error(Error::kRemoveFailed);
   }
-  return Status::error(Error::kRemoveFailed);
+  return Status::success();
 }
 
 // ---------------------------------------------------------------------------
@@ -962,11 +1050,8 @@ Result<UploadListing> Client::ListDir(const char* dir) noexcept {
   }
 
   const Status closed = CloseHandle(handle, handle_len);
-  if (err != Error::kOk) {
-    return Result<UploadListing>::error(err);
-  }
-  if (!closed) {
-    return Result<UploadListing>::error(Error::kCloseFailed);
+  if ((Error::kOk != err) || !closed) {
+    return Result<UploadListing>::error((Error::kOk != err) ? err : Error::kCloseFailed);
   }
   return Result<UploadListing>::success(out);
 }

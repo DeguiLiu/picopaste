@@ -61,7 +61,7 @@ TEST_CASE("core fixed buffers stay inside the design's memory budget") {
 
   // Config is read once, never a heap string: growth here means an unbounded
   // field slipped in.
-  CHECK(sizeof(picopaste::Config) <= kConfigBudget);
+  CHECK(kConfigBudget >= sizeof(picopaste::Config));
   // The log ring is a fixed array of per-producer SPSC rings.
   CHECK(sizeof(picopaste::LogRing) <= kLogRingBudget);
   // The SFTP client's tx_/rx_ scratch is the single largest fixed buffer; the
