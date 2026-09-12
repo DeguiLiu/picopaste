@@ -38,7 +38,7 @@ option(PICOPASTE_WERROR "Treat warnings as errors" OFF)
 set(PICOPASTE_CONFIG_FORMAT "ini" CACHE STRING "newosp config backend: ini|toml")
 
 # ---------------------------------------------------------------------------
-# newosp -- required, not optional, and currently PINNED TO A BRANCH.
+# newosp -- required, not optional, and PINNED TO A COMMIT ON A BRANCH.
 #
 # The Windows build depends on newosp's `windows` branch, NOT on `main`. On
 # main, osp/platform.hpp reads windows.h's RT_VERSION (a resource-type constant)
@@ -46,7 +46,9 @@ set(PICOPASTE_CONFIG_FORMAT "ini" CACHE STRING "newosp config backend: ini|toml"
 # Windows translation unit that pulls windows.h first fails to compile. That fix
 # lives on `windows` and is not yet merged.
 #
-# The branch is recorded in two places and they must agree:
+# CI pins PICOPASTE_NEWOSP_REF to a commit SHA on that branch, not the branch
+# name, so a force-push or merge-and-delete cannot break the build unnoticed.
+# The branch/pin is recorded in two places and they must agree:
 #   - .github/workflows/ci.yml  (PICOPASTE_NEWOSP_REPO / PICOPASTE_NEWOSP_REF)
 #   - docs/build/windows-compile-test.md (step 1)
 # Drop the pin once `windows` merges into main.

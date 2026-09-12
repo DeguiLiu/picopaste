@@ -2,11 +2,11 @@
 #
 # This file is a CMake script, not a batch/shell script. The product ships no
 # scripts at all: tools/check_no_scripts.cmake rejects .bat/.cmd/.ps1/.vbs/.sh
-# files anywhere under src/ or include/, and rejects string literals naming a
-# script host in the sources there. tools/ is outside that scan, so a .bat here
-# would pass the gate -- but keeping dev tooling in the same non-shell form as
-# the gate scripts avoids a second exemption a reviewer has to reason about,
-# and it runs identically from cmd, PowerShell and git bash.
+# files under src/, include/, tests/ or tools/, and rejects string literals
+# naming a script host in the sources and in the CMake build/test logic.
+# Keeping dev tooling in the same non-shell form as the gate scripts avoids an
+# exemption a reviewer has to reason about, and it runs identically from cmd,
+# PowerShell and git bash.
 #
 # Behaviour: load the MSVC environment, configure only when the build directory
 # is missing or out of date, build Release in parallel on all cores, optionally

@@ -42,12 +42,13 @@ if(WIN32)
     "${CMAKE_SOURCE_DIR}/src/platform/win32/stream_win32.cpp")
 endif()
 
-if(MSVC)
-  target_compile_options(picopaste_tests PRIVATE /W4 /permissive- /utf-8)
-  set_property(TARGET picopaste_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
-else()
-  target_compile_options(picopaste_tests PRIVATE -Wall -Wextra)
-endif()
+# Same posture as the product targets, via the shared helper: /WX on MSVC and
+# -Werror on GCC whenever PICOPASTE_WERROR=ON. Test sources are ours, so a
+# warning in one is a defect in this repo and must fail the build; hardcoding
+# the flags here without the error switch let test warnings pass CI silently
+# and made docs/build/windows-compile-test.md's "/WX applies" claim false for
+# this target.
+picopaste_apply_flags(picopaste_tests)
 
 include(Catch)
 # When the local sftp subsystem is unavailable every case in an integration
@@ -61,9 +62,9 @@ catch_discover_tests(picopaste_tests PROPERTIES SKIP_RETURN_CODE 4)
 # Mechanical gates for design promises that were previously only intentions.
 # All are CMake scripts (not shell), so they run identically under the Linux
 # and Windows CI jobs via ctest. See tools/check_*.cmake for what they enforce.
-# The format gate SKIPs (passes with a message) when clang-format is absent, so
-# a runner without it does not fail the job; pass -DPICOPASTE_CLANG_FORMAT=<path>
-# to pin a specific binary.
+# The format gate SKIPs only when no clang-format is requested and none is on
+# PATH. CI pins a formatter and passes -DPICOPASTE_CLANG_FORMAT=<name>, which
+# makes a missing binary a hard failure instead of a silent pass.
 # ---------------------------------------------------------------------------
 add_test(NAME gate_no_scripts
   COMMAND ${CMAKE_COMMAND} "-DPICOPASTE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"

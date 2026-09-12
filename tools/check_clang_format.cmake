@@ -13,11 +13,16 @@
 # exclusion below keeps that promise written down if a vendored drop ever
 # moves inside a product root.
 #
-# clang-format is not part of the C++ toolchain on the CI runners, so a missing
-# binary is not a failure: the gate SKIPs with a clear message and passes. Set
-# PICOPASTE_CLANG_FORMAT (cache variable, e.g. -DPICOPASTE_CLANG_FORMAT=<path>)
-# or the PICOPASTE_CLANG_FORMAT environment variable to point at a specific
-# binary; otherwise PATH is searched.
+# A missing binary is a SKIP only when the caller did NOT ask for the gate.
+# That optional mode exists so a developer without clang-format can still run
+# the rest of the suite; it is not a way for CI to pass. CI pins a formatter and
+# sets PICOPASTE_CLANG_FORMAT, which makes absence a hard FAIL, because a gate
+# whose verdict is "whatever the runner image happens to ship, or nothing at
+# all" is the exact false-confidence failure mode this project exists to remove.
+# Set PICOPASTE_CLANG_FORMAT (cache variable, e.g.
+# -DPICOPASTE_CLANG_FORMAT=<name-or-path>) or the PICOPASTE_CLANG_FORMAT
+# environment variable to request a specific binary; otherwise PATH is searched
+# and absence is a SKIP.
 #
 # Usage:
 #   cmake -DPICOPASTE_SOURCE_DIR=<repo root> -P tools/check_clang_format.cmake
@@ -31,24 +36,44 @@ if(NOT PICOPASTE_SOURCE_DIR)
 endif()
 
 # ---------------------------------------------------------------------------
-# Locate clang-format. An explicit cache/CLI value wins, then the environment,
-# then PATH. Absent everywhere is a SKIP, not a failure: failing here would make
-# the gate unlandable on runners that do not ship clang-format.
+# Locate clang-format. An explicit cache/CLI value or environment value means
+# the caller requested the gate: the named binary must resolve, and if it does
+# not that is a FAIL. With no explicit value PATH is searched and absence is a
+# SKIP, so a developer machine without clang-format can still run the suite.
 # ---------------------------------------------------------------------------
-if(NOT PICOPASTE_CLANG_FORMAT AND DEFINED ENV{PICOPASTE_CLANG_FORMAT})
+set(_picopaste_format_requested FALSE)
+if(PICOPASTE_CLANG_FORMAT)
+  set(_picopaste_format_requested TRUE)
+elseif(DEFINED ENV{PICOPASTE_CLANG_FORMAT})
   set(PICOPASTE_CLANG_FORMAT "$ENV{PICOPASTE_CLANG_FORMAT}")
+  set(_picopaste_format_requested TRUE)
 endif()
-if(NOT PICOPASTE_CLANG_FORMAT)
+
+if(_picopaste_format_requested)
+  # Accept either a path or a bare program name. A bare name is resolved on
+  # PATH; a path must exist exactly as given -- `find_program` returns NOTFOUND
+  # for a missing absolute path, so both cases funnel through the same check.
+  if(NOT EXISTS "${PICOPASTE_CLANG_FORMAT}")
+    find_program(_picopaste_clang_format_explicit NAMES "${PICOPASTE_CLANG_FORMAT}")
+    if(NOT _picopaste_clang_format_explicit)
+      message(FATAL_ERROR
+        "clang-format gate: FAIL -- PICOPASTE_CLANG_FORMAT='${PICOPASTE_CLANG_FORMAT}' "
+        "was requested but not found. Install that exact version, or unset "
+        "PICOPASTE_CLANG_FORMAT to allow a SKIP.")
+    endif()
+    set(PICOPASTE_CLANG_FORMAT "${_picopaste_clang_format_explicit}")
+  endif()
+else()
   find_program(_picopaste_clang_format
     NAMES clang-format clang-format-20 clang-format-19 clang-format-18
           clang-format-17 clang-format-16 clang-format-15 clang-format-14)
   set(PICOPASTE_CLANG_FORMAT "${_picopaste_clang_format}")
-endif()
-if(NOT PICOPASTE_CLANG_FORMAT)
-  message(STATUS
-    "clang-format gate: SKIP (no clang-format found on PATH; "
-    "set PICOPASTE_CLANG_FORMAT to enable)")
-  return()
+  if(NOT PICOPASTE_CLANG_FORMAT)
+    message(STATUS
+      "clang-format gate: SKIP (no clang-format found on PATH and none "
+      "requested; set PICOPASTE_CLANG_FORMAT to require it)")
+    return()
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

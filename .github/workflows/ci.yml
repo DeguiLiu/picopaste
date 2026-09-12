@@ -7,7 +7,13 @@ on:
 env:
   # The Windows platform layer lives on this branch of newosp until it merges.
   PICOPASTE_NEWOSP_REPO: https://github.com/DeguiLiu/newosp.git
-  PICOPASTE_NEWOSP_REF: windows
+  # Pinned to a COMMIT on the `windows` branch, not to the branch itself. The
+  # branch is genuinely required (main lacks the RT_VERSION fix, so any Windows
+  # TU fails to compile), and that is exactly why a moving ref is wrong here: a
+  # force-push or a merge-and-delete would break this build with no change in
+  # this repo. Keep the branch name for humans; update with:
+  #   git ls-remote https://github.com/DeguiLiu/newosp.git refs/heads/windows
+  PICOPASTE_NEWOSP_REF: 67c0a23b74d15f8ac33439072dea722631c530f5
 
 jobs:
   linux:
@@ -22,8 +28,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fetch by SHA, not `clone --branch`: --branch only accepts a branch or
+      # tag name, so a commit pin needs init + fetch + detached checkout. The
+      # checkout must still land at $HOME/newosp-windows, because Configure
+      # points PICOPASTE_NEWOSP_DIR at it.
       - name: Fetch newosp
-        run: git clone --depth 1 --branch "$PICOPASTE_NEWOSP_REF" "$PICOPASTE_NEWOSP_REPO" "$HOME/newosp-windows"
+        run: |
+          git init "$HOME/newosp-windows"
+          git -C "$HOME/newosp-windows" remote add origin "$PICOPASTE_NEWOSP_REPO"
+          git -C "$HOME/newosp-windows" fetch --depth 1 origin "$PICOPASTE_NEWOSP_REF"
+          git -C "$HOME/newosp-windows" checkout --detach FETCH_HEAD
+
+      # Pin the formatter. Without this the gate's verdict depends on whichever
+      # clang-format the runner image happens to ship (and used to PASS without
+      # checking anything when none was present). A venv sidesteps PEP 668's
+      # externally-managed-Python block on Ubuntu; the version must match what
+      # developers run locally, so bump it and reformat in the same commit.
+      - name: Install pinned clang-format
+        run: |
+          python3 -m venv "$HOME/.clang-format-venv"
+          "$HOME/.clang-format-venv/bin/pip" install --quiet "clang-format==22.1.1"
+          "$HOME/.clang-format-venv/bin/clang-format" --version
 
       # The integration tests shell out to `ssh -s localhost sftp` and rely on
       # ssh's own host-key checking, so a runner without a trusted local sshd
@@ -120,13 +145,16 @@ jobs:
             FLAGS="-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitizer }} -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitizer }}"
           fi
           cmake -S . -B build -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON \
-            -DPICOPASTE_NEWOSP_DIR="$HOME/newosp-windows" $FLAGS
+            -DPICOPASTE_NEWOSP_DIR="$HOME/newosp-windows" \
+            -DPICOPASTE_CLANG_FORMAT="$HOME/.clang-format-venv/bin/clang-format" $FLAGS
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
       # Runs the full ctest suite, which includes the mechanical gates
-      # (gate_no_scripts, gate_posix_leak) registered in tests/CMakeLists.txt.
+      # (gate_no_scripts, gate_posix_leak, gate_clang_format) registered in
+      # tests/CMakeLists.txt. gate_clang_format is enforced here with the pinned
+      # binary above; the Windows job has none installed and reports SKIP.
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
@@ -141,7 +169,16 @@ jobs:
 
       - name: Fetch newosp
         shell: pwsh
-        run: git clone --depth 1 --branch "$env:PICOPASTE_NEWOSP_REF" "$env:PICOPASTE_NEWOSP_REPO" "$env:USERPROFILE/newosp-windows"
+        # Same commit pin as the Linux job; `clone --branch` cannot take a SHA,
+        # so fetch the commit and detach. Must land at
+        # $env:USERPROFILE/newosp-windows for the Configure step below.
+        run: |
+          git init "$env:USERPROFILE/newosp-windows"
+          git -C "$env:USERPROFILE/newosp-windows" remote add origin "$env:PICOPASTE_NEWOSP_REPO"
+          git -C "$env:USERPROFILE/newosp-windows" fetch --depth 1 origin "$env:PICOPASTE_NEWOSP_REF"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C "$env:USERPROFILE/newosp-windows" checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure
         shell: pwsh
@@ -155,5 +192,7 @@ jobs:
       # ctest includes the CMake-script gates registered in tests/CMakeLists.txt
       # (gate_no_scripts, gate_posix_leak); the latter correctly excludes
       # src/platform/posix/, which is legitimate POSIX and not built on Windows.
+      # gate_clang_format SKIPs here (no clang-format installed); the Linux job
+      # enforces it with the pinned binary.
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
