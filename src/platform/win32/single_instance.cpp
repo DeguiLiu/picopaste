@@ -1,6 +1,8 @@
 // picopaste -- single-instance mutex and Job Object containment.
 #include "single_instance.hpp"
 
+#include <cstdlib>
+
 #include "win32_util.hpp"
 
 namespace picopaste::win32 {
@@ -80,6 +82,21 @@ void WriteOwner(HANDLE* section_out, void** view_out) noexcept {
   *view_out = view;
 }
 
+// Poll interval and ceiling for the restart wait. The ceiling exists so a
+// predecessor that never exits cannot hang this process's start-up for ever.
+constexpr DWORD kAwaitInstancePollMs = 50;
+
+// Milliseconds to wait for the instance to be released when this process was
+// relaunched by another one (kAwaitInstanceEnvName present and non-zero). Zero
+// means an ordinary launch: report the conflict on the first attempt and exit.
+unsigned long AwaitInstanceMs() noexcept {
+  wchar_t value[16] = {};
+  if (GetEnvironmentVariableW(kAwaitInstanceEnvName, value, 16) == 0) {
+    return 0;
+  }
+  return (std::wcstoul(value, nullptr, 10) == 0) ? 0 : kAwaitInstanceMaxMs;
+}
+
 }  // namespace
 
 Status SingleInstance::Acquire(std::uint32_t* owner_pid, wchar_t* owner_image,
@@ -94,13 +111,34 @@ Status SingleInstance::Acquire(std::uint32_t* owner_pid, wchar_t* owner_image,
   // Deliberately no initial owner and no WaitForSingleObject: the mutex object
   // simply exists while we do. The kernel releases it on process exit, which is
   // the exact lifetime we want, with no PID file to go stale.
-  mutex_ = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
-  if (mutex_ == nullptr) {
-    return Status::error(Error::kJobObjectFailed);
-  }
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    ReadOwner(owner_pid, owner_image, owner_image_chars);
-    return Status::error(Error::kSingleInstanceExists);
+  //
+  // A restart relaunches this process before its predecessor has exited, so the
+  // predecessor's mutex still exists for a moment. Waiting it out here is what
+  // keeps "Restart" from silently degrading into "Quit"; the wait is bounded, and
+  // with no such request in the environment it is zero, so the first attempt is
+  // the only one and an ordinary second launch behaves exactly as before.
+  const unsigned long await_ms = AwaitInstanceMs();
+  unsigned long waited_ms = 0;
+  for (;;) {
+    mutex_ = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
+    if (mutex_ == nullptr) {
+      return Status::error(Error::kJobObjectFailed);
+    }
+    if (GetLastError() != ERROR_ALREADY_EXISTS) {
+      break;
+    }
+    // Each failed attempt opens its own handle to the predecessor's mutex, and
+    // an open handle keeps the object alive. Leaving it open would make the next
+    // attempt -- and the predecessor's own exit -- irrelevant: we would be the
+    // one holding the mutex. Close it before waiting.
+    (void)CloseHandle(mutex_);
+    mutex_ = nullptr;
+    if (waited_ms >= await_ms) {
+      ReadOwner(owner_pid, owner_image, owner_image_chars);
+      return Status::error(Error::kSingleInstanceExists);
+    }
+    Sleep(kAwaitInstancePollMs);
+    waited_ms += kAwaitInstancePollMs;
   }
 
   WriteOwner(&owner_section_, &owner_view_);
@@ -149,13 +187,21 @@ Status SingleInstance::SetupJobObjects(std::uint32_t memory_limit_mb) noexcept {
   // failure -- visible, per the project's first requirement. Do NOT add
   // JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK here: it would let the memory-heavy
   // child out of the only cap that bounds it.
+  //
+  // BREAKAWAY_OK is the explicit form, not the silent one, and is what lets a
+  // *restarted* instance escape this job and build its own: a process already in
+  // a job cannot join an unrelated second one, so without it the relaunched child
+  // fails in SetupJobObjects and the restart dies silently. The escape happens
+  // only on an explicit CREATE_BREAKAWAY_FROM_JOB request, which ssh.exe does not
+  // make -- it stays inside the ceiling.
   memory_job_ = CreateJobObjectW(nullptr, nullptr);
   if (memory_job_ == nullptr) {
     Close();
     return Status::error(Error::kJobObjectFailed);
   }
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION memory_info{};
-  memory_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+  memory_info.BasicLimitInformation.LimitFlags =
+      JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
   memory_info.JobMemoryLimit = static_cast<SIZE_T>(memory_limit_mb) * 1024u * 1024u;
   if (SetInformationJobObject(memory_job_, JobObjectExtendedLimitInformation, &memory_info,
                               sizeof(memory_info)) == 0) {

@@ -45,6 +45,18 @@ inline constexpr std::size_t kOwnerImageChars = 260;
 inline constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\picopaste";
 inline constexpr wchar_t kSingleInstanceOwnerName[] = L"Local\\picopaste.owner";
 
+// Environment variable a relaunching instance sets on the child it spawns. The
+// predecessor lives on for a moment after the spawn, so without this cue the
+// child would find the predecessor's mutex and exit as a duplicate -- silently
+// turning "Restart" into "Quit". Any non-zero value asks the child to wait up to
+// kAwaitInstanceMaxMs for the instance to be released; unset means no wait at
+// all, which keeps an ordinary second launch reporting the conflict immediately.
+inline constexpr wchar_t kAwaitInstanceEnvName[] = L"PICOPASTE_AWAIT_INSTANCE";
+
+// Ceiling on that wait, so a predecessor that never exits cannot hang the new
+// process's start-up for ever.
+inline constexpr unsigned long kAwaitInstanceMaxMs = 10000;
+
 // Owns the named mutex, the owner-info section, and the two job objects for the
 // process lifetime. Move-only-free: create one at start-up and keep it.
 class SingleInstance final {
