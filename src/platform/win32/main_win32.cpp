@@ -128,6 +128,10 @@ enum class WorkerNotice : std::uint8_t {
   kStopped = 1,
   kUploadStarted = 2,  // arms the main thread's deadline probe
   kUploadEnded = 3,    // disarms it, whatever the outcome
+  kLocalFailure = 4,   // wParam is the Error code from a hotkey press that
+                       // produced no upload; the main thread renders it as a
+                       // one-shot balloon so a silent no-op looks like a dead
+                       // hotkey and the user can act on it.
 };
 
 // RAII: attach to the console that launched us, and detach again on scope exit.
@@ -649,7 +653,10 @@ class UploadWorker final {
     }
     if (ChannelIsBad(result.get_error()) == false) {
       // A local, user-caused outcome: the link is healthy, so leave it up and
-      // republish health rather than reporting a channel failure.
+      // republish health rather than reporting a channel failure. But the hotkey
+      // press produced no upload, and a silent no-op looks like a dead hotkey --
+      // tell the main thread which capture step failed so it can surface that.
+      PostLocalFailure(result.get_error());
       PostHealth();
       return;
     }
@@ -764,6 +771,14 @@ class UploadWorker final {
                              static_cast<LPARAM>(WorkerNotice::kStopped));
   }
 
+  // A capture or paste step that returned a local error -- the channel stays
+  // healthy, but the hotkey press did nothing visible. The main thread maps the
+  // error to a one-shot tray balloon; the link's health is unchanged.
+  void PostLocalFailure(Error err) noexcept {
+    (void)PostThreadMessageW(main_thread_, kWmWorkerStatus, static_cast<WPARAM>(err),
+                             static_cast<LPARAM>(WorkerNotice::kLocalFailure));
+  }
+
   Win32Platform platform_{};
   picopaste::win32::ChildStream channel_{};
   ClientSlot client_{};
@@ -841,6 +856,21 @@ const wchar_t* NoticeFor(picopaste::win32::TrayState state) noexcept {
     case picopaste::win32::TrayState::kWarning:
     default:
       return L"reconnecting";
+  }
+}
+
+// Maps a local, user-caused pipeline error to a one-line balloon the user can
+// act on. Anything not in this list is intentionally silent: a hotkey that
+// hits nothing for some unforeseen reason should not invent a story.
+const wchar_t* NoticeForLocalError(Error err) noexcept {
+  switch (err) {
+    case Error::kNoImageInClipboard: return L"clipboard has no image";
+    case Error::kImageTooLarge:      return L"image too large (max 20 MB)";
+    case Error::kPngEncodeFailed:    return L"image encode failed";
+    case Error::kClipboardOpenFailed:return L"another program is holding the clipboard";
+    case Error::kClipboardLockFailed:return L"clipboard lock failed";
+    case Error::kTempFileFailed:     return L"could not create temp file";
+    default:                         return nullptr;
   }
 }
 
@@ -1002,6 +1032,15 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
         }
       } else if (WorkerNotice::kUploadEnded == notice) {
         disarm_timer();
+      } else if (WorkerNotice::kLocalFailure == notice) {
+        // One-shot balloon: a hotkey press that produced no upload would
+        // otherwise look exactly like a dead hotkey, with no state change to
+        // announce it. We do not touch the tray state or the tooltip -- the
+        // link is healthy -- we only say what went wrong.
+        const wchar_t* detail = NoticeForLocalError(static_cast<Error>(msg.wParam));
+        if (detail != nullptr && config.notify_enabled) {
+          tray.Notify(L"picopaste", detail, true);
+        }
       } else if (WorkerNotice::kStopped == notice) {
         disarm_timer();
         const auto state = static_cast<picopaste::win32::TrayState>(msg.wParam);
