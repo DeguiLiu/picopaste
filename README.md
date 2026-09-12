@@ -48,6 +48,7 @@ watched, so a lost link is an event — the tray turns red — not silence.
 
 ## How it works
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"actorBkg":"#dbeafe","actorBorder":"#2563eb","actorTextColor":"#1e3a8a","actorLineColor":"#93c5fd","signalColor":"#2563eb","signalTextColor":"#1e3a8a","noteBkgColor":"#fde68a","noteBorderColor":"#d97706","noteTextColor":"#78350f"}}}%%
 sequenceDiagram
   participant U as User
   participant P as picopaste.exe
@@ -58,7 +59,7 @@ sequenceDiagram
   P->>S: MKDIR /tmp/picopaste, OPEN / WRITE / CLOSE
   S->>R: SFTP v3 frames over the sftp subsystem
   P->>S: STAT the remote path
-  Note over P,R: a size mismatch aborts; nothing is published
+  Note over P,R: a size mismatch aborts - nothing is published
   P->>U: put the remote absolute path on the clipboard
   P->>U: SendInput ctrl+shift+v (every event count verified)
   U->>R: the terminal pastes the path into Claude Code
@@ -86,6 +87,11 @@ flowchart LR
   CLIC --> PUB
   LIF --> EXT
   W32 --> EXT
+  classDef pub fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef sftp fill:#e9d5ff,stroke:#7c3aed,color:#4c1d95
+  classDef app fill:#fde68a,stroke:#d97706,color:#78350f
+  classDef plat fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+  classDef ext fill:#e5e7eb,stroke:#6b7280,color:#374151
 ```
 `UploadPipeline::Run` takes `ClipboardOps` / `InjectOps` — function-pointer tables with an opaque
 context, the same shape as `ByteStream`. That inversion is why the core stays free of `<windows.h>`

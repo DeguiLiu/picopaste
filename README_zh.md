@@ -47,6 +47,7 @@ flowchart LR
 
 ## 工作流程
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"actorBkg":"#dbeafe","actorBorder":"#2563eb","actorTextColor":"#1e3a8a","actorLineColor":"#93c5fd","signalColor":"#2563eb","signalTextColor":"#1e3a8a","noteBkgColor":"#fde68a","noteBorderColor":"#d97706","noteTextColor":"#78350f"}}}%%
 sequenceDiagram
   participant U as 用户
   participant P as picopaste.exe
@@ -85,6 +86,11 @@ flowchart LR
   CLIC --> PUB
   LIF --> EXT
   W32 --> EXT
+  classDef pub fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef sftp fill:#e9d5ff,stroke:#7c3aed,color:#4c1d95
+  classDef app fill:#fde68a,stroke:#d97706,color:#78350f
+  classDef plat fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+  classDef ext fill:#e5e7eb,stroke:#6b7280,color:#374151
 ```
 `UploadPipeline::Run` 接收 `ClipboardOps` / `InjectOps`——带不透明 ctx 的函数指针表，与 `ByteStream`
 同形。正是这一处反转让 core 不碰 `<windows.h>`，并能用假表在 host 上测试。
