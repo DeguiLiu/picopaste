@@ -76,10 +76,14 @@ constexpr std::uint32_t kBitmapV4HeaderSize = 108u;
 constexpr std::uint32_t kBiRgb = 0u;
 constexpr std::uint32_t kBiBitfields = 3u;
 
-// A clipboard fetch is retried over this bounded window. Both values stay small
-// because the clipboard is held open for the whole retry.
-constexpr std::int32_t kFetchAttempts = 10;
-constexpr DWORD kFetchRetryMs = 10;
+// A clipboard fetch is retried over this bounded window. The clipboard is held
+// open for the whole retry, so the budget is deliberately short: our own open
+// lock prevents any other process from changing the contents, which means a
+// retry can only help with a delayed render that the owner has already promised
+// -- never with a format that is genuinely absent. Three attempts over 10 ms
+// keep the worst case (four candidate formats) at ~30 ms of exclusive hold.
+constexpr std::int32_t kFetchAttempts = 3;
+constexpr DWORD kFetchRetryMs = 5;
 
 std::uint16_t ReadU16(const std::uint8_t* p) noexcept {
   std::uint16_t v = 0;
@@ -192,8 +196,9 @@ bool DescribeMasks(DibGeometry* geo, std::uint32_t red_mask, std::uint32_t green
 
 // Resolve the palette, colour masks and pixel offset for the header's layout.
 // Returns false for a layout we would decode incorrectly.
-bool ResolveDibLayout(const std::uint8_t* dib, std::uint32_t header_size, std::uint32_t compression,
-                      std::uint32_t clr_used, DibGeometry* geo, std::uint32_t* pixel_offset) noexcept {
+bool ResolveDibLayout(const std::uint8_t* dib, std::size_t dib_bytes, std::uint32_t header_size,
+                      std::uint32_t compression, std::uint32_t clr_used, DibGeometry* geo,
+                      std::uint32_t* pixel_offset) noexcept {
   const bool bitfields = (compression == kBiBitfields);
 
   // Colour masks: present inside the header from BITMAPV4HEADER on, otherwise
@@ -209,6 +214,14 @@ bool ResolveDibLayout(const std::uint8_t* dib, std::uint32_t header_size, std::u
     blue_mask = ReadU32(dib + 48);
     alpha_mask = ReadU32(dib + 52);
   } else if (header_size == kBitmapInfoHeaderSize && bitfields) {
+    // The three masks live immediately after the 40-byte header, so the block
+    // must be long enough to hold them. ParseDibHeader only guarantees
+    // dib_bytes >= 40, and the stride/size check that would catch a short block
+    // runs later in ParseDib -- after this read. A CF_DIB with BI_BITFIELDS and
+    // a truncated payload would otherwise be read four bytes past its end.
+    if (dib_bytes < (kBitmapInfoHeaderSize + (3u * sizeof(std::uint32_t)))) {
+      return false;
+    }
     red_mask = ReadU32(dib + 40);
     green_mask = ReadU32(dib + 44);
     blue_mask = ReadU32(dib + 48);
@@ -272,7 +285,7 @@ bool ParseDib(const std::uint8_t* dib, std::size_t dib_bytes, DibGeometry* geo) 
   }
 
   std::uint32_t pixel_offset = 0;
-  if (ResolveDibLayout(dib, header_size, compression, clr_used, geo, &pixel_offset) == false) {
+  if (ResolveDibLayout(dib, dib_bytes, header_size, compression, clr_used, geo, &pixel_offset) == false) {
     return false;
   }
 
@@ -650,17 +663,24 @@ void FillCaptured(CapturedImage* image, const wchar_t* wide_path, std::uint64_t 
 }
 
 // Fetch one clipboard block by format. GetClipboardData can answer NULL while
-// the owner is still handing the block over, so it is retried briefly. Only
-// formats the clipboard really carries are ever passed in, so this can never
-// pull in a synthesized block (see InspectClipboardFormats for why that
-// matters).
+// the owner is still handing the block over, so it is retried briefly.
+//
+// The formats passed in are only the ones InspectClipboardFormats enumerated on
+// this clipboard, with one deliberate exception: the CF_BITMAP fallback asks for
+// CF_DIB so Windows synthesizes the block from the HBITMAP. That synthesis is
+// expensive (a full copy of the pixels) and is why the enumeration matters --
+// requesting a format the owner never published would quietly buy that copy.
 HANDLE FetchClipboardBlock(UINT format) noexcept {
   for (std::int32_t attempt = 0; attempt < kFetchAttempts; ++attempt) {
     const HANDLE data = GetClipboardData(format);
     if (nullptr != data) {
       return data;
     }
-    Sleep(kFetchRetryMs);
+    // No sleep after the final attempt: it would only lengthen the window in
+    // which the clipboard stays open for a retry that cannot happen.
+    if ((attempt + 1) < kFetchAttempts) {
+      Sleep(kFetchRetryMs);
+    }
   }
   return nullptr;
 }
@@ -669,8 +689,15 @@ HANDLE FetchClipboardBlock(UINT format) noexcept {
 // block is copied to the temp file without re-encoding.
 Result<CapturedImage> CaptureRegisteredPng(HANDLE data, const Config& cfg, const wchar_t* temp_path) noexcept {
   const SIZE_T size = GlobalSize(data);
-  if (size == 0 || size > cfg.max_image_bytes) {
-    return Result<CapturedImage>::error(size == 0 ? Error::kClipboardLockFailed : Error::kImageTooLarge);
+  // An empty block is a block with no bytes to hand over, not a lock failure:
+  // the handle came back valid from GetClipboardData, so the clipboard was open
+  // and readable. Saying "clipboard lock failed" here would point the user at
+  // the wrong cause.
+  if (size > cfg.max_image_bytes) {
+    return Result<CapturedImage>::error(Error::kImageTooLarge);
+  }
+  if (size == 0) {
+    return Result<CapturedImage>::error(Error::kClipboardReadFailed);
   }
   const void* locked = GlobalLock(data);
   if (locked == nullptr) {
@@ -693,10 +720,15 @@ Result<CapturedImage> CaptureOneDib(const Config& cfg, const wchar_t* temp_path,
                                     const char* label) noexcept {
   const HANDLE data = FetchClipboardBlock(format);
   if (nullptr == data) {
+    // The format was enumerated on this clipboard, so it exists; failing to
+    // fetch it is a read failure, not an absent image.
     return Result<CapturedImage>::error(Error::kClipboardReadFailed);
   }
   const SIZE_T size = GlobalSize(data);
-  const void* locked = (size == 0) ? nullptr : GlobalLock(data);
+  if (size == 0) {
+    return Result<CapturedImage>::error(Error::kClipboardReadFailed);
+  }
+  const void* locked = GlobalLock(data);
   if (nullptr == locked) {
     return Result<CapturedImage>::error(Error::kClipboardLockFailed);
   }
@@ -709,39 +741,55 @@ Result<CapturedImage> CaptureOneDib(const Config& cfg, const wchar_t* temp_path,
   return encoded;
 }
 
-// Fallback: unpack and encode a DIB. The clipboard can carry both flavours at
+// Rank two failures and keep the one the user can act on. kImageTooLarge is a
+// real condition of the image ("shrink it or raise max_image_bytes") and must
+// survive a lower-priority candidate failing for a transport reason; among the
+// rest the earlier attempt wins, because the candidates are tried in descending
+// order of fidelity (DIBV5 -> DIB -> synthesized) and the first failure names
+// the best block the clipboard actually offered.
+Error WorseFailure(Error kept, Error candidate) noexcept {
+  if (Error::kImageTooLarge == kept || Error::kImageTooLarge == candidate) {
+    return Error::kImageTooLarge;
+  }
+  return (Error::kNoImageInClipboard == kept) ? candidate : kept;
+}
+
+// Fallback: unpack and encode a DIB. The clipboard can carry several flavours at
 // once, and a block that is listed can still refuse to hand over its bytes (the
 // owner may die between the listing and the fetch), so every candidate is tried
 // before a failure is reported: an unreadable CF_DIBV5 next to a perfectly good
-// CF_DIB must not surface as "no image".
+// CF_DIB must not surface as "no image". `prior` is the failure the PNG fast
+// path already recorded, if any, so its verdict competes on equal terms.
 Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path,
-                                         const ClipboardFormats& formats) noexcept {
-  Error failure = Error::kNoImageInClipboard;
+                                         const ClipboardFormats& formats, Error prior) noexcept {
+  Error failure = prior;
   if (formats.has_dibv5) {
     Result<CapturedImage> v5 = CaptureOneDib(cfg, temp_path, CF_DIBV5, "DIBV5");
     if (v5.has_value()) {
       return v5;
     }
-    failure = v5.get_error();
+    failure = WorseFailure(failure, v5.get_error());
   }
   if (formats.has_dib) {
     Result<CapturedImage> dib = CaptureOneDib(cfg, temp_path, CF_DIB, "DIB");
     if (dib.has_value()) {
       return dib;
     }
-    failure = dib.get_error();
+    failure = WorseFailure(failure, dib.get_error());
   }
   if (formats.has_bitmap) {
-    // Last resort for a clipboard that publishes only CF_BITMAP: it carries no
-    // DIB block, so Windows has to build one on request. That build is a full
-    // copy of the pixels inside this process -- exactly what the commit ceiling
-    // refuses for a large screenshot -- but without it such a clipboard is
-    // unreadable, so it is tried once nothing better exists.
+    // Last resort for a clipboard that publishes only CF_BITMAP. It carries no
+    // DIB block, so GetClipboardData(CF_DIB) asks Windows to synthesize one from
+    // the HBITMAP -- the handle that comes back is a real HGLOBAL, so
+    // GlobalSize/GlobalLock are type-correct here. That synthesis is a full copy
+    // of the pixels inside this process, exactly what the commit ceiling refuses
+    // for a large screenshot, but without it such a clipboard is unreadable, so
+    // it is tried once nothing better exists.
     Result<CapturedImage> built = CaptureOneDib(cfg, temp_path, CF_DIB, "BITMAP");
     if (built.has_value()) {
       return built;
     }
-    failure = built.get_error();
+    failure = WorseFailure(failure, built.get_error());
   }
   return Result<CapturedImage>::error(failure);
 }
@@ -830,21 +878,37 @@ Result<CapturedImage> CaptureClipboardImage(const Config& cfg) noexcept {
   }
   TempFileGuard temp_guard(temp_path);
 
-  // Fast path: a registered "PNG" format carries ready-to-upload bytes.
+  // Fast path: a registered "PNG" format carries ready-to-upload bytes. A
+  // failure here does not end the capture: a clipboard that carries a bad PNG
+  // block may still carry a perfectly good DIB, and returning early would let
+  // the unreadable flavour hide the readable one -- the very thing the
+  // multi-format fallback below exists to prevent. The failure is carried into
+  // the fallback so it still wins if every DIB candidate fails too.
+  Error prior = Error::kNoImageInClipboard;
   if (formats.has_png) {
     const HANDLE png_data = FetchClipboardBlock(RegisterClipboardFormatW(L"PNG"));
     if (nullptr != png_data) {
       Result<CapturedImage> png = CaptureRegisteredPng(png_data, cfg, temp_path);
       if (png.has_value()) {
         temp_guard.Keep();
+        return png;
       }
-      return png;
+      // A listed PNG block that would not hand over its bytes is a read
+      // failure, not an absent image: the format was enumerated on this
+      // clipboard moments ago. Any other verdict (encode, size, temp file) is
+      // already specific and is kept as-is.
+      prior = png.get_error();
+      if (Error::kNoImageInClipboard == prior) {
+        prior = Error::kClipboardReadFailed;
+      }
+    } else {
+      prior = Error::kClipboardReadFailed;
     }
   }
 
   // Fallback: unpack and encode the DIB. The DIB is read in place -- no heap
   // copy of the uncompressed pixels.
-  Result<CapturedImage> encoded = CaptureDibFallback(cfg, temp_path, formats);
+  Result<CapturedImage> encoded = CaptureDibFallback(cfg, temp_path, formats, prior);
   if (encoded.has_value()) {
     temp_guard.Keep();
   }
