@@ -4,9 +4,13 @@
 // anything: printf would write into the void and a failing run would look
 // exactly like a passing one. The output below therefore goes through the
 // process's standard handles with WriteFile, which does reach the terminal once
-// a console is attached. Nothing here shows a MessageBox -- a modal dialog
-// would hang a headless or CI invocation forever, and a process that cannot be
-// observed is the failure mode this project exists to remove.
+// a console is attached. That channel does not exist for a double-clicked
+// process, and a start-up failure reported only through it left nothing on
+// screen at all -- the tray, which is the interactive channel for everything
+// else, is not created until after those checks. The fatal start-up paths
+// therefore fall back to a message box when AttachConsole found no console (see
+// ReportStartupFailure); nothing else here shows one, and a process that cannot
+// be observed is the failure mode this project exists to remove.
 //
 // Modes:
 //   picopaste --selftest [--config PATH]
@@ -183,6 +187,12 @@ class ParentConsole final {
   ParentConsole(const ParentConsole&) = delete;
   ParentConsole& operator=(const ParentConsole&) = delete;
 
+  // False for a double-clicked process, which is the case every start-up
+  // failure has to fall back from. A GUI-subsystem image is created without a
+  // console, so a failed AttachConsole means there is none to write to rather
+  // than one we were refused.
+  bool attached() const noexcept { return attached_; }
+
  private:
   bool attached_ = false;
 };
@@ -222,6 +232,13 @@ class ArgvBlock final {
 // Write one already-formatted string to a standard handle. A handle that is
 // absent (no console attached) is not an error: the exit code carries the
 // result in that case.
+//
+// This cannot be used to decide whether anyone can actually see the text. A
+// process started without a console does not necessarily hold a NULL standard
+// handle -- CreateProcess copies the parent's handle *values* into the child's
+// PEB even when nothing was inherited -- so the write succeeds into nothing at
+// all. Whether a console exists is asked separately, from the AttachConsole
+// result; see ReportStartupFailure.
 void Emit(HANDLE handle, const char* text) noexcept {
   if ((nullptr == handle) || (INVALID_HANDLE_VALUE == handle)) {
     return;
@@ -243,6 +260,50 @@ void EmitFormatted(HANDLE handle, const char* format, ...) noexcept {
   va_end(args);
   if (written > 0) {
     Emit(handle, line);
+  }
+}
+
+// Show an ASCII line in a modal box. Only reached when there is no console to
+// write to; see ReportStartupFailure for why that case exists at all.
+void ShowStartupFailure(const char* text) noexcept {
+  wchar_t wide[kLineChars] = {};
+  const int written = MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, static_cast<int>(kLineChars));
+  if (written <= 0) {
+    return;
+  }
+  // MB_SETFOREGROUND: the box is the only trace of a process that is about to
+  // exit, so it must not open behind whatever else is on the desktop.
+  (void)MessageBoxW(nullptr, wide, L"picopaste", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+}
+
+// Report a failure that ends the process before the tray exists. Without this
+// the message reaches only a console, and a double-clicked process has none, so
+// the run ended with exit code 1 as its only trace -- indistinguishable from
+// the program doing nothing, which is the failure the project refuses to ship.
+//
+// `no_console` is the caller's AttachConsole result, inverted. It is the only
+// sound test: neither the handle nor the write says anything useful here (see
+// Emit), and the tray -- the interactive channel for everything else -- does
+// not exist yet on any path below.
+//
+// Scope is the interactive start-up only. --selftest passes false and keeps its
+// behaviour exactly as it was: it is documented as a terminal command, and its
+// output contract is the exit code plus stdout, not a dialog.
+void ReportStartupFailure(HANDLE err, bool no_console, const char* text) noexcept {
+  Emit(err, text);
+  if (no_console) {
+    ShowStartupFailure(text);
+  }
+}
+
+void ReportStartupFailureFormatted(HANDLE err, bool no_console, const char* format, ...) noexcept {
+  char line[kLineChars] = {};
+  va_list args;
+  va_start(args, format);
+  const std::int32_t written = std::vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (written > 0) {
+    ReportStartupFailure(err, no_console, line);
   }
 }
 
@@ -301,20 +362,21 @@ std::size_t DerivedConfigPath(wchar_t* out, std::size_t out_chars) noexcept {
 // default is used so LoadConfig still receives a real path and can answer a
 // missing file with the built-in defaults. A path that does not fit is
 // reported, never silently truncated.
-bool ResolveConfigPath(HANDLE err, const wchar_t* config_path, char* out, std::size_t out_chars) noexcept {
+bool ResolveConfigPath(HANDLE err, bool no_console, const wchar_t* config_path, char* out,
+                       std::size_t out_chars) noexcept {
   const bool from_user = (config_path != nullptr);
   wchar_t derived[kConfigPathChars] = {};
   const wchar_t* effective = config_path;
   if (from_user == false) {
     if (DerivedConfigPath(derived, sizeof(derived) / sizeof(derived[0])) == 0) {
-      Emit(err, "FAIL config-path: could not derive the default config path\n");
+      ReportStartupFailure(err, no_console, "FAIL config-path: could not derive the default config path\n");
       return false;
     }
     effective = derived;
   }
   if (NarrowPath(effective, out, out_chars) == false) {
-    EmitFormatted(err, "FAIL config-path: the %s path exceeds %u bytes\n", (from_user ? "--config" : "default config"),
-                  static_cast<unsigned>(out_chars));
+    ReportStartupFailureFormatted(err, no_console, "FAIL config-path: the %s path exceeds %u bytes\n",
+                                  (from_user ? "--config" : "default config"), static_cast<unsigned>(out_chars));
     return false;
   }
   return true;
@@ -907,16 +969,21 @@ class UploadWorker final {
 // Interactive mode
 // ---------------------------------------------------------------------------
 
-bool LoadInteractiveConfig(HANDLE out, HANDLE err, const wchar_t* config_path, Config& out_cfg) noexcept {
+bool LoadInteractiveConfig(HANDLE out, HANDLE err, const wchar_t* config_path, Config& out_cfg,
+                           bool no_console) noexcept {
   char narrow[kConfigPathChars] = {};
-  if (ResolveConfigPath(err, config_path, narrow, sizeof(narrow)) == false) {
+  // no_console is threaded through rather than re-derived: every failure below
+  // aborts the run before any tray exists, and whether a console can be written
+  // to was settled once, when the console was attached.
+  if (ResolveConfigPath(err, no_console, config_path, narrow, sizeof(narrow)) == false) {
     return false;
   }
 
   bool created_defaults = false;
   const auto loaded = picopaste::LoadConfig(narrow, &created_defaults);
   if (loaded.has_value() == false) {
-    EmitFormatted(err, "FAIL config-load: error %u\n", static_cast<unsigned>(loaded.get_error()));
+    ReportStartupFailureFormatted(err, no_console, "FAIL config-load: error %u\n",
+                                  static_cast<unsigned>(loaded.get_error()));
     return false;
   }
   if (created_defaults == true) {
@@ -988,13 +1055,14 @@ const wchar_t* NoticeForLocalError(Error err, const Config& cfg, wchar_t* buf, s
   }
 }
 
-std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wchar_t* config_path) noexcept {
+std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wchar_t* config_path,
+                            bool no_console) noexcept {
   Config config = picopaste::DefaultConfig();
-  if (LoadInteractiveConfig(out, err, config_path, config) == false) {
+  if (LoadInteractiveConfig(out, err, config_path, config, no_console) == false) {
     return kExitSelftestFailed;
   }
   if (config.host.empty()) {
-    Emit(err, "picopaste: config 'host' is empty; set host = <ssh alias> and retry.\n");
+    ReportStartupFailure(err, no_console, "picopaste: config 'host' is empty; set host = <ssh alias> and retry.\n");
     return kExitSelftestFailed;
   }
 
@@ -1015,12 +1083,19 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
     if (Error::kSingleInstanceExists == setup.get_error()) {
       char owner_narrow[picopaste::win32::kOwnerImageChars * 3] = {};
       (void)picopaste::win32::WideToUtf8(owner_image, owner_narrow, sizeof(owner_narrow));
-      EmitFormatted(err, "picopaste: already running (pid %u, image %s); refusing a second instance.\n",
-                    static_cast<unsigned>(owner_pid), owner_narrow);
+      ReportStartupFailureFormatted(err, no_console,
+                                    "picopaste: already running (pid %u, image %s); refusing a second instance.\n",
+                                    static_cast<unsigned>(owner_pid), owner_narrow);
     } else {
-      EmitFormatted(err, "picopaste: could not create the single-instance mutex (error %u)\n",
-                    static_cast<unsigned>(setup.get_error()));
+      ReportStartupFailureFormatted(err, no_console,
+                                    "picopaste: could not create the single-instance mutex (error %u)\n",
+                                    static_cast<unsigned>(setup.get_error()));
     }
+    // Return here rather than falling through: nothing between this point and
+    // the consolidated check below runs while `setup` is false, and reaching it
+    // would report the same failure a second time -- which, now that the report
+    // is a box, would mean two boxes for one problem.
+    return kExitSelftestFailed;
   }
   if (setup) {
     setup = single.SetupJobObjects(config.job_memory_limit_mb);
@@ -1049,8 +1124,8 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
     }
   }
   if (!setup) {
-    EmitFormatted(err, "picopaste: startup failed (error %u, hotkey %lu)\n", static_cast<unsigned>(setup.get_error()),
-                  static_cast<unsigned long>(hotkey_error));
+    ReportStartupFailureFormatted(err, no_console, "picopaste: startup failed (error %u, hotkey %lu)\n",
+                                  static_cast<unsigned>(setup.get_error()), static_cast<unsigned long>(hotkey_error));
     return kExitSelftestFailed;
   }
   g_hotkey_backend = hotkey.backend();
@@ -1061,8 +1136,9 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
   worker.Configure(&config, single.containment_job(), &pipeline, &lifecycle);
   const Status started = worker.Start();
   if (!started) {
-    EmitFormatted(err, "picopaste: could not start the upload worker (error %u)\n",
-                  static_cast<unsigned>(started.get_error()));
+    // The tray is torn down on this path, so the box is the only report left.
+    ReportStartupFailureFormatted(err, no_console, "picopaste: could not start the upload worker (error %u)\n",
+                                  static_cast<unsigned>(started.get_error()));
     hotkey.Uninstall();
     single.Close();
     tray.Destroy();
@@ -1276,7 +1352,7 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
 
 std::int32_t RunSelftest(HANDLE out, HANDLE err, const wchar_t* config_path) noexcept {
   char narrow[kConfigPathChars] = {};
-  if (ResolveConfigPath(err, config_path, narrow, sizeof(narrow)) == false) {
+  if (ResolveConfigPath(err, false, config_path, narrow, sizeof(narrow)) == false) {
     return kExitSelftestFailed;
   }
 
@@ -1325,6 +1401,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
 
   const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
   const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+  // Decided once, here, where the console was attached: false for a
+  // double-click, true from a terminal. Only the interactive start-up consumes
+  // it; --selftest does not, so its behaviour is unchanged.
+  const bool no_console = (console.attached() == false);
 
   if (arguments.valid() == false) {
     Emit(err, "FAIL argv: could not read the process command line\n");
@@ -1335,5 +1415,5 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   if (options.selftest == true) {
     return RunSelftest(out, err, options.config_path);
   }
-  return RunInteractive(instance, out, err, options.config_path);
+  return RunInteractive(instance, out, err, options.config_path, no_console);
 }
