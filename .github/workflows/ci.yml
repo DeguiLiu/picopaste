@@ -154,7 +154,7 @@ jobs:
       # Runs the full ctest suite, which includes the mechanical gates
       # (gate_no_scripts, gate_posix_leak, gate_clang_format) registered in
       # tests/CMakeLists.txt. gate_clang_format is enforced here with the pinned
-      # binary above; the Windows job has none installed and reports SKIP.
+      # binary above, and the Windows job pins the very same version.
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
@@ -185,20 +185,38 @@ jobs:
           git -C "$env:USERPROFILE/newosp-windows" checkout --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Pinned to the same version the Linux job installs, and for the same
+      # reason. This is not belt-and-braces: windows-latest DOES ship
+      # clang-format on PATH (the image carries LLVM), so an unpinned gate
+      # still runs here -- it just judges the tree with whatever version the
+      # image happens to carry, which can differ from the Linux job's. Two
+      # verdicts on one source, with no change in this repo, is precisely the
+      # false confidence the gate exists to remove. Naming the binary makes
+      # this job's verdict reproducible instead.
+      - name: Install pinned clang-format
+        shell: pwsh
+        run: |
+          python -m venv "$env:USERPROFILE\.clang-format-venv"
+          & "$env:USERPROFILE\.clang-format-venv\Scripts\python.exe" -m pip install --quiet "clang-format==22.1.1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:USERPROFILE\.clang-format-venv\Scripts\clang-format.exe" --version
+
       - name: Configure
         shell: pwsh
         # Pass the newosp path explicitly: the CMake default is $ENV{HOME} and
-        # Windows runners do not guarantee HOME==USERPROFILE.
-        run: cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON -DPICOPASTE_NEWOSP_DIR="$env:USERPROFILE/newosp-windows"
+        # Windows runners do not guarantee HOME==USERPROFILE. The formatter is
+        # named for the same reason the Linux job names one -- an unset value
+        # sends the gate back to PATH, which is the drift this pin removes.
+        run: cmake -S . -B build -A x64 -DPICOPASTE_BUILD_TESTS=ON -DPICOPASTE_WERROR=ON -DPICOPASTE_NEWOSP_DIR="$env:USERPROFILE/newosp-windows" -DPICOPASTE_CLANG_FORMAT="$env:USERPROFILE\.clang-format-venv\Scripts\clang-format.exe"
 
       - name: Build
         run: cmake --build build --config Release
 
       # ctest includes the CMake-script gates registered in tests/CMakeLists.txt
-      # (gate_no_scripts, gate_posix_leak); the latter correctly excludes
-      # src/platform/posix/, which is legitimate POSIX and not built on Windows.
-      # gate_clang_format SKIPs here (no clang-format installed); the Linux job
-      # enforces it with the pinned binary.
+      # (gate_no_scripts, gate_posix_leak, gate_clang_format); gate_posix_leak
+      # correctly excludes src/platform/posix/, which is legitimate POSIX and
+      # not built on Windows. gate_clang_format runs here against the same
+      # pinned version the Linux job installs.
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
