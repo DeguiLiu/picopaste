@@ -760,8 +760,8 @@ Error WorseFailure(Error kept, Error candidate) noexcept {
 // before a failure is reported: an unreadable CF_DIBV5 next to a perfectly good
 // CF_DIB must not surface as "no image". `prior` is the failure the PNG fast
 // path already recorded, if any, so its verdict competes on equal terms.
-Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path,
-                                         const ClipboardFormats& formats, Error prior) noexcept {
+Result<CapturedImage> CaptureDibFallback(const Config& cfg, const wchar_t* temp_path, const ClipboardFormats& formats,
+                                         Error prior) noexcept {
   Error failure = prior;
   if (formats.has_dibv5) {
     Result<CapturedImage> v5 = CaptureOneDib(cfg, temp_path, CF_DIBV5, "DIBV5");

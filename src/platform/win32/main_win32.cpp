@@ -1166,9 +1166,8 @@ std::int32_t RunInteractive(HINSTANCE instance, HANDLE out, HANDLE err, const wc
         // announce it. We do not touch the tray state or the tooltip -- the
         // link is healthy -- we only say what went wrong.
         wchar_t size_balloon[64] = {};
-        const wchar_t* detail =
-            NoticeForLocalError(static_cast<Error>(msg.wParam), config, size_balloon,
-                                sizeof(size_balloon) / sizeof(size_balloon[0]));
+        const wchar_t* detail = NoticeForLocalError(static_cast<Error>(msg.wParam), config, size_balloon,
+                                                    sizeof(size_balloon) / sizeof(size_balloon[0]));
         if (detail != nullptr && config.notify_enabled) {
           tray.Notify(L"picopaste", detail, true);
         }
