@@ -181,6 +181,26 @@ if(WIN32)
   add_executable(picopaste WIN32)
   target_link_libraries(picopaste PRIVATE picopaste_core picopaste_msvc_crt
     user32 shell32 ole32 windowscodecs shlwapi advapi32)
+  # Declare the process code page UTF-8 instead of inheriting the system ANSI
+  # one. Every narrow string here is already UTF-8 -- LoadConfig takes a UTF-8
+  # path and says so -- but newosp's INI reader opens that path with
+  # std::ifstream(const char*), and MSVC converts a narrow path through the
+  # process code page. /utf-8 does not change that (verified: it is already set
+  # above and the bug happened anyway). The consequence was that a
+  # picopaste.ini sitting next to the exe under a path with non-ASCII
+  # characters -- D:\工作资料\Software\picopaste, the case that surfaced this --
+  # could not be opened at all; and because a missing config is not an error
+  # here, the run continued on defaults with an empty host and reported a
+  # missing file that was in fact present.
+  #
+  # Reading the config ourselves with a wide path and handing the library a
+  # buffer is the alternative; this keeps it to one declarative line and also
+  # covers the library's own write path.
+  #
+  # Windows 10 1903+ honours the setting. Older versions ignore it and keep the
+  # old, unsupported-for-non-ASCII behaviour -- nothing else changes.
+  target_link_options(picopaste PRIVATE
+    "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/platform/win32/picopaste.manifest")
   picopaste_apply_flags(picopaste)
   picopaste_apply_vendor_includes(picopaste)
   add_subdirectory(src/platform/win32)
