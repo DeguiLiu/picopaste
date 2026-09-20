@@ -6,9 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Press one global hotkey and the clipboard image goes to a Linux host; the remote absolute path is then
-put on the clipboard and typed into the terminal so Claude Code can read the image. The remote needs
-**no custom server-side code** — plain `sshd` and its `sftp-server`. One process, kernel-enforced
-single instance and child containment, zero idle CPU, no scripts.
+put on the clipboard and typed into the terminal as a path Codex CLI can open. None of that is
+Codex-specific: Claude Code reads the very same pasted path. The remote needs **no custom server-side
+code** — plain `sshd` and its `sftp-server`. One process, kernel-enforced single instance and child
+containment, zero idle CPU, no scripts.
 
 ## Overview
 ```mermaid
@@ -62,7 +63,7 @@ sequenceDiagram
   Note over P,R: a size mismatch aborts - nothing is published
   P->>U: put the remote absolute path on the clipboard
   P->>U: SendInput ctrl+shift+v (every event count verified)
-  U->>R: the terminal pastes the path into Claude Code
+  U->>R: the terminal pastes the path into Codex CLI
   P->>S: OPENDIR / REMOVE (retention housekeeping)
 ```
 Order is the contract: everything that can fail runs before the clipboard is written or a key is

@@ -6,8 +6,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 按一次全局热键，剪贴板里的图片就会上传到 Linux 主机；远端绝对路径随即写入剪贴板并敲进终端，
-Claude Code 据此读到这张图。远端**不需要任何自研服务端代码**——只用 stock `sshd` 和它自带的
-`sftp-server`。单进程、内核级单实例与子进程收容、空闲 CPU 为零、全树无脚本。
+Codex CLI 据此读到这张图。这套机制并不专属于 Codex CLI：Claude Code 读到的也是同一串粘贴路径。
+远端**不需要任何自研服务端代码**——只用 stock `sshd` 和它自带的 `sftp-server`。单进程、内核级
+单实例与子进程收容、空闲 CPU 为零、全树无脚本。
 
 ## 概览
 ```mermaid
@@ -61,7 +62,7 @@ sequenceDiagram
   Note over P,R: 字节数不符即中止，不发布任何文件
   P->>U: 把远端绝对路径写入剪贴板
   P->>U: SendInput ctrl+shift+v（核对每个事件）
-  U->>R: 终端把路径粘贴进 Claude Code
+  U->>R: 终端把路径粘贴进 Codex CLI
   P->>S: OPENDIR / REMOVE（保留策略清理）
 ```
 步骤顺序就是契约：所有可能失败的步骤都在写剪贴板或敲键**之前**跑完，所以一次失败的粘贴一定
