@@ -311,6 +311,11 @@ stateDiagram-v2
 配置文件是 INI 格式，用 `--config <路径>` 指定；**不指定时用 exe 同目录下的 `picopaste.ini`**。
 两种情况都**不要求文件真的存在**：找不到就用内置默认值继续运行（并提示用的是默认值），所以你可以只写需要改的那几行。`;` 或 `#` 开头是注释。
 
+**安装目录必须是纯 ASCII 路径**（`D:\tools\picopaste`，不要 `D:\工具\picopaste`）。这条路径在
+Windows 10 1903 / Windows Server 2022 之前无法按 UTF-8 打开，配置文件会被误判为不存在，
+程序退回默认值继续跑——现象是"文件就在 exe 旁边，却报找不到、`host` 为空"。新系统上 exe 的
+manifest 已声明 UTF-8 代码页，但为了少一类排查，本工具统一要求纯英文路径。
+
 ```ini
 [picopaste]
 

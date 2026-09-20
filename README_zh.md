@@ -97,7 +97,9 @@ flowchart LR
 同形。正是这一处反转让 core 不碰 `<windows.h>`，并能用假表在 host 上测试。
 
 ## 如何使用
-1. 把 `picopaste.ini` 放在 exe 同目录——最少只需 `host = user@host`。每个键及其默认值见
+1. **先放进纯英文路径**——`D:\tools\picopaste`，不要用 `D:\工具\picopaste`：Windows 10 1903 之前，
+   非 ASCII 路径下 exe 同目录的配置文件根本无法打开，程序会退回内置默认值、并反过来报告"文件不存在"。
+   `picopaste.ini` 放在 exe 同目录——最少只需 `host = user@host`。每个键及其默认值见
    [`docs/design/picopaste-design.md`](docs/design/picopaste-design.md)；文件不存在不算错误，会用
    内置默认值并提示。
 2. 运行 `picopaste.exe`。托盘图标出现即立刻建连：通道就绪后为绿（启动至多闪一下黄），

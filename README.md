@@ -99,8 +99,11 @@ context, the same shape as `ByteStream`. That inversion is why the core stays fr
 and is testable with fake tables.
 
 ## Usage
-1. Put `picopaste.ini` next to the exe — `host = user@host` is the minimum. Every key and its default
-   is in [`docs/design/picopaste-design.md`](docs/design/picopaste-design.md); a missing file is not an
+1. **Install into an ASCII-only path** — `D:\tools\picopaste`, never `D:\工具\picopaste`: before
+   Windows 10 1903 the config next to the exe cannot be opened at all when that path is non-ASCII,
+   and the run then continues on defaults while reporting the file as missing. `picopaste.ini` goes
+   next to the exe — `host = user@host` is the minimum. Every key and its default is in
+   [`docs/design/picopaste-design.md`](docs/design/picopaste-design.md); a missing file is not an
    error, the defaults are used and the program says so.
 2. Run `picopaste.exe`. A tray icon appears and connects immediately: green once the channel is up
    (a sub-second flicker of yellow at most), amber while retrying in the background.
